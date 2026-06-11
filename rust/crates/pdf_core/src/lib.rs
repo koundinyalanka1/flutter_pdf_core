@@ -1,9 +1,9 @@
-pub mod error;
-pub mod object;
-pub mod lexer;
-pub mod parser;
-pub mod xref;
-pub mod stream;
-pub mod filter;
 pub mod document;
+pub mod error;
+pub mod filter;
+pub mod lexer;
+pub mod object;
+pub mod parser;
+pub mod stream;
 pub mod writer;
+pub mod xref;
