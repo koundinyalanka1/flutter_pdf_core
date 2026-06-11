@@ -44,6 +44,44 @@ impl<'a> Lexer<'a> {
         self.pos = pos.min(self.data.len());
     }
 
+    /// Read stream payload bytes. When `length_hint` (from a direct
+    /// `/Length`) is plausible — i.e. `endstream` follows it — the exact
+    /// length is used, which keeps binary payloads containing the word
+    /// "endstream" intact. Otherwise falls back to scanning.
+    pub fn read_stream_data_with_length(
+        &mut self,
+        stream_keyword_offset: usize,
+        length_hint: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        if self.pos < self.data.len() && self.data[self.pos] == b'\r' {
+            self.pos += 1;
+            if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
+                self.pos += 1;
+            }
+        } else if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
+            self.pos += 1;
+        }
+        let start = self.pos;
+
+        if let Some(len) = length_hint {
+            let data_end = start.checked_add(len).unwrap_or(usize::MAX);
+            if data_end <= self.data.len() {
+                // Allow EOL + optional whitespace before `endstream`.
+                let mut probe = data_end;
+                while probe < self.data.len() && is_ws(self.data[probe]) && probe < data_end + 4 {
+                    probe += 1;
+                }
+                if self.data[probe..].starts_with(b"endstream") {
+                    let data = self.data[start..data_end].to_vec();
+                    self.pos = probe + b"endstream".len();
+                    return Ok(data);
+                }
+            }
+        }
+        self.pos = start;
+        self.scan_stream_data(stream_keyword_offset, start)
+    }
+
     pub fn read_stream_data(&mut self, stream_keyword_offset: usize) -> Result<Vec<u8>> {
         if self.pos < self.data.len() && self.data[self.pos] == b'\r' {
             self.pos += 1;
@@ -53,8 +91,11 @@ impl<'a> Lexer<'a> {
         } else if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
             self.pos += 1;
         }
-
         let start = self.pos;
+        self.scan_stream_data(stream_keyword_offset, start)
+    }
+
+    fn scan_stream_data(&mut self, stream_keyword_offset: usize, start: usize) -> Result<Vec<u8>> {
         let marker = b"endstream";
         let marker_offset = self.data[start..]
             .windows(marker.len())

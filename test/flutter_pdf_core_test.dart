@@ -1,28 +1,48 @@
-import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_pdf_core/flutter_pdf_core.dart';
-import 'package:flutter_pdf_core/flutter_pdf_core_platform_interface.dart';
-import 'package:flutter_pdf_core/flutter_pdf_core_method_channel.dart';
-import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+import 'package:flutter_test/flutter_test.dart';
 
-class MockFlutterPdfCorePlatform
-    with MockPlatformInterfaceMixin
-    implements FlutterPdfCorePlatform {
-  @override
-  Future<String?> getPlatformVersion() => Future.value('42');
-}
-
+// Pure-Dart tests (no native library needed). Full integration against the
+// Rust core lives in `rust/` (cargo test) and example/integration_test.
 void main() {
-  final FlutterPdfCorePlatform initialPlatform = FlutterPdfCorePlatform.instance;
-
-  test('$MethodChannelFlutterPdfCore is the default instance', () {
-    expect(initialPlatform, isInstanceOf<MethodChannelFlutterPdfCore>());
+  group('PdfMetadata', () {
+    test('round-trips through JSON', () {
+      const meta = PdfMetadata(title: 'Report', author: 'Koundinya');
+      final json = meta.toJson();
+      expect(json['title'], 'Report');
+      final back = PdfMetadata.fromJson(json);
+      expect(back.title, 'Report');
+      expect(back.author, 'Koundinya');
+      expect(back.subject, isNull);
+    });
   });
 
-  test('getPlatformVersion', () async {
-    FlutterPdfCore flutterPdfCorePlugin = FlutterPdfCore();
-    MockFlutterPdfCorePlatform fakePlatform = MockFlutterPdfCorePlatform();
-    FlutterPdfCorePlatform.instance = fakePlatform;
+  group('PdfInfo', () {
+    test('parses inspect JSON', () {
+      final info = PdfInfo.fromJson({
+        'version': '1.7',
+        'encrypted': false,
+        'objectCount': 12,
+        'pageCount': 3,
+        'metadata': {'title': 'T'},
+      });
+      expect(info.version, '1.7');
+      expect(info.pageCount, 3);
+      expect(info.metadata.title, 'T');
+    });
 
-    expect(await flutterPdfCorePlugin.getPlatformVersion(), '42');
+    test('tolerates missing fields', () {
+      final info = PdfInfo.fromJson(const {});
+      expect(info.pageCount, 0);
+      expect(info.encrypted, isFalse);
+    });
+  });
+
+  group('PdfException', () {
+    test('exposes machine-readable codes', () {
+      final e = PdfException('WRONG_PASSWORD', 'incorrect password');
+      expect(e.isWrongPassword, isTrue);
+      expect(e.isEncrypted, isFalse);
+      expect(e.toString(), contains('WRONG_PASSWORD'));
+    });
   });
 }

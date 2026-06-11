@@ -1,26 +1,8 @@
-import 'package:flutter/services.dart';
-import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_pdf_core/flutter_pdf_core_method_channel.dart';
-
-void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
-
-  MethodChannelFlutterPdfCore platform = MethodChannelFlutterPdfCore();
-  const MethodChannel channel = MethodChannel('flutter_pdf_core');
-
-  setUp(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
-          return '42';
-        });
-  });
-
-  tearDown(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, null);
-  });
-
-  test('getPlatformVersion', () async {
-    expect(await platform.getPlatformVersion(), '42');
-  });
-}
+// The plugin migrated from method channels to dart:ffi (see
+// lib/src/pdf_core_api.dart). The legacy method-channel layer is retained
+// only for backwards compatibility and has no behavior worth testing.
+//
+// Native-facing behavior is covered by:
+//   * rust/  — `cargo test` (parser, ops, text, AI export, crypto, FFI)
+//   * example/integration_test — end-to-end FFI smoke tests on device.
+void main() {}

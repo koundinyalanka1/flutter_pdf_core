@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 pdf_core = { path = "../pdf_core" }
+pdf_ops = { path = "../pdf_ops" }
 pdf_text = { path = "../pdf_text" }
 serde.workspace = true
 serde_json.workspace = true

@@ -24,7 +24,11 @@ A new Flutter plugin project.
 
   s.dependency 'FlutterMacOS'
 
-  s.platform = :osx, '10.11'
+  # Rust core (universal dylib). Build it with `scripts/build_macos.sh`
+  # from the package root before `pod install`.
+  s.vendored_libraries = 'Frameworks/libpdf_ffi.dylib'
+
+  s.platform = :osx, '10.14'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
 end

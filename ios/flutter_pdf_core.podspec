@@ -17,8 +17,18 @@ A new Flutter plugin project.
   s.dependency 'Flutter'
   s.platform = :ios, '13.0'
 
+  # Rust core (static XCFramework). Build it with `scripts/build_ios.sh`
+  # from the package root before `pod install`. The -force_load flag keeps
+  # the linker from stripping the FFI symbols that dart:ffi resolves at
+  # runtime via DynamicLibrary.process().
+  s.vendored_frameworks = 'Frameworks/PdfFfi.xcframework'
+
   # Flutter.framework does not contain a i386 slice.
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
+  s.pod_target_xcconfig = {
+    'DEFINES_MODULE' => 'YES',
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+    'OTHER_LDFLAGS' => '$(inherited) -force_load "$(PODS_XCFRAMEWORKS_BUILD_DIR)/PdfFfi/libpdf_ffi.a"',
+  }
   s.swift_version = '5.0'
 
   # If your plugin requires a privacy manifest, for example if it uses any

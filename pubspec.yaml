@@ -1,6 +1,6 @@
 name: flutter_pdf_core
-description: "A new Flutter plugin project."
-version: 0.0.1
+description: "A lightweight PDF toolkit built from scratch in Rust: split, merge, rotate, crop, metadata, text extraction, AI-ready export and AES-256 passwords."
+version: 0.1.0
 homepage:
 
 environment:
@@ -10,6 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  ffi: ^2.1.0
   plugin_platform_interface: ^2.0.2
 
 dev_dependencies:
@@ -37,10 +38,13 @@ flutter:
       android:
         package: com.yourmateapps.flutter_pdf_core
         pluginClass: FlutterPdfCorePlugin
+        ffiPlugin: true
       ios:
         pluginClass: FlutterPdfCorePlugin
+        ffiPlugin: true
       macos:
         pluginClass: FlutterPdfCorePlugin
+        ffiPlugin: true
 
   # To add assets to your plugin package, add an assets section, like this:
   # assets:

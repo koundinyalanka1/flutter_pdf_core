@@ -1,3 +1,4 @@
+pub mod crypt;
 pub mod document;
 pub mod error;
 pub mod filter;

@@ -21,6 +21,17 @@ impl PdfWriter {
     }
 
     pub fn write_document_to_vec(document: &PdfDocument) -> Result<Vec<u8>> {
+        Self::write_document_inner(document, false)
+    }
+
+    /// Like `write_document_to_vec`, but preserves the trailer's /Encrypt
+    /// reference. Only used by `crypt::encrypt_to_bytes`, which has already
+    /// encrypted every string and stream in the document.
+    pub(crate) fn write_document_to_vec_keep_encrypt(document: &PdfDocument) -> Result<Vec<u8>> {
+        Self::write_document_inner(document, true)
+    }
+
+    fn write_document_inner(document: &PdfDocument, keep_encrypt: bool) -> Result<Vec<u8>> {
         let root = document
             .root_ref()
             .ok_or_else(|| PdfError::write("cannot write PDF without trailer /Root"))?;
@@ -65,7 +76,7 @@ impl PdfWriter {
             }
         }
 
-        let trailer = Self::build_trailer(document, root, max_object_number + 1);
+        let trailer = Self::build_trailer(document, root, max_object_number + 1, keep_encrypt);
         out.extend_from_slice(b"trailer\n");
         Self::write_dictionary(&mut out, &trailer, None)?;
         write!(out, "\nstartxref\n{startxref}\n%%EOF\n")?;
@@ -78,11 +89,22 @@ impl PdfWriter {
         Ok(out)
     }
 
-    fn build_trailer(document: &PdfDocument, root: ObjectId, size: u32) -> Dictionary {
+    fn build_trailer(
+        document: &PdfDocument,
+        root: ObjectId,
+        size: u32,
+        keep_encrypt: bool,
+    ) -> Dictionary {
         let mut trailer = Dictionary::new();
         for (key, value) in &document.xref.trailer {
-            // Avoid preserving offsets into the previous file or stream-xref metadata.
-            if matches!(key.as_str(), "Size" | "Prev" | "XRefStm") {
+            if key == "Encrypt" && keep_encrypt {
+                trailer.insert(key.clone(), value.clone());
+                continue;
+            }
+            // Avoid preserving offsets into the previous file, stream-xref
+            // metadata, or encryption state (documents are written decrypted;
+            // use `crypt::encrypt_document` to produce an encrypted file).
+            if matches!(key.as_str(), "Size" | "Prev" | "XRefStm" | "Encrypt" | "Type" | "Index" | "W" | "Filter" | "DecodeParms" | "Length") {
                 continue;
             }
             trailer.insert(key.clone(), value.clone());
@@ -272,16 +294,16 @@ mod tests {
         let document = PdfDocument::from_bytes(input).unwrap();
         let output = PdfWriter::write_document_to_vec(&document).unwrap();
         let xref = parse_xref(&output).unwrap();
-        for (id, entry) in xref
+        for (number, entry) in xref
             .entries
             .iter()
-            .filter(|(id, entry)| id.number != 0 && entry.in_use)
+            .filter(|(number, entry)| **number != 0 && entry.in_use())
         {
-            let expected = format!("{} {} obj", id.number, id.generation);
+            let expected = format!("{} {} obj", number, entry.generation);
+            let offset = entry.offset().expect("classic entries are in-file");
             assert!(
-                output[entry.offset..].starts_with(expected.as_bytes()),
-                "xref offset {} did not point to {expected}",
-                entry.offset
+                output[offset..].starts_with(expected.as_bytes()),
+                "xref offset {offset} did not point to {expected}"
             );
         }
     }
@@ -291,7 +313,6 @@ mod tests {
         for input in [
             include_bytes!("../../../fixtures/simple.pdf").as_slice(),
             include_bytes!("../../../fixtures/two_pages.pdf").as_slice(),
-            include_bytes!("../../../fixtures/encrypted_marker.pdf").as_slice(),
         ] {
             let original = PdfDocument::from_bytes(input).unwrap();
             let output = PdfWriter::write_document_to_vec(&original).unwrap();

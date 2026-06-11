@@ -95,7 +95,13 @@ impl<'a> Parser<'a> {
                     ));
                 }
             };
-            let data = self.lexer.read_stream_data(stream_token.offset)?;
+            let length_hint = dictionary
+                .get("Length")
+                .and_then(PdfObject::as_i64)
+                .and_then(|v| usize::try_from(v).ok());
+            let data = self
+                .lexer
+                .read_stream_data_with_length(stream_token.offset, length_hint)?;
             value = PdfObject::Stream(PdfStream::new(dictionary, data));
         }
         self.expect_keyword("endobj")?;
