@@ -31,3 +31,6 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 /build/
 /coverage/
+
+# Local build output for standalone Rust utilities.
+/tools/pdf_viewer/target/
