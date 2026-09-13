@@ -55,7 +55,7 @@ pub fn chunk_pages(pages: &[String], options: ChunkOptions) -> Vec<Chunk> {
     let mut page_start: usize = 0;
     let mut page_end: usize = 0;
 
-    let mut flush =
+    let flush =
         |current: &mut String, page_start: usize, page_end: usize, chunks: &mut Vec<Chunk>| {
             let text = current.trim().to_owned();
             if !text.is_empty() {

@@ -1,0 +1,16 @@
+[package]
+name = "pdf_render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf_core = { path = "../pdf_core" }
+pdf_ops = { path = "../pdf_ops" }
+pdf_text = { path = "../pdf_text" }
+thiserror.workspace = true
+flate2.workspace = true
+
+# Image codecs only — not PDF libraries. DCTDecode images are baseline JPEG
+# and JPXDecode is out of scope, so this is the one decoder the rasterizer
+# cannot write itself without shipping a second JPEG implementation.
+jpeg-decoder = { version = "0.3", default-features = false }

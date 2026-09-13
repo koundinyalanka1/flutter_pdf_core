@@ -34,3 +34,7 @@ migrate_working_dir/
 
 # Local build output for standalone Rust utilities.
 /tools/pdf_viewer/target/
+
+# Cargo build cache for the native core (regenerate with `cargo build` /
+# the scripts/build_*.sh helpers documented in README.md).
+/rust/target/

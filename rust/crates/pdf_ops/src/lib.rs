@@ -1,3 +1,4 @@
+pub mod compose;
 pub mod page_tree;
 pub mod split;
 pub mod merge;

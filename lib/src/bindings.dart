@@ -55,6 +55,31 @@ typedef _CropC = Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Int32, Double,
 typedef _CropDart = int Function(
     Pointer<Utf8>, Pointer<Utf8>, int, double, double, double, double, Pointer<Utf8>);
 
+// Milestone 13: rendering + image composition.
+
+typedef _RenderPngC = Pointer<Uint8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Int32, Int32, Int32, Pointer<Int32>);
+typedef _RenderPngDart = Pointer<Uint8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, int, int, int, Pointer<Int32>);
+
+typedef _RenderRgbaC = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
+    Int32, Int32, Int32, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>);
+typedef _RenderRgbaDart = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
+    int, int, int, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>);
+
+typedef _FreeBufferC = Void Function(Pointer<Uint8>, Int32);
+typedef _FreeBufferDart = void Function(Pointer<Uint8>, int);
+
+typedef _PageSizeC = Int32 Function(
+    Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<Double>, Pointer<Double>);
+typedef _PageSizeDart = int Function(
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Double>, Pointer<Double>);
+
+typedef _ImagesToPdfC = Int32 Function(
+    Pointer<Utf8>, Pointer<Utf8>, Double, Double, Int32, Double);
+typedef _ImagesToPdfDart = int Function(
+    Pointer<Utf8>, Pointer<Utf8>, double, double, int, double);
+
 /// Lazily-resolved bindings to the native library.
 class PdfBindings {
   PdfBindings._(DynamicLibrary lib)
@@ -80,6 +105,15 @@ class PdfBindings {
             lib.lookupFunction<_ExtractTextC, _ExtractTextDart>('pdf_extract_text'),
         exportAi = lib.lookupFunction<_ExportAiC, _ExportAiDart>('pdf_export_ai'),
         encrypt = lib.lookupFunction<_Op5C, _Op5Dart>('pdf_encrypt'),
+        renderPagePng =
+            lib.lookupFunction<_RenderPngC, _RenderPngDart>('pdf_render_page_png'),
+        renderPageRgba = lib
+            .lookupFunction<_RenderRgbaC, _RenderRgbaDart>('pdf_render_page_rgba'),
+        freeBuffer =
+            lib.lookupFunction<_FreeBufferC, _FreeBufferDart>('pdf_free_buffer'),
+        pageSize = lib.lookupFunction<_PageSizeC, _PageSizeDart>('pdf_page_size'),
+        imagesToPdf =
+            lib.lookupFunction<_ImagesToPdfC, _ImagesToPdfDart>('pdf_images_to_pdf'),
         decrypt = lib.lookupFunction<_Op3C, _Op3Dart>('pdf_decrypt');
 
   final _VersionC version;
@@ -99,6 +133,11 @@ class PdfBindings {
   final _ExportAiDart exportAi;
   final _Op5Dart encrypt;
   final _Op3Dart decrypt;
+  final _RenderPngDart renderPagePng;
+  final _RenderRgbaDart renderPageRgba;
+  final _FreeBufferDart freeBuffer;
+  final _PageSizeDart pageSize;
+  final _ImagesToPdfDart imagesToPdf;
 
   static PdfBindings? _instance;
 

@@ -16,6 +16,7 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use pdf_ai::chunker::ChunkOptions;
+use pdf_ops::compose::{images_to_document, ComposeOptions, PageFit};
 use pdf_core::crypt::encrypt_to_bytes;
 use pdf_core::document::PdfDocument;
 use pdf_core::error::PdfError;
@@ -525,6 +526,244 @@ pub unsafe extern "C" fn pdf_decrypt(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 13: rendering and image composition
+// ---------------------------------------------------------------------------
+
+/// Release a buffer handed out by `pdf_render_page_*`.
+///
+/// # Safety
+/// `ptr`/`len` must be exactly what the render call returned, and must not
+/// have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_free_buffer(ptr: *mut u8, len: i32) {
+    if ptr.is_null() || len <= 0 {
+        return;
+    }
+    drop(Vec::from_raw_parts(ptr, len as usize, len as usize));
+}
+
+/// Hand a `Vec<u8>` to the caller as a raw pointer, writing its length into
+/// `out_len`. Returns NULL on failure.
+fn release_buffer(data: Vec<u8>, out_len: *mut i32) -> *mut u8 {
+    if out_len.is_null() {
+        set_error("ERROR: null out_len");
+        return std::ptr::null_mut();
+    }
+    let mut boxed = data.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    let len = boxed.len();
+    if len > i32::MAX as usize {
+        set_error("ERROR: rendered buffer too large");
+        return std::ptr::null_mut();
+    }
+    std::mem::forget(boxed);
+    unsafe { *out_len = len as i32 };
+    ptr
+}
+
+fn render_options(target_width: i32, target_height: i32) -> pdf_render::RenderOptions {
+    let size = if target_width > 0 && target_height > 0 {
+        pdf_render::RenderSize::FitBox {
+            width: target_width as u32,
+            height: target_height as u32,
+        }
+    } else {
+        // Negative/zero target means "use the page's own size at 72 dpi".
+        pdf_render::RenderSize::Scale(1.0)
+    };
+    pdf_render::RenderOptions {
+        size,
+        ..Default::default()
+    }
+}
+
+/// Render page `page` (0-based) and return it as PNG bytes.
+///
+/// Fits inside `target_width` x `target_height` pixels when both are positive.
+/// Free the result with `pdf_free_buffer`.
+///
+/// # Safety
+/// All pointer arguments must be valid NUL-terminated C strings / writable
+/// out-parameters for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_render_page_png(
+    path: *const c_char,
+    password: *const c_char,
+    page: i32,
+    target_width: i32,
+    target_height: i32,
+    out_len: *mut i32,
+) -> *mut u8 {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, PdfError> {
+        let doc = open(path, password)?;
+        let rendered = pdf_render::render_page(
+            &doc,
+            page.max(0) as usize,
+            render_options(target_width, target_height),
+        )?;
+        pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
+            .ok_or_else(|| PdfError::Structure("could not encode PNG".into()))
+    }));
+    match result {
+        Ok(Ok(data)) => release_buffer(data, out_len),
+        Ok(Err(err)) => {
+            set_pdf_error(&err);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_error("PANIC: internal error");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Render page `page` (0-based) as raw RGBA8, top-left origin.
+///
+/// Writes the pixel dimensions into `out_width`/`out_height` so the caller can
+/// hand the buffer straight to a GPU upload without re-parsing a container.
+/// Free the result with `pdf_free_buffer`.
+///
+/// # Safety
+/// As [`pdf_render_page_png`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pdf_render_page_rgba(
+    path: *const c_char,
+    password: *const c_char,
+    page: i32,
+    target_width: i32,
+    target_height: i32,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_len: *mut i32,
+) -> *mut u8 {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    if out_width.is_null() || out_height.is_null() {
+        set_error("ERROR: null out parameter");
+        return std::ptr::null_mut();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<_, PdfError> {
+        let doc = open(path, password)?;
+        pdf_render::render_page(
+            &doc,
+            page.max(0) as usize,
+            render_options(target_width, target_height),
+        )
+    }));
+    match result {
+        Ok(Ok(rendered)) => {
+            *out_width = rendered.width as i32;
+            *out_height = rendered.height as i32;
+            release_buffer(rendered.pixels, out_len)
+        }
+        Ok(Err(err)) => {
+            set_pdf_error(&err);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_error("PANIC: internal error");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Page size in PostScript points, honouring `/Rotate`.
+///
+/// # Safety
+/// `out_width`/`out_height` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_page_size(
+    path: *const c_char,
+    password: *const c_char,
+    page: i32,
+    out_width: *mut f64,
+    out_height: *mut f64,
+) -> c_int {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return -1;
+    };
+    if out_width.is_null() || out_height.is_null() {
+        set_error("ERROR: null out parameter");
+        return -1;
+    }
+    let (w, h) = match catch_unwind(AssertUnwindSafe(|| -> Result<(f64, f64), PdfError> {
+        let doc = open(path, password)?;
+        pdf_render::page_size_points(&doc, page.max(0) as usize)
+    })) {
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => {
+            set_pdf_error(&err);
+            return -1;
+        }
+        Err(_) => {
+            set_error("PANIC: internal error");
+            return -1;
+        }
+    };
+    *out_width = w;
+    *out_height = h;
+    0
+}
+
+/// Build a PDF from JPEG images, one page each.
+///
+/// `jpeg_paths` is a newline-separated list, in page order. `fit` is 0 for
+/// "fixed page size, image letterboxed" and 1 for "page takes the image's
+/// aspect ratio". `page_width`/`page_height` are in points; pass 0 for A4.
+///
+/// # Safety
+/// Both pointers must be valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_images_to_pdf(
+    jpeg_paths: *const c_char,
+    out_path: *const c_char,
+    page_width: f64,
+    page_height: f64,
+    fit: i32,
+    margin: f64,
+) -> c_int {
+    let (Ok(paths), Ok(out_path)) = (cstr(jpeg_paths), cstr(out_path)) else {
+        return -1;
+    };
+    run_int(|| {
+        let files: Vec<&str> = paths
+            .split('\n')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if files.is_empty() {
+            return Err(PdfError::Structure("no input images".into()));
+        }
+        let mut images = Vec::with_capacity(files.len());
+        for file in files {
+            images.push(std::fs::read(file)?);
+        }
+        let options = ComposeOptions {
+            page_size: if page_width > 1.0 && page_height > 1.0 {
+                (page_width, page_height)
+            } else {
+                pdf_ops::compose::A4
+            },
+            fit: if fit == 0 {
+                PageFit::Contain
+            } else {
+                PageFit::ImageAspect
+            },
+            margin,
+        };
+        let doc = images_to_document(&images, options)?;
+        doc.save_as(out_path)?;
+        Ok(0)
+    })
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +852,108 @@ mod tests {
                 0
             );
             assert_eq!(pdf_page_count(split_c.as_ptr(), empty.as_ptr()), 1);
+
+            // --- Milestone 13: rendering -------------------------------
+            let mut out_len = 0i32;
+            let png = pdf_render_page_png(
+                input_c.as_ptr(),
+                empty.as_ptr(),
+                0,
+                120,
+                120,
+                &mut out_len,
+            );
+            assert!(!png.is_null(), "render failed: {}", last_error());
+            assert!(out_len > 8);
+            let header = std::slice::from_raw_parts(png, 8);
+            assert_eq!(header, &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+            pdf_free_buffer(png, out_len);
+
+            let (mut w, mut h, mut len) = (0i32, 0i32, 0i32);
+            let rgba = pdf_render_page_rgba(
+                input_c.as_ptr(),
+                empty.as_ptr(),
+                0,
+                64,
+                64,
+                &mut w,
+                &mut h,
+                &mut len,
+            );
+            assert!(!rgba.is_null(), "rgba render failed: {}", last_error());
+            assert_eq!(len, w * h * 4);
+            assert!(w <= 64 && h <= 64);
+            pdf_free_buffer(rgba, len);
+
+            // Out-of-range page reports an error rather than panicking.
+            assert!(pdf_render_page_png(
+                input_c.as_ptr(),
+                empty.as_ptr(),
+                99,
+                64,
+                64,
+                &mut out_len
+            )
+            .is_null());
+            assert!(last_error().starts_with("PAGE_OUT_OF_RANGE"));
+
+            let (mut pw_pts, mut ph_pts) = (0.0f64, 0.0f64);
+            assert_eq!(
+                pdf_page_size(
+                    input_c.as_ptr(),
+                    empty.as_ptr(),
+                    0,
+                    &mut pw_pts,
+                    &mut ph_pts
+                ),
+                0
+            );
+            assert!(pw_pts > 0.0 && ph_pts > 0.0);
+
+            // --- Milestone 13: images -> PDF ---------------------------
+            let jpeg_path = dir.join("page.jpg");
+            std::fs::write(&jpeg_path, sample_jpeg()).unwrap();
+            let images = c(&format!(
+                "{}\n{}",
+                jpeg_path.to_str().unwrap(),
+                jpeg_path.to_str().unwrap()
+            ));
+            let composed = dir.join("composed.pdf");
+            let composed_c = c(composed.to_str().unwrap());
+            assert_eq!(
+                pdf_images_to_pdf(images.as_ptr(), composed_c.as_ptr(), 0.0, 0.0, 1, 0.0),
+                0,
+                "compose failed: {}",
+                last_error()
+            );
+            assert_eq!(pdf_page_count(composed_c.as_ptr(), empty.as_ptr()), 2);
+
+            // And the composed document renders back.
+            let png = pdf_render_page_png(
+                composed_c.as_ptr(),
+                empty.as_ptr(),
+                0,
+                80,
+                80,
+                &mut out_len,
+            );
+            assert!(!png.is_null(), "composed render failed: {}", last_error());
+            pdf_free_buffer(png, out_len);
         }
+    }
+
+    unsafe fn last_error() -> String {
+        CStr::from_ptr(pdf_last_error()).to_string_lossy().into_owned()
+    }
+
+    /// A 2x2 baseline greyscale JPEG, hand-assembled so the test needs no
+    /// encoder dependency.
+    fn sample_jpeg() -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        // SOF0: 8-bit precision, 2x2, one component.
+        out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x11, 0x00]);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
     }
 }

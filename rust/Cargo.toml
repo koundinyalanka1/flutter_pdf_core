@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/pdf_core",
   "crates/pdf_ops",
+  "crates/pdf_render",
   "crates/pdf_text",
   "crates/pdf_ai",
   "crates/pdf_ffi",

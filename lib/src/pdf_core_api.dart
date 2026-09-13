@@ -3,6 +3,7 @@
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
@@ -98,8 +99,42 @@ class PdfInfo {
   final PdfMetadata metadata;
 }
 
+/// A rasterized page: RGBA8 pixels plus their dimensions.
+///
+/// The buffer is straight (non-premultiplied) RGBA with a top-left origin,
+/// which is exactly what `ui.decodeImageFromPixels` expects.
+class PdfRenderedPage {
+  const PdfRenderedPage({
+    required this.width,
+    required this.height,
+    required this.pixels,
+  });
+
+  final int width;
+  final int height;
+  final Uint8List pixels;
+}
+
+/// A page's size in PostScript points (1/72"), honouring `/Rotate`.
+class PdfPageSize {
+  const PdfPageSize(this.width, this.height);
+  final double width;
+  final double height;
+
+  double get aspectRatio => height == 0 ? 1 : width / height;
+}
+
+/// How an image is placed on its page by [PdfCore.imagesToPdf].
+enum PdfImageFit {
+  /// Fixed page size; the image is scaled to fit and centred (letterboxed).
+  contain,
+
+  /// The page takes the image's own aspect ratio — no bars.
+  imageAspect,
+}
+
 /// Pure-Rust PDF toolkit: parse, split, merge, rotate, crop, metadata,
-/// text extraction, AI export and AES-256 password protection.
+/// text extraction, rendering, AI export and AES-256 password protection.
 ///
 /// All methods are synchronous FFI calls; the `xxxAsync` variants run the
 /// same call on a background isolate so heavy documents don't jank the UI.
@@ -225,6 +260,118 @@ class PdfCore {
   static void decrypt(String path, String password, String outPath) =>
       _check(_int3(_b.decrypt, path, password, outPath));
 
+  // -- rendering ---------------------------------------------------------
+
+  /// Rasterize [page] (0-based) and return it as PNG bytes.
+  ///
+  /// When [width] and [height] are both positive the page is scaled to fit
+  /// inside that pixel box, preserving aspect ratio; otherwise it renders at
+  /// its natural size (72 dpi).
+  static Uint8List renderPagePng(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) {
+    return _withUtf8([path, password], (args) {
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer =
+            _b.renderPagePng(args[0], args[1], page, width, height, lengthOut);
+        if (buffer == nullptr) throw _lastError();
+        return _takeBuffer(buffer, lengthOut.value);
+      } finally {
+        calloc.free(lengthOut);
+      }
+    });
+  }
+
+  /// Rasterize [page] (0-based) to raw RGBA8 — the cheapest path to a
+  /// `ui.Image`, with no encode/decode round trip.
+  static PdfRenderedPage renderPageRgba(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) {
+    return _withUtf8([path, password], (args) {
+      final widthOut = calloc<Int32>();
+      final heightOut = calloc<Int32>();
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = _b.renderPageRgba(
+          args[0],
+          args[1],
+          page,
+          width,
+          height,
+          widthOut,
+          heightOut,
+          lengthOut,
+        );
+        if (buffer == nullptr) throw _lastError();
+        return PdfRenderedPage(
+          width: widthOut.value,
+          height: heightOut.value,
+          pixels: _takeBuffer(buffer, lengthOut.value),
+        );
+      } finally {
+        calloc.free(widthOut);
+        calloc.free(heightOut);
+        calloc.free(lengthOut);
+      }
+    });
+  }
+
+  /// Page size in points, honouring `/Rotate`.
+  static PdfPageSize pageSize(String path, int page, {String password = ''}) {
+    return _withUtf8([path, password], (args) {
+      final widthOut = calloc<Double>();
+      final heightOut = calloc<Double>();
+      try {
+        final status =
+            _b.pageSize(args[0], args[1], page, widthOut, heightOut);
+        _check(status);
+        return PdfPageSize(widthOut.value, heightOut.value);
+      } finally {
+        calloc.free(widthOut);
+        calloc.free(heightOut);
+      }
+    });
+  }
+
+  // -- composition -------------------------------------------------------
+
+  /// Build a PDF from JPEG files, one page per image.
+  ///
+  /// The JPEG bytes are embedded as-is (`DCTDecode`), so there is no decode /
+  /// re-encode step and no quality loss. [pageSizePoints] defaults to A4 and
+  /// only matters for [PdfImageFit.contain]; under [PdfImageFit.imageAspect]
+  /// it sets the target long edge.
+  static void imagesToPdf(
+    List<String> jpegPaths,
+    String outPath, {
+    PdfImageFit fit = PdfImageFit.imageAspect,
+    PdfPageSize? pageSizePoints,
+    double margin = 0,
+  }) {
+    if (jpegPaths.isEmpty) {
+      throw PdfException('ERROR', 'no input images');
+    }
+    _check(_withUtf8([jpegPaths.join('\n'), outPath], (args) {
+      return _b.imagesToPdf(
+        args[0],
+        args[1],
+        pageSizePoints?.width ?? 0,
+        pageSizePoints?.height ?? 0,
+        fit == PdfImageFit.contain ? 0 : 1,
+        margin,
+      );
+    }));
+  }
+
   // -- async variants ----------------------------------------------------------
 
   static Future<int> pageCountAsync(String path, {String password = ''}) =>
@@ -278,6 +425,40 @@ class PdfCore {
   static Future<void> decryptAsync(String path, String password, String outPath) =>
       Isolate.run(() => decrypt(path, password, outPath));
 
+  static Future<Uint8List> renderPagePngAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) =>
+      Isolate.run(() => renderPagePng(path, page,
+          width: width, height: height, password: password));
+
+  static Future<PdfRenderedPage> renderPageRgbaAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) =>
+      Isolate.run(() => renderPageRgba(path, page,
+          width: width, height: height, password: password));
+
+  static Future<PdfPageSize> pageSizeAsync(String path, int page,
+          {String password = ''}) =>
+      Isolate.run(() => pageSize(path, page, password: password));
+
+  static Future<void> imagesToPdfAsync(
+    List<String> jpegPaths,
+    String outPath, {
+    PdfImageFit fit = PdfImageFit.imageAspect,
+    PdfPageSize? pageSizePoints,
+    double margin = 0,
+  }) =>
+      Isolate.run(() => imagesToPdf(jpegPaths, outPath,
+          fit: fit, pageSizePoints: pageSizePoints, margin: margin));
+
   // -- plumbing ----------------------------------------------------------------
 
   static R _withUtf8<R>(List<String> strings, R Function(List<Pointer<Utf8>>) f) {
@@ -288,6 +469,17 @@ class PdfCore {
       for (final p in pointers) {
         malloc.free(p);
       }
+    }
+  }
+
+  /// Copy a native buffer into a Dart list and release the native memory.
+  static Uint8List _takeBuffer(Pointer<Uint8> ptr, int length) {
+    try {
+      if (length <= 0) return Uint8List(0);
+      // asTypedList is a view over native memory; copy before freeing.
+      return Uint8List.fromList(ptr.asTypedList(length));
+    } finally {
+      _b.freeBuffer(ptr, length);
     }
   }
 
