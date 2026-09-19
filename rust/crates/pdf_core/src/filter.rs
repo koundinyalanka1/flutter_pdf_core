@@ -1,7 +1,8 @@
 //! Milestone 7: stream filters.
 //!
-//! Supports FlateDecode (with PNG/TIFF predictors), ASCIIHexDecode and
-//! ASCII85Decode. Filter chains (`/Filter` as an array) are applied in order.
+//! Supports FlateDecode and LZWDecode (both with PNG/TIFF predictors),
+//! RunLengthDecode, ASCIIHexDecode and ASCII85Decode. Filter chains
+//! (`/Filter` as an array) are applied in order.
 
 use std::io::Read;
 use std::io::Write as _;
@@ -20,6 +21,10 @@ pub struct DecodeParms {
     pub colors: usize,
     pub bits_per_component: usize,
     pub columns: usize,
+    /// LZW only: whether code width grows one code earlier than the table
+    /// strictly requires. `/EarlyChange 0` turns it off; the default is on,
+    /// and getting it wrong shifts every code after the first table growth.
+    pub early_change: bool,
 }
 
 impl Default for DecodeParms {
@@ -29,6 +34,7 @@ impl Default for DecodeParms {
             colors: 1,
             bits_per_component: 8,
             columns: 1,
+            early_change: true,
         }
     }
 }
@@ -43,6 +49,7 @@ impl DecodeParms {
             colors: get("Colors", 1).max(1) as usize,
             bits_per_component: get("BitsPerComponent", 8).max(1) as usize,
             columns: get("Columns", 1).max(1) as usize,
+            early_change: get("EarlyChange", 1) != 0,
         }
     }
 }
@@ -54,8 +61,16 @@ pub fn decode(filter: &str, data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>>
             let inflated = flate_decode(data)?;
             apply_predictor(&inflated, parms)
         }
+        "LZWDecode" | "LZW" => {
+            let expanded = lzw_decode(data, parms.early_change)?;
+            apply_predictor(&expanded, parms)
+        }
+        "RunLengthDecode" | "RL" => run_length_decode(data),
         "ASCIIHexDecode" | "AHx" => ascii_hex_decode(data),
         "ASCII85Decode" | "A85" => ascii85_decode(data),
+        // Decryption already ran when the document was opened, so a /Crypt
+        // filter has nothing left to do here.
+        "Crypt" => Ok(data.to_vec()),
         other => Err(PdfError::UnsupportedFilter(other.to_owned())),
     }
 }
@@ -109,10 +124,14 @@ fn decode_parms_list(dict: &Dictionary, n: usize) -> Vec<DecodeParms> {
 pub fn flate_decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut decoder = ZlibDecoder::new(data);
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|e| PdfError::Filter(format!("FlateDecode failed: {e}")))?;
-    Ok(out)
+    match decoder.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        // A truncated stream still inflated everything up to the damage, and
+        // most of a page is worth more than none of it. This matches how
+        // LZWDecode and the CCITT decoder treat short input.
+        Err(_) if !out.is_empty() => Ok(out),
+        Err(e) => Err(PdfError::Filter(format!("FlateDecode failed: {e}"))),
+    }
 }
 
 pub fn flate_encode(data: &[u8]) -> Vec<u8> {
@@ -123,6 +142,132 @@ pub fn flate_encode(data: &[u8]) -> Vec<u8> {
     encoder
         .finish()
         .expect("finishing in-memory encoder cannot fail")
+}
+
+// ---------------------------------------------------------------------------
+// LZWDecode
+// ---------------------------------------------------------------------------
+
+const LZW_CLEAR: u16 = 256;
+const LZW_EOD: u16 = 257;
+const LZW_MAX: usize = 4096;
+
+/// LZW as PDF uses it: MSB-first codes, 9 bits growing to 12, 256 = clear
+/// table, 257 = end of data.
+///
+/// Damaged or truncated streams stop at the damage and return what was
+/// recovered rather than erroring, because a partly-decoded content stream
+/// still draws most of a page.
+pub fn lzw_decode(data: &[u8], early_change: bool) -> Result<Vec<u8>> {
+    let early = usize::from(early_change);
+    let mut table: Vec<Vec<u8>> = Vec::with_capacity(LZW_MAX);
+    reset_lzw_table(&mut table);
+
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() * 3);
+    let mut width = 9usize;
+    let mut previous: Option<u16> = None;
+    let mut bit = 0usize;
+    let total_bits = data.len() * 8;
+
+    while bit + width <= total_bits {
+        let mut code = 0u16;
+        for i in 0..width {
+            let at = bit + i;
+            let value = (data[at >> 3] >> (7 - (at & 7))) & 1;
+            code = (code << 1) | u16::from(value);
+        }
+        bit += width;
+
+        match code {
+            LZW_CLEAR => {
+                reset_lzw_table(&mut table);
+                width = 9;
+                previous = None;
+                continue;
+            }
+            LZW_EOD => break,
+            _ => {}
+        }
+
+        // Either a code already in the table, or the classic "code not yet
+        // defined" case, where the entry is the previous one plus its own
+        // first byte.
+        let entry: Vec<u8> = match table.get(code as usize) {
+            Some(existing) if !existing.is_empty() => existing.clone(),
+            _ => {
+                let Some(prev) = previous else { break };
+                let Some(base) = table.get(prev as usize) else { break };
+                if base.is_empty() {
+                    break;
+                }
+                let mut built = base.clone();
+                built.push(base[0]);
+                built
+            }
+        };
+        out.extend_from_slice(&entry);
+
+        if let Some(prev) = previous {
+            if table.len() < LZW_MAX {
+                if let Some(base) = table.get(prev as usize) {
+                    let mut grown = base.clone();
+                    grown.push(entry[0]);
+                    table.push(grown);
+                }
+            }
+        }
+        previous = Some(code);
+
+        width = match table.len() + early {
+            n if n >= 2048 => 12,
+            n if n >= 1024 => 11,
+            n if n >= 512 => 10,
+            _ => 9,
+        };
+    }
+
+    Ok(out)
+}
+
+fn reset_lzw_table(table: &mut Vec<Vec<u8>>) {
+    table.clear();
+    for byte in 0..=255u16 {
+        table.push(vec![byte as u8]);
+    }
+    // 256 and 257 are the clear and EOD markers; they hold no data but must
+    // occupy their slots so later codes land at the right index.
+    table.push(Vec::new());
+    table.push(Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// RunLengthDecode
+// ---------------------------------------------------------------------------
+
+/// Length byte `n`: 0–127 means copy the next `n + 1` bytes literally,
+/// 129–255 means repeat the next byte `257 - n` times, and 128 ends the data.
+pub fn run_length_decode(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let mut i = 0usize;
+    while i < data.len() {
+        let length = data[i];
+        i += 1;
+        match length {
+            128 => break,
+            0..=127 => {
+                let take = usize::from(length) + 1;
+                let end = (i + take).min(data.len());
+                out.extend_from_slice(&data[i..end]);
+                i = end;
+            }
+            _ => {
+                let Some(&byte) = data.get(i) else { break };
+                out.extend(std::iter::repeat(byte).take(257 - usize::from(length)));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn apply_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
@@ -300,6 +445,123 @@ fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Encodes with the same 9→12-bit scheme the decoder expects, so the
+    /// round trip exercises table growth rather than a hand-picked vector.
+    fn lzw_encode(data: &[u8], early_change: bool) -> Vec<u8> {
+        let early = usize::from(early_change);
+        let mut dict: std::collections::HashMap<Vec<u8>, u16> =
+            (0..=255u16).map(|b| (vec![b as u8], b)).collect();
+        let mut next = 258u16;
+        let mut width = 9usize;
+        let mut bits: Vec<u8> = Vec::new();
+        let emit = |code: u16, width: usize, bits: &mut Vec<u8>| {
+            for i in (0..width).rev() {
+                bits.push(((code >> i) & 1) as u8);
+            }
+        };
+        emit(LZW_CLEAR, width, &mut bits);
+        let mut current: Vec<u8> = Vec::new();
+        for &byte in data {
+            let mut candidate = current.clone();
+            candidate.push(byte);
+            if dict.contains_key(&candidate) {
+                current = candidate;
+            } else {
+                emit(dict[&current], width, &mut bits);
+                if (next as usize) < LZW_MAX {
+                    dict.insert(candidate, next);
+                    next += 1;
+                }
+                width = match next as usize - 1 + early {
+                    n if n >= 2048 => 12,
+                    n if n >= 1024 => 11,
+                    n if n >= 512 => 10,
+                    _ => 9,
+                };
+                current = vec![byte];
+            }
+        }
+        if !current.is_empty() {
+            emit(dict[&current], width, &mut bits);
+        }
+        emit(LZW_EOD, width, &mut bits);
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        bits.chunks(8)
+            .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | b))
+            .collect()
+    }
+
+    #[test]
+    fn lzw_round_trip_grows_the_code_width() {
+        // Long enough to push the table past 511 entries and force 10-bit codes.
+        let mut payload = Vec::new();
+        for i in 0..4000u32 {
+            payload.extend_from_slice(format!("token{} ", i % 900).as_bytes());
+        }
+        let encoded = lzw_encode(&payload, true);
+        assert_eq!(lzw_decode(&encoded, true).unwrap(), payload);
+    }
+
+    #[test]
+    fn lzw_handles_early_change_off() {
+        let payload = b"aaabbbcccaaabbbccc-repeat-aaabbbccc".repeat(40);
+        let encoded = lzw_encode(&payload, false);
+        assert_eq!(lzw_decode(&encoded, false).unwrap(), payload);
+    }
+
+    #[test]
+    fn lzw_decodes_a_content_stream_through_the_dictionary() {
+        let content = b"BT /F1 24 Tf 72 700 Td (LZW) Tj ET".to_vec();
+        let mut dict = Dictionary::new();
+        dict.insert("Filter".into(), PdfObject::Name("LZWDecode".into()));
+        let encoded = lzw_encode(&content, true);
+        assert_eq!(decode_with_dict(&dict, &encoded).unwrap(), content);
+    }
+
+    #[test]
+    fn lzw_truncated_input_returns_what_it_recovered() {
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(20);
+        let encoded = lzw_encode(&payload, true);
+        let decoded = lzw_decode(&encoded[..encoded.len() / 2], true).unwrap();
+        assert!(!decoded.is_empty(), "partial LZW should still yield bytes");
+        assert!(payload.starts_with(&decoded[..decoded.len().min(20)]));
+    }
+
+    #[test]
+    fn run_length_literals_and_runs() {
+        // 2 -> copy 3 literal bytes; 254 -> repeat next byte 3 times; 128 ends.
+        let encoded = [2u8, b'a', b'b', b'c', 254, b'z', 128, b'j', b'u', b'n', b'k'];
+        assert_eq!(run_length_decode(&encoded).unwrap(), b"abczzz");
+    }
+
+    #[test]
+    fn run_length_without_terminator_still_decodes() {
+        let encoded = [1u8, b'h', b'i'];
+        assert_eq!(run_length_decode(&encoded).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn truncated_flate_keeps_what_inflated() {
+        let payload = b"the quick brown fox jumps over the lazy dog".repeat(40);
+        let encoded = flate_encode(&payload);
+        let decoded = flate_decode(&encoded[..encoded.len() - 12]).unwrap();
+        assert!(!decoded.is_empty(), "partial inflate should still yield bytes");
+        assert!(payload.starts_with(&decoded[..]));
+    }
+
+    #[test]
+    fn flate_that_yields_nothing_is_still_an_error() {
+        assert!(flate_decode(b"not compressed at all").is_err());
+    }
+
+    #[test]
+    fn crypt_filter_passes_bytes_through() {
+        let parms = DecodeParms::default();
+        assert_eq!(decode("Crypt", b"already-decrypted", &parms).unwrap(), b"already-decrypted");
+    }
+
     #[test]
     fn flate_round_trip() {
         let data = b"hello hello hello hello".to_vec();
@@ -338,6 +600,7 @@ mod tests {
             colors: 1,
             bits_per_component: 8,
             columns: 4,
+            ..DecodeParms::default()
         };
         let raw = [
             2u8, 1, 2, 3, 4, // row 1: prev row is zeros -> 1 2 3 4

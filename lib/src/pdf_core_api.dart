@@ -25,6 +25,23 @@ class PdfException implements Exception {
   String toString() => 'PdfException($code): $message';
 }
 
+/// A rendered page and anything the renderer had to leave out of it.
+///
+/// A page can render successfully and still not be a faithful copy — an image
+/// in a codec this build does not read, or text in a font the document never
+/// embedded and which is therefore drawn in a substitute face. The warnings
+/// let a caller say so rather than presenting an approximation as exact.
+class PdfRenderedPng {
+  const PdfRenderedPng(this.bytes, this.warnings);
+
+  final Uint8List bytes;
+
+  /// Human-readable notes, empty when the page rendered exactly as authored.
+  final List<String> warnings;
+
+  bool get isApproximate => warnings.isNotEmpty;
+}
+
 /// Document metadata (all fields optional).
 ///
 /// When passed to [PdfCore.setMetadata]: `null` leaves a field untouched,
@@ -287,6 +304,22 @@ class PdfCore {
     });
   }
 
+  /// As [renderPagePng], but also reports what the renderer had to skip.
+  ///
+  /// The warnings come from a thread-local the native side fills in during the
+  /// render, so they are read here, immediately after the call that set them.
+  static PdfRenderedPng renderPagePngWithWarnings(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) {
+    final bytes =
+        renderPagePng(path, page, width: width, height: height, password: password);
+    return PdfRenderedPng(bytes, _lastWarnings());
+  }
+
   /// Rasterize [page] (0-based) to raw RGBA8 — the cheapest path to a
   /// `ui.Image`, with no encode/decode round trip.
   static PdfRenderedPage renderPageRgba(
@@ -435,6 +468,20 @@ class PdfCore {
       Isolate.run(() => renderPagePng(path, page,
           width: width, height: height, password: password));
 
+  /// [renderPagePngWithWarnings] on a background isolate.
+  ///
+  /// Both the render and the warning read happen inside the isolate, which is
+  /// the only place the thread-local they live in is valid.
+  static Future<PdfRenderedPng> renderPagePngWithWarningsAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+  }) =>
+      Isolate.run(() => renderPagePngWithWarnings(path, page,
+          width: width, height: height, password: password));
+
   static Future<PdfRenderedPage> renderPageRgbaAsync(
     String path,
     int page, {
@@ -523,6 +570,12 @@ class PdfCore {
     if (status != 0) {
       throw _lastError();
     }
+  }
+
+  static List<String> _lastWarnings() {
+    final raw = _b.lastWarnings().toDartString();
+    if (raw.isEmpty) return const [];
+    return raw.split('\n').where((line) => line.isNotEmpty).toList();
   }
 
   static PdfException _lastError() {

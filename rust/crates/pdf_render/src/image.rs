@@ -1,10 +1,14 @@
 //! Decoding PDF image XObjects into RGB samples.
 //!
-//! `PdfDocument::stream_data` already unwinds Flate/ASCII filters, but it
-//! stops at `DCTDecode` because that is a picture format rather than a byte
-//! filter. This module handles the split: JPEG payloads go to the decoder,
-//! everything else comes back as raw component samples that are then read
-//! through the image's colour space.
+//! `PdfDocument::stream_data` already unwinds the byte filters (Flate, LZW,
+//! RunLength, ASCII), but stops at the picture formats. This module handles
+//! the split: JPEG payloads go to the JPEG decoder, CCITT G3/G4 fax data to
+//! [`crate::ccitt`], and everything else comes back as raw component samples
+//! read through the image's colour space.
+//!
+//! JPXDecode (JPEG 2000) and JBIG2Decode remain unread. They are reported by
+//! name rather than skipped silently, so a page missing an image says which
+//! format it wanted.
 
 use pdf_core::document::PdfDocument;
 use pdf_core::filter::{decode, DecodeParms};
@@ -12,6 +16,7 @@ use pdf_core::object::{Dictionary, PdfObject};
 use pdf_core::stream::PdfStream;
 
 use crate::canvas::Rgb;
+use crate::ccitt;
 
 /// A decoded image, ready to sample.
 pub struct DecodedImage {
@@ -145,7 +150,7 @@ pub fn decode_image(doc: &PdfDocument, stream: &PdfStream) -> Option<DecodedImag
         });
 
     let filters = filter_names(doc, dict);
-    let data = defilter(doc, stream, &filters)?;
+    let data = defilter(doc, stream, &filters, width, height)?;
 
     let mut image = if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
         decode_jpeg(&data, width, height)?
@@ -168,24 +173,91 @@ pub fn decode_image(doc: &PdfDocument, stream: &PdfStream) -> Option<DecodedImag
 
 /// Apply the whole filter chain except a trailing image codec, which is
 /// handed back untouched for the JPEG decoder.
-fn defilter(doc: &PdfDocument, stream: &PdfStream, filters: &[String]) -> Option<Vec<u8>> {
+fn defilter(
+    doc: &PdfDocument,
+    stream: &PdfStream,
+    filters: &[String],
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
     let mut data = stream.data.clone();
     let parms = decode_parms(doc, &stream.dictionary, filters.len());
+    let raw_parms = raw_decode_parms(doc, &stream.dictionary, filters.len());
     for (i, name) in filters.iter().enumerate() {
         match name.as_str() {
-            // Image codecs terminate the byte-filter chain.
-            "DCTDecode" | "DCT" | "JPXDecode" | "JBIG2Decode" | "CCITTFaxDecode" | "CCF" => {
-                if name == "DCTDecode" || name == "DCT" {
-                    return Some(data);
-                }
-                return None; // JPX/JBIG2/CCITT are out of scope.
+            // JPEG is decoded by the image path rather than here, so its
+            // bytes pass through untouched.
+            "DCTDecode" | "DCT" => return Some(data),
+            "CCITTFaxDecode" | "CCF" => {
+                let params = ccitt_params(doc, raw_parms.get(i).and_then(Option::as_ref), width, height);
+                return ccitt::decode(&data, &params);
             }
+            // Still out of scope; the renderer reports these by name.
+            "JPXDecode" | "JBIG2Decode" => return None,
             _ => {
                 data = decode(name, &data, &parms[i]).ok()?;
             }
         }
     }
     Some(data)
+}
+
+/// The per-filter `/DecodeParms` dictionaries themselves, which CCITT needs
+/// because its parameters do not fit the byte-filter `DecodeParms` struct.
+fn raw_decode_parms(
+    doc: &PdfDocument,
+    dict: &Dictionary,
+    count: usize,
+) -> Vec<Option<Dictionary>> {
+    let mut out = vec![None; count.max(1)];
+    let raw = dict
+        .get("DecodeParms")
+        .or_else(|| dict.get("DP"))
+        .map(|o| doc.resolve_value(o));
+    match raw {
+        Some(PdfObject::Dictionary(d)) => out[0] = Some(d),
+        Some(PdfObject::Array(items)) => {
+            for (i, item) in items.iter().take(out.len()).enumerate() {
+                if let PdfObject::Dictionary(d) = doc.resolve_value(item) {
+                    out[i] = Some(d);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn ccitt_params(
+    doc: &PdfDocument,
+    parms: Option<&Dictionary>,
+    width: usize,
+    height: usize,
+) -> ccitt::CcittParams {
+    let get = |key: &str, default: i64| -> i64 {
+        parms
+            .and_then(|d| d.get(key))
+            .map(|o| doc.resolve_value(o))
+            .and_then(|o| o.as_i64())
+            .unwrap_or(default)
+    };
+    let flag = |key: &str| -> bool {
+        matches!(
+            parms.and_then(|d| d.get(key)).map(|o| doc.resolve_value(o)),
+            Some(PdfObject::Bool(true))
+        )
+    };
+    ccitt::CcittParams {
+        k: get("K", 0) as i32,
+        // The specification's default is 1728, but the image dictionary's
+        // /Width is what the rest of the pipeline will read rows against, and
+        // the two only ever differ in broken files. Preferring /Width is
+        // never worse and rescues streams that simply omitted /Columns.
+        columns: get("Columns", width as i64).max(1) as usize,
+        rows: get("Rows", height as i64).max(0) as usize,
+        black_is_1: flag("BlackIs1"),
+        byte_align: flag("EncodedByteAlign"),
+    }
 }
 
 /// Per-filter `/DecodeParms`, resolved.
@@ -235,6 +307,7 @@ fn parms_from_dict(doc: &PdfDocument, dict: &Dictionary) -> DecodeParms {
         colors: get("Colors", 1).max(1) as usize,
         bits_per_component: get("BitsPerComponent", 8).max(1) as usize,
         columns: get("Columns", 1).max(1) as usize,
+        early_change: get("EarlyChange", 1) != 0,
     }
 }
 

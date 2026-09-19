@@ -6,6 +6,7 @@
 //! on top of the font's internal `cmap`.
 
 pub mod cff;
+pub mod fallback;
 pub mod truetype;
 
 use pdf_core::document::PdfDocument;
@@ -14,6 +15,7 @@ use pdf_text::font::{load_font, Font as TextFont};
 
 use crate::geom::Path;
 use cff::CffFont;
+use fallback::{FallbackFont, FallbackStyle};
 use truetype::TrueTypeFont;
 
 /// Why a font cannot be drawn, when it cannot.
@@ -24,10 +26,10 @@ pub enum GlyphSource {
     /// Embedded CFF / Type1C outlines are available.
     Cff,
     /// The font program is in a format this renderer does not interpret
-    /// (bare Type1, for instance). Text falls back to boxes.
+    /// (bare Type1, for instance), so a substitute face is drawn instead.
     UnsupportedProgram,
-    /// No font program embedded at all (one of the standard 14, or an
-    /// external reference). There are no outlines to draw.
+    /// No font program embedded at all — one of the standard 14, or an
+    /// external reference. A substitute face is drawn instead.
     NotEmbedded,
 }
 
@@ -50,6 +52,8 @@ pub struct RenderFont {
     composite: bool,
     /// `/Symbolic` flag from the font descriptor.
     symbolic: bool,
+    /// Substitute outlines, used when nothing usable was embedded.
+    fallback: Option<FallbackFont>,
 }
 
 impl RenderFont {
@@ -82,6 +86,25 @@ impl RenderFont {
             Some(descriptor) => load_program(doc, descriptor),
         };
 
+        // Nothing drawable was embedded. Rather than skip the text — which
+        // renders the page blank and looks like a broken file — borrow a
+        // substitute face matched to the font's declared weight and slope.
+        let fallback = if program.is_none() {
+            let base_font = owner
+                .get("BaseFont")
+                .and_then(PdfObject::as_name)
+                .or_else(|| dict.get("BaseFont").and_then(PdfObject::as_name))
+                .unwrap_or("");
+            let flags = descriptor
+                .as_ref()
+                .and_then(|d| d.get("Flags"))
+                .and_then(PdfObject::as_i64)
+                .unwrap_or(0);
+            FallbackFont::for_style(FallbackStyle::detect(base_font, flags))
+        } else {
+            None
+        };
+
         let cid_to_gid = descendant
             .as_ref()
             .and_then(|d| d.get("CIDToGIDMap"))
@@ -103,25 +126,67 @@ impl RenderFont {
             cid_to_gid,
             composite,
             symbolic,
+            fallback,
         }
     }
 
+    /// The em size the outlines from [`RenderFont::outline`] are expressed
+    /// in. It must track whichever source actually drew the glyph, or text
+    /// scales to the wrong size — Roboto's em is 2048, not 1000.
     pub fn units_per_em(&self) -> f64 {
         match &self.program {
             Some(Program::TrueType(f)) => f.units_per_em,
             Some(Program::Cff(f)) => f.units_per_em,
-            None => 1000.0,
+            None => self
+                .fallback
+                .as_ref()
+                .map(FallbackFont::units_per_em)
+                .unwrap_or(1000.0),
         }
     }
 
     pub fn can_draw_glyphs(&self) -> bool {
-        self.program.is_some()
+        self.program.is_some() || self.fallback.is_some()
+    }
+
+    /// True when the glyphs being drawn are a stand-in rather than the
+    /// document's own font, so a caller can note the page is approximate.
+    pub fn is_substituted(&self) -> bool {
+        self.program.is_none() && self.fallback.is_some()
+    }
+
+    /// Advance for one code, in text-space units (em/1000).
+    ///
+    /// The PDF's own `/Widths` wins whenever it has an entry, so substituted
+    /// text still breaks lines where the document intended. Only when the
+    /// document supplied nothing — legal for the standard 14 — does the
+    /// substitute's own metric fill in, which is far closer than the flat
+    /// 500-unit default it replaces.
+    pub fn advance_width(&self, code: u32) -> f64 {
+        if let Some(width) = self.text.explicit_width(code) {
+            return width;
+        }
+        if let Some(fallback) = self.fallback.as_ref() {
+            if let Some(ch) = self.text.decode_code(code).chars().next() {
+                if let Some(advance) = fallback.advance(ch) {
+                    return advance;
+                }
+            }
+        }
+        self.text.width(code)
     }
 
     /// Outline for one character code, in font units (y up, origin at the
     /// glyph origin). `None` when the glyph is blank or undrawable.
     pub fn outline(&self, code: u32) -> Option<Path> {
-        match self.program.as_ref()? {
+        let Some(program) = self.program.as_ref() else {
+            // Substituted: the code's Unicode meaning is the only handle we
+            // have on the stand-in face.
+            let fallback = self.fallback.as_ref()?;
+            let ch = self.text.decode_code(code).chars().next()?;
+            return fallback.outline_for_char(ch);
+        };
+        match program {
             Program::TrueType(program) => {
                 let gid = self.glyph_id(code, program)?;
                 program.glyph_outline(gid)
@@ -276,21 +341,48 @@ mod tests {
     use pdf_core::object::PdfObject;
 
     #[test]
-    fn missing_descriptor_reports_not_embedded() {
+    fn missing_descriptor_draws_a_substitute() {
         let doc = PdfDocument::new_empty("1.7");
         let mut dict = Dictionary::new();
         dict.insert("Type".into(), PdfObject::Name("Font".into()));
-        dict.insert("Subtype".into(), PdfObject::Name("TrueType".into()));
+        dict.insert("Subtype".into(), PdfObject::Name("Type1".into()));
+        dict.insert("BaseFont".into(), PdfObject::Name("Helvetica".into()));
         let font = RenderFont::load(&doc, &dict);
+        // Still honestly reported as not embedded...
         assert_eq!(font.source, GlyphSource::NotEmbedded);
-        assert!(!font.can_draw_glyphs());
-        assert!(font.outline(65).is_none());
+        // ...but it draws, because a blank page is the worse answer.
+        assert!(font.can_draw_glyphs());
+        assert!(font.is_substituted());
+        assert!(font.outline(65).is_some(), "'A' should have an outline");
     }
 
     #[test]
-    fn units_per_em_defaults_to_1000_without_a_program() {
+    fn units_per_em_follows_the_substitute_that_drew_the_glyph() {
         let doc = PdfDocument::new_empty("1.7");
-        let font = RenderFont::load(&doc, &Dictionary::new());
-        assert_eq!(font.units_per_em(), 1000.0);
+        let mut dict = Dictionary::new();
+        dict.insert("BaseFont".into(), PdfObject::Name("Helvetica".into()));
+        let font = RenderFont::load(&doc, &dict);
+        // Roboto's em is 2048; reporting 1000 here would scale text wrongly.
+        assert_eq!(font.units_per_em(), font.fallback.as_ref().unwrap().units_per_em());
+        assert!(font.units_per_em() > 0.0);
+    }
+
+    #[test]
+    fn document_widths_win_over_the_substitutes_own_metrics() {
+        let doc = PdfDocument::new_empty("1.7");
+        let mut dict = Dictionary::new();
+        dict.insert("Subtype".into(), PdfObject::Name("Type1".into()));
+        dict.insert("BaseFont".into(), PdfObject::Name("Helvetica".into()));
+        dict.insert("FirstChar".into(), PdfObject::Integer(65));
+        dict.insert(
+            "Widths".into(),
+            PdfObject::Array(vec![PdfObject::Integer(722)]),
+        );
+        let font = RenderFont::load(&doc, &dict);
+        assert_eq!(font.advance_width(65), 722.0);
+        // 'B' has no /Widths entry, so the substitute fills in — and must not
+        // return the flat 500 default that used to pile glyphs up.
+        let b = font.advance_width(66);
+        assert!(b > 0.0 && b != 500.0, "expected a real metric, got {b}");
     }
 }

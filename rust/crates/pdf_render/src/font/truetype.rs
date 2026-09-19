@@ -91,6 +91,26 @@ impl TrueTypeFont {
         self.num_glyphs
     }
 
+    /// Advance width for a glyph, in font units.
+    ///
+    /// `hmtx` stores one record per glyph only up to `numberOfHMetrics`;
+    /// every glyph beyond that reuses the last record's advance, which is how
+    /// monospaced tails are compressed.
+    pub fn advance(&self, glyph_id: u16) -> Option<f64> {
+        let (hhea, _) = *self.tables.get(b"hhea")?;
+        let metric_count = read_u16(&self.data, hhea + 34)?;
+        if metric_count == 0 {
+            return None;
+        }
+        let (hmtx, length) = *self.tables.get(b"hmtx")?;
+        let index = glyph_id.min(metric_count - 1) as usize;
+        let at = hmtx + index * 4;
+        if at + 2 > hmtx + length {
+            return None;
+        }
+        read_u16(&self.data, at).map(f64::from)
+    }
+
     pub fn has_outlines(&self) -> bool {
         !self.loca.is_empty() && self.tables.contains_key(b"glyf")
     }

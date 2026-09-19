@@ -85,6 +85,8 @@ class PdfBindings {
   PdfBindings._(DynamicLibrary lib)
       : version = lib.lookupFunction<_VersionC, _VersionC>('pdf_core_version'),
         lastError = lib.lookupFunction<_LastErrorC, _LastErrorC>('pdf_last_error'),
+        lastWarnings =
+            lib.lookupFunction<_LastErrorC, _LastErrorC>('pdf_last_warnings'),
         freeString =
             lib.lookupFunction<_FreeStringC, _FreeStringDart>('pdf_free_string'),
         pageCount =
@@ -118,6 +120,7 @@ class PdfBindings {
 
   final _VersionC version;
   final _LastErrorC lastError;
+  final _LastErrorC lastWarnings;
   final _FreeStringDart freeString;
   final _PageCountDart pageCount;
   final _Str2C inspectJson;

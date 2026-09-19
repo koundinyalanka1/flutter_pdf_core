@@ -5,6 +5,7 @@
 //! parser the text extractor uses.
 
 pub mod canvas;
+pub mod ccitt;
 pub mod font;
 pub mod geom;
 pub mod image;

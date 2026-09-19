@@ -23,6 +23,18 @@ use pdf_core::error::PdfError;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+    /// Set by the most recent render on this thread. A render that succeeded
+    /// but had to leave something out — an image codec this build cannot
+    /// read, a font the document did not embed — says so here, so the caller
+    /// can tell an exact page from an approximate one.
+    static LAST_WARNINGS: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+}
+
+fn set_warnings(warnings: &[String]) {
+    let joined = warnings.join("\n").replace('\0', " ");
+    LAST_WARNINGS.with(|slot| {
+        *slot.borrow_mut() = CString::new(joined).unwrap_or_default();
+    });
 }
 
 fn set_error(message: impl Into<String>) {
@@ -146,6 +158,16 @@ pub extern "C" fn pdf_core_version() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn pdf_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+}
+
+/// Borrowed pointer to the warnings from the last render on this thread (do
+/// NOT free). Empty when the page rendered exactly as authored.
+///
+/// Newline-separated. Valid until the next render on the same thread, so a
+/// caller reads it immediately after the render call that produced it.
+#[no_mangle]
+pub extern "C" fn pdf_last_warnings() -> *const c_char {
+    LAST_WARNINGS.with(|slot| slot.borrow().as_ptr())
 }
 
 /// Free a string returned by this library.
@@ -605,6 +627,7 @@ pub unsafe extern "C" fn pdf_render_page_png(
             page.max(0) as usize,
             render_options(target_width, target_height),
         )?;
+        set_warnings(&rendered.warnings);
         pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
             .ok_or_else(|| PdfError::Structure("could not encode PNG".into()))
     }));
@@ -660,6 +683,7 @@ pub unsafe extern "C" fn pdf_render_page_rgba(
         Ok(Ok(rendered)) => {
             *out_width = rendered.width as i32;
             *out_height = rendered.height as i32;
+            set_warnings(&rendered.warnings);
             release_buffer(rendered.pixels, out_len)
         }
         Ok(Err(err)) => {

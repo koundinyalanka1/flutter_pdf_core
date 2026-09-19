@@ -7,13 +7,18 @@
 //! Supported: the graphics state stack, path construction and painting
 //! (fill/stroke/even-odd), arbitrary clipping paths, DeviceGray/RGB/CMYK plus
 //! ICCBased/Indexed/Separation colour, constant alpha from `/ExtGState`,
-//! image XObjects (JPEG, Flate, stencil masks, soft masks), form XObjects and
-//! TrueType text.
+//! image XObjects (JPEG, CCITT G3/G4, Flate, LZW, stencil masks, soft masks),
+//! form XObjects, and text in TrueType or CFF outlines.
+//!
+//! Text whose font the document did not embed — the standard 14, or a program
+//! in a format this renderer cannot parse — is drawn in a substitute face; see
+//! [`crate::font::fallback`]. It is drawn, not skipped, because a page of
+//! invisible text is indistinguishable from a broken file.
 //!
 //! Not supported, and deliberately skipped rather than failed: shading
 //! patterns (`sh`), tiling patterns, inline images (`BI…EI`), blend modes and
-//! CFF/Type1 glyph outlines. Pages using those render with everything else
-//! intact.
+//! JPX/JBIG2 image codecs. Pages using those render with everything else
+//! intact, and [`RenderedPage::warnings`] says what was left out.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -62,6 +67,11 @@ pub struct RenderedPage {
     pub height: u32,
     /// RGBA8, row-major, top-left origin.
     pub pixels: Vec<u8>,
+    /// Things that were skipped while drawing — an image codec this build
+    /// cannot read, a font with no usable outlines. The page still rendered,
+    /// but it is not a faithful copy, and a caller that shows it should be
+    /// able to say so instead of presenting a silently incomplete page.
+    pub warnings: Vec<String>,
 }
 
 /// Rasterize page `index` (0-based).
@@ -135,21 +145,48 @@ pub fn render_page(
         .unwrap_or_default();
     let content = page_content(doc, &page)?;
 
+    // Every content stream failed to decode, so there is nothing to draw and
+    // no honest way to call the result a render. Returning white pixels here
+    // is what made unsupported filters look like empty documents; the caller
+    // needs the reason so it can say what actually went wrong.
+    if content.streams > 0 && content.failed == content.streams {
+        let reason = content
+            .first_error
+            .unwrap_or_else(|| "content stream could not be decoded".to_owned());
+        return Err(PdfError::Filter(format!(
+            "page {} has no decodable content: {reason}",
+            index + 1
+        )));
+    }
+
     let mut renderer = Renderer {
         doc,
         canvas: &mut canvas,
         fonts: HashMap::new(),
         depth: 0,
+        warnings: Vec::new(),
     };
     let mut state = GraphicsState::new(base_ctm);
-    // A failed content stream should still yield the page background rather
-    // than an error — damaged files are common and a blank page beats none.
-    let _ = renderer.run(&content, &resources, &mut state);
+    // Parsing recovers from damage rather than failing, so this only errors
+    // in cases the renderer genuinely cannot proceed from; the page
+    // background is still a better answer than no page at all.
+    let _ = renderer.run(&content.data, &resources, &mut state);
+
+    let mut warnings = renderer.warnings;
+    if content.failed > 0 {
+        warnings.push(format!(
+            "{} of {} content streams could not be decoded",
+            content.failed, content.streams
+        ));
+    }
+    warnings.sort();
+    warnings.dedup();
 
     Ok(RenderedPage {
         width: out_w as u32,
         height: out_h as u32,
         pixels: canvas.pixels,
+        warnings,
     })
 }
 
@@ -234,9 +271,24 @@ struct Renderer<'a> {
     canvas: &'a mut Canvas,
     fonts: HashMap<String, Rc<RenderFont>>,
     depth: usize,
+    warnings: Vec<String>,
 }
 
 impl Renderer<'_> {
+    /// Record something the page needed but this build could not draw.
+    ///
+    /// Deduplicated on the way in, not just on the way out: `show_text` runs
+    /// once per text-showing operator, so a page of substituted text would
+    /// otherwise spend the whole cap on copies of one message and crowd out
+    /// the distinct ones — a skipped image, say — that come later.
+    fn warn(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.warnings.len() >= 32 || self.warnings.iter().any(|w| *w == message) {
+            return;
+        }
+        self.warnings.push(message);
+    }
+
     fn run(
         &mut self,
         content: &[u8],
@@ -539,8 +591,16 @@ impl Renderer<'_> {
         let invisible = state.render_mode == 3 || state.render_mode == 7;
         let units_per_em = font.units_per_em();
 
+        if !invisible {
+            if font.is_substituted() {
+                self.warn("some text uses a substitute font: the document did not embed its own");
+            } else if !font.can_draw_glyphs() {
+                self.warn("some text could not be drawn: no usable font outlines");
+            }
+        }
+
         for code in font.text.codes(bytes) {
-            let width = font.text.width(code) / 1000.0;
+            let width = font.advance_width(code) / 1000.0;
 
             if !invisible && font.can_draw_glyphs() {
                 if let Some(outline) = font.outline(code) {
@@ -655,6 +715,8 @@ impl Renderer<'_> {
     /// intermediate.
     fn draw_image(&mut self, stream: &pdf_core::stream::PdfStream, state: &GraphicsState) {
         let Some(image) = decode_image(self.doc, stream) else {
+            let codec = image_codec_name(self.doc, stream);
+            self.warn(format!("image skipped: {codec} is not supported"));
             return;
         };
         let Some(inverse) = state.ctm.invert() else {
@@ -769,24 +831,83 @@ fn color_from(values: &[f64]) -> Option<Rgb> {
     }
 }
 
-fn page_content(doc: &PdfDocument, page: &Dictionary) -> Result<Vec<u8>> {
-    let Some(entry) = page.get("Contents") else {
-        return Ok(Vec::new());
+/// The image codec a stream asks for, for a warning the user can act on.
+fn image_codec_name(doc: &PdfDocument, stream: &pdf_core::stream::PdfStream) -> String {
+    let entry = stream
+        .dictionary
+        .get("Filter")
+        .or_else(|| stream.dictionary.get("F"))
+        .map(|o| doc.resolve_value(o));
+    let names: Vec<String> = match entry {
+        Some(PdfObject::Name(name)) => vec![name],
+        Some(PdfObject::Array(items)) => items
+            .iter()
+            .map(|o| doc.resolve_value(o))
+            .filter_map(|o| o.as_name().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
     };
-    let mut out = Vec::new();
+    names
+        .into_iter()
+        .rev()
+        .find(|n| {
+            matches!(
+                n.as_str(),
+                "JPXDecode" | "JBIG2Decode" | "CCITTFaxDecode" | "CCF" | "DCTDecode" | "DCT"
+            )
+        })
+        .unwrap_or_else(|| "this image format".to_owned())
+}
+
+/// A page's concatenated content streams, plus what it cost to get them.
+struct PageContent {
+    data: Vec<u8>,
+    /// How many content streams were present, and how many would not decode.
+    streams: usize,
+    failed: usize,
+    /// Why the first failure happened, for the error message.
+    first_error: Option<String>,
+}
+
+fn page_content(doc: &PdfDocument, page: &Dictionary) -> Result<PageContent> {
+    let mut content = PageContent {
+        data: Vec::new(),
+        streams: 0,
+        failed: 0,
+        first_error: None,
+    };
+    let Some(entry) = page.get("Contents") else {
+        return Ok(content);
+    };
+
+    let take = |content: &mut PageContent, stream: &pdf_core::stream::PdfStream| {
+        content.streams += 1;
+        match doc.stream_data(stream) {
+            Ok(bytes) => {
+                content.data.extend_from_slice(&bytes);
+                content.data.push(b'\n');
+            }
+            Err(err) => {
+                content.failed += 1;
+                if content.first_error.is_none() {
+                    content.first_error = Some(err.to_string());
+                }
+            }
+        }
+    };
+
     match doc.resolve_value(entry) {
-        PdfObject::Stream(stream) => out = doc.stream_data(&stream).unwrap_or_default(),
+        PdfObject::Stream(stream) => take(&mut content, &stream),
         PdfObject::Array(items) => {
             for item in items {
                 if let PdfObject::Stream(stream) = doc.resolve_value(&item) {
-                    out.extend_from_slice(&doc.stream_data(&stream).unwrap_or_default());
-                    out.push(b'\n');
+                    take(&mut content, &stream);
                 }
             }
         }
         _ => {}
     }
-    Ok(out)
+    Ok(content)
 }
 
 fn rect(doc: &PdfDocument, page: &Dictionary, key: &str) -> Option<(f64, f64, f64, f64)> {

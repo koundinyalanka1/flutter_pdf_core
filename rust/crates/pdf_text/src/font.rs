@@ -70,6 +70,15 @@ impl Font {
         self.widths.get(&code).copied().unwrap_or(self.default_width)
     }
 
+    /// The width the document itself gave for this code, if it gave one.
+    ///
+    /// Distinguishes "the PDF says this glyph is 722 wide" from "the PDF said
+    /// nothing and 500 is a guess", which is the difference between honouring
+    /// a document's layout and inventing one.
+    pub fn explicit_width(&self, code: u32) -> Option<f64> {
+        self.widths.get(&code).copied()
+    }
+
     /// Whether a (single-byte) code is an ASCII space — used for Tw.
     pub fn is_space_code(&self, code: u32) -> bool {
         !self.two_byte_codes && code == 32
