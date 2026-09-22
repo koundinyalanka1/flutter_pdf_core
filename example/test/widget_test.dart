@@ -2,7 +2,6 @@
 // which isn't available in plain `flutter test`, so we only verify that the
 // app builds and renders its scaffold (the demo reports errors in-app).
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:flutter_pdf_core_example/main.dart';
