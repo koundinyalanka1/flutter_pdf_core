@@ -37,9 +37,9 @@ use crate::image::decode_image;
 /// How large to render.
 #[derive(Debug, Clone, Copy)]
 pub enum RenderSize {
-    /// Multiply the page's point size by this factor (1.0 = 72 dpi).
+    /// Multiply the page's point size by this finite, positive factor (1.0 = 72 dpi).
     Scale(f64),
-    /// Fit inside this pixel box, preserving aspect ratio.
+    /// Fit inside this nonzero pixel box, preserving aspect ratio where possible.
     FitBox { width: u32, height: u32 },
 }
 
@@ -48,7 +48,7 @@ pub struct RenderOptions {
     pub size: RenderSize,
     pub background: Rgb,
     /// Hard cap on output pixels, so a malformed /MediaBox cannot ask for a
-    /// gigapixel buffer on a phone.
+    /// gigapixel buffer on a phone. Must be at least one.
     pub max_pixels: usize,
 }
 
@@ -90,8 +90,7 @@ pub fn render_page(
     let box_rect = rect(doc, &page, "CropBox")
         .or_else(|| rect(doc, &page, "MediaBox"))
         .unwrap_or((0.0, 0.0, 612.0, 792.0));
-    let page_w = (box_rect.2 - box_rect.0).abs().max(1.0);
-    let page_h = (box_rect.3 - box_rect.1).abs().max(1.0);
+    let (page_w, page_h) = box_dimensions(box_rect)?;
 
     let rotate = page
         .get("Rotate")
@@ -106,19 +105,7 @@ pub fn render_page(
         (page_w, page_h)
     };
 
-    let scale = match options.size {
-        RenderSize::Scale(s) => s.max(0.01),
-        RenderSize::FitBox { width, height } => {
-            (width as f64 / display_w).min(height as f64 / display_h).max(0.01)
-        }
-    };
-    let mut out_w = (display_w * scale).round().max(1.0) as usize;
-    let mut out_h = (display_h * scale).round().max(1.0) as usize;
-    if out_w * out_h > options.max_pixels {
-        let shrink = (options.max_pixels as f64 / (out_w * out_h) as f64).sqrt();
-        out_w = ((out_w as f64 * shrink).round() as usize).max(1);
-        out_h = ((out_h as f64 * shrink).round() as usize).max(1);
-    }
+    let (out_w, out_h) = output_dimensions(display_w, display_h, options)?;
 
     let mut canvas = Canvas::new(out_w, out_h);
     canvas.fill_background(options.background);
@@ -132,10 +119,7 @@ pub fn render_page(
         270 => Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, page_w),
         _ => Matrix::IDENTITY,
     };
-    let device_scale = Matrix::scale(
-        out_w as f64 / display_w,
-        out_h as f64 / display_h,
-    );
+    let device_scale = Matrix::scale(out_w as f64 / display_w, out_h as f64 / display_h);
     let base_ctm = flip.then(&rotation).then(&device_scale);
 
     let resources = page
@@ -200,10 +184,11 @@ pub fn page_size_points(doc: &PdfDocument, index: usize) -> Result<(f64, f64)> {
     let r = rect(doc, &page, "CropBox")
         .or_else(|| rect(doc, &page, "MediaBox"))
         .unwrap_or((0.0, 0.0, 612.0, 792.0));
-    let (w, h) = ((r.2 - r.0).abs().max(1.0), (r.3 - r.1).abs().max(1.0));
+    let (w, h) = box_dimensions(r)?;
     let rotate = page
         .get("Rotate")
-        .and_then(PdfObject::as_i64)
+        .map(|o| doc.resolve_value(o))
+        .and_then(|o| o.as_i64())
         .unwrap_or(0)
         .rem_euclid(360);
     Ok(if rotate == 90 || rotate == 270 {
@@ -211,6 +196,56 @@ pub fn page_size_points(doc: &PdfDocument, index: usize) -> Result<(f64, f64)> {
     } else {
         (w, h)
     })
+}
+
+fn box_dimensions(rect: (f64, f64, f64, f64)) -> Result<(f64, f64)> {
+    let width = (rect.2 - rect.0).abs();
+    let height = (rect.3 - rect.1).abs();
+    if !width.is_finite() || !height.is_finite() {
+        return Err(PdfError::Structure("page dimensions must be finite".into()));
+    }
+    Ok((width.max(1.0), height.max(1.0)))
+}
+
+fn output_dimensions(width: f64, height: f64, options: RenderOptions) -> Result<(usize, usize)> {
+    let requested_scale = match options.size {
+        RenderSize::Scale(scale) if scale.is_finite() && scale > 0.0 => scale,
+        RenderSize::FitBox {
+            width: w,
+            height: h,
+        } if w > 0 && h > 0 => (w as f64 / width).min(h as f64 / height),
+        _ => {
+            return Err(PdfError::Structure(
+                "render size must be finite and positive".into(),
+            ))
+        }
+    };
+    // RGBA allocations must fit Rust's allocation limit as well as the caller's
+    // pixel budget. Bound the scale before multiplying any dimensions.
+    // Canvas also allocates a coverage row of width + 2 f32 elements.
+    let budget = options.max_pixels.min(isize::MAX as usize / 4 - 2);
+    if budget == 0 {
+        return Err(PdfError::Structure(
+            "render pixel budget must be positive".into(),
+        ));
+    }
+    let side_limit = budget.min(u32::MAX as usize);
+    let scale = requested_scale
+        .min((budget as f64).sqrt() / width.sqrt() / height.sqrt())
+        .min(side_limit as f64 / width)
+        .min(side_limit as f64 / height);
+    let mut out_w = ((width * scale).round().max(1.0) as usize).min(side_limit);
+    let mut out_h = ((height * scale).round().max(1.0) as usize).min(side_limit);
+    // Rounding and the one-pixel minimum can raise the area above the budget,
+    // especially on very narrow pages. Division avoids overflowing w * h.
+    if out_w > budget / out_h {
+        if out_w >= out_h {
+            out_w = budget / out_h;
+        } else {
+            out_h = budget / out_w;
+        }
+    }
+    Ok((out_w, out_h))
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +999,158 @@ mod tests {
     use super::*;
     use pdf_core::stream::PdfStream;
 
+    #[test]
+    fn tiny_fit_boxes_are_respected() {
+        let doc = doc_with_content("", [0, 0, 200, 100]);
+        let page = render_page(
+            &doc,
+            0,
+            RenderOptions {
+                size: RenderSize::FitBox {
+                    width: 1,
+                    height: 1,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((page.width, page.height), (1, 1));
+    }
+
+    #[test]
+    fn extreme_aspect_ratios_respect_the_pixel_budget() {
+        for media in [[0, 0, 100_000, 1], [0, 0, 1, 100_000]] {
+            let doc = doc_with_content("", media);
+            let page = render_page(
+                &doc,
+                0,
+                RenderOptions {
+                    max_pixels: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(page.width > 0 && page.height > 0);
+            assert!(page.width as usize * page.height as usize <= 16);
+            assert_eq!(
+                page.pixels.len(),
+                page.width as usize * page.height as usize * 4
+            );
+        }
+    }
+
+    #[test]
+    fn huge_page_dimensions_cannot_overflow_pixel_accounting() {
+        let doc = doc_with_content("", [0, 0, i64::MAX, i64::MAX]);
+        let page = render_page(
+            &doc,
+            0,
+            RenderOptions {
+                max_pixels: 16,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((page.width, page.height), (4, 4));
+    }
+
+    #[test]
+    fn rounding_and_large_scales_cannot_exceed_pixel_budgets() {
+        for media in [[0, 0, 1, 1], [0, 0, 13, 29], [0, 0, 100_000, 1]] {
+            let doc = doc_with_content("", media);
+            for max_pixels in [1, 7, 17, 997] {
+                for scale in [f64::MIN_POSITIVE, 1.0, f64::MAX] {
+                    let page = render_page(
+                        &doc,
+                        0,
+                        RenderOptions {
+                            size: RenderSize::Scale(scale),
+                            max_pixels,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    assert!(page.width > 0 && page.height > 0);
+                    assert!(page.width as usize <= max_pixels / page.height as usize);
+                    assert_eq!(
+                        page.pixels.len(),
+                        page.width as usize * page.height as usize * 4
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_page_extents_are_errors() {
+        let mut doc = doc_with_content("", [0, 0, 200, 100]);
+        let id = doc.collect_page_ids().unwrap()[0];
+        let mut dict = doc.resolve(id).unwrap().as_dict().unwrap().clone();
+        dict.insert(
+            "MediaBox".into(),
+            PdfObject::Array(
+                [-f64::MAX, 0.0, f64::MAX, 100.0]
+                    .into_iter()
+                    .map(PdfObject::Real)
+                    .collect(),
+            ),
+        );
+        doc.set_object(id, PdfObject::Dictionary(dict));
+        assert!(page_size_points(&doc, 0).is_err());
+        assert!(render_page(&doc, 0, RenderOptions::default()).is_err());
+    }
+
+    #[test]
+    fn invalid_render_sizes_and_empty_budgets_are_errors() {
+        let doc = doc_with_content("", [0, 0, 2, 2]);
+        for size in [
+            RenderSize::Scale(0.0),
+            RenderSize::Scale(-1.0),
+            RenderSize::Scale(f64::NAN),
+            RenderSize::Scale(f64::INFINITY),
+            RenderSize::FitBox {
+                width: 0,
+                height: 10,
+            },
+            RenderSize::FitBox {
+                width: 10,
+                height: 0,
+            },
+        ] {
+            assert!(render_page(
+                &doc,
+                0,
+                RenderOptions {
+                    size,
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        }
+        assert!(render_page(
+            &doc,
+            0,
+            RenderOptions {
+                max_pixels: 0,
+                ..Default::default()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn page_size_resolves_indirect_rotation_like_rendering() {
+        let mut doc = doc_with_content("", [0, 0, 200, 100]);
+        let rotation = doc.add_object(PdfObject::Integer(90));
+        let id = doc.collect_page_ids().unwrap()[0];
+        let mut dict = doc.resolve(id).unwrap().as_dict().unwrap().clone();
+        dict.insert("Rotate".into(), PdfObject::Reference(rotation));
+        doc.set_object(id, PdfObject::Dictionary(dict));
+        assert_eq!(page_size_points(&doc, 0).unwrap(), (100.0, 200.0));
+        let page = render_page(&doc, 0, RenderOptions::default()).unwrap();
+        assert_eq!((page.width, page.height), (100, 200));
+    }
+
     /// Build a one-page document whose content stream is `content`.
     fn doc_with_content(content: &str, media: [i64; 4]) -> PdfDocument {
         let mut doc = PdfDocument::new_empty("1.7");
@@ -1092,10 +1279,7 @@ mod tests {
 
     #[test]
     fn q_restores_the_previous_state() {
-        let doc = doc_with_content(
-            "q 1 0 0 rg Q 0 0 100 100 re f",
-            [0, 0, 100, 100],
-        );
+        let doc = doc_with_content("q 1 0 0 rg Q 0 0 100 100 re f", [0, 0, 100, 100]);
         let page = render_page(&doc, 0, RenderOptions::default()).unwrap();
         // The red set inside q…Q must not survive; default fill is black.
         assert_eq!(pixel(&page, 50, 50), (0, 0, 0));
@@ -1114,10 +1298,7 @@ mod tests {
 
     #[test]
     fn strokes_are_painted() {
-        let doc = doc_with_content(
-            "0 0 0 RG 4 w 10 50 m 90 50 l S",
-            [0, 0, 100, 100],
-        );
+        let doc = doc_with_content("0 0 0 RG 4 w 10 50 m 90 50 l S", [0, 0, 100, 100]);
         let page = render_page(&doc, 0, RenderOptions::default()).unwrap();
         assert_eq!(pixel(&page, 50, 50), (0, 0, 0), "on the line");
         assert_eq!(pixel(&page, 50, 20), (255, 255, 255), "away from it");
@@ -1125,10 +1306,7 @@ mod tests {
 
     #[test]
     fn ext_gstate_alpha_is_applied() {
-        let mut doc = doc_with_content(
-            "/GS0 gs 0 0 0 rg 0 0 100 100 re f",
-            [0, 0, 100, 100],
-        );
+        let mut doc = doc_with_content("/GS0 gs 0 0 0 rg 0 0 100 100 re f", [0, 0, 100, 100]);
         // Attach an ExtGState with ca 0.5 to the page's resources.
         let mut gs = Dictionary::new();
         gs.insert("ca".into(), PdfObject::Real(0.5));

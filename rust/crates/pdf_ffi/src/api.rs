@@ -16,10 +16,10 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use pdf_ai::chunker::ChunkOptions;
-use pdf_ops::compose::{images_to_document, ComposeOptions, PageFit};
 use pdf_core::crypt::encrypt_to_bytes;
 use pdf_core::document::PdfDocument;
 use pdf_core::error::PdfError;
+use pdf_ops::compose::{images_to_document, ComposeOptions, PageFit};
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
@@ -56,6 +56,14 @@ fn error_code(err: &PdfError) -> &'static str {
 
 fn set_pdf_error(err: &PdfError) {
     set_error(format!("{}: {}", error_code(err), err));
+}
+
+fn non_negative_page(page: c_int) -> Result<usize, ()> {
+    usize::try_from(page).map_err(|_| {
+        set_error(format!(
+            "PAGE_OUT_OF_RANGE: page index {page} is out of bounds"
+        ));
+    })
 }
 
 unsafe fn cstr<'a>(ptr: *const c_char) -> Result<&'a str, ()> {
@@ -454,15 +462,18 @@ pub unsafe extern "C" fn pdf_extract_text(
     password: *const c_char,
     page: c_int,
 ) -> *mut c_char {
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
     let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
         return std::ptr::null_mut();
     };
     run_str(|| {
         let doc = open(path, password)?;
-        if page <= 0 {
+        if page == 0 {
             Ok(pdf_text::extractor::extract_all_pages(&doc)?.join("\u{0C}"))
         } else {
-            pdf_text::extractor::extract_page_text(&doc, (page - 1) as usize)
+            pdf_text::extractor::extract_page_text(&doc, page - 1)
         }
     })
 }
@@ -603,7 +614,8 @@ fn render_options(target_width: i32, target_height: i32) -> pdf_render::RenderOp
 /// Render page `page` (0-based) and return it as PNG bytes.
 ///
 /// Fits inside `target_width` x `target_height` pixels when both are positive.
-/// Free the result with `pdf_free_buffer`.
+/// Free the result with `pdf_free_buffer`. On failure, returns NULL and sets
+/// `out_len` to zero. Negative page indices are errors.
 ///
 /// # Safety
 /// All pointer arguments must be valid NUL-terminated C strings / writable
@@ -617,16 +629,22 @@ pub unsafe extern "C" fn pdf_render_page_png(
     target_height: i32,
     out_len: *mut i32,
 ) -> *mut u8 {
+    set_warnings(&[]);
+    if out_len.is_null() {
+        set_error("ERROR: null out_len");
+        return std::ptr::null_mut();
+    }
+    *out_len = 0;
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
     let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
         return std::ptr::null_mut();
     };
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, PdfError> {
         let doc = open(path, password)?;
-        let rendered = pdf_render::render_page(
-            &doc,
-            page.max(0) as usize,
-            render_options(target_width, target_height),
-        )?;
+        let rendered =
+            pdf_render::render_page(&doc, page, render_options(target_width, target_height))?;
         set_warnings(&rendered.warnings);
         pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
             .ok_or_else(|| PdfError::Structure("could not encode PNG".into()))
@@ -648,7 +666,8 @@ pub unsafe extern "C" fn pdf_render_page_png(
 ///
 /// Writes the pixel dimensions into `out_width`/`out_height` so the caller can
 /// hand the buffer straight to a GPU upload without re-parsing a container.
-/// Free the result with `pdf_free_buffer`.
+/// Free the result with `pdf_free_buffer`. All non-null output parameters are
+/// set to zero on failure. Negative page indices are errors.
 ///
 /// # Safety
 /// As [`pdf_render_page_png`].
@@ -664,27 +683,35 @@ pub unsafe extern "C" fn pdf_render_page_rgba(
     out_height: *mut i32,
     out_len: *mut i32,
 ) -> *mut u8 {
-    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
-        return std::ptr::null_mut();
-    };
-    if out_width.is_null() || out_height.is_null() {
+    set_warnings(&[]);
+    for output in [out_width, out_height, out_len] {
+        if !output.is_null() {
+            *output = 0;
+        }
+    }
+    if out_width.is_null() || out_height.is_null() || out_len.is_null() {
         set_error("ERROR: null out parameter");
         return std::ptr::null_mut();
     }
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<_, PdfError> {
         let doc = open(path, password)?;
-        pdf_render::render_page(
-            &doc,
-            page.max(0) as usize,
-            render_options(target_width, target_height),
-        )
+        pdf_render::render_page(&doc, page, render_options(target_width, target_height))
     }));
     match result {
         Ok(Ok(rendered)) => {
-            *out_width = rendered.width as i32;
-            *out_height = rendered.height as i32;
-            set_warnings(&rendered.warnings);
-            release_buffer(rendered.pixels, out_len)
+            let buffer = release_buffer(rendered.pixels, out_len);
+            if !buffer.is_null() {
+                *out_width = rendered.width as i32;
+                *out_height = rendered.height as i32;
+                set_warnings(&rendered.warnings);
+            }
+            buffer
         }
         Ok(Err(err)) => {
             set_pdf_error(&err);
@@ -697,7 +724,8 @@ pub unsafe extern "C" fn pdf_render_page_rgba(
     }
 }
 
-/// Page size in PostScript points, honouring `/Rotate`.
+/// Page size in PostScript points, honouring `/Rotate`. `page` is 0-based.
+/// Non-null output parameters are set to zero on failure.
 ///
 /// # Safety
 /// `out_width`/`out_height` must be writable.
@@ -709,16 +737,24 @@ pub unsafe extern "C" fn pdf_page_size(
     out_width: *mut f64,
     out_height: *mut f64,
 ) -> c_int {
-    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
-        return -1;
-    };
+    for output in [out_width, out_height] {
+        if !output.is_null() {
+            *output = 0.0;
+        }
+    }
     if out_width.is_null() || out_height.is_null() {
         set_error("ERROR: null out parameter");
         return -1;
     }
+    let Ok(page) = non_negative_page(page) else {
+        return -1;
+    };
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return -1;
+    };
     let (w, h) = match catch_unwind(AssertUnwindSafe(|| -> Result<(f64, f64), PdfError> {
         let doc = open(path, password)?;
-        pdf_render::page_size_points(&doc, page.max(0) as usize)
+        pdf_render::page_size_points(&doc, page)
     })) {
         Ok(Ok(size)) => size,
         Ok(Err(err)) => {
@@ -787,7 +823,6 @@ pub unsafe extern "C" fn pdf_images_to_pdf(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +830,142 @@ mod tests {
 
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
+    }
+
+    fn fixture_path() -> CString {
+        c(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/simple.pdf"
+        ))
+    }
+
+    #[test]
+    fn negative_page_indices_are_errors() {
+        let path = fixture_path();
+        let empty = c("");
+        unsafe {
+            for page in [-1, i32::MIN] {
+                let mut len = 0;
+                let png =
+                    pdf_render_page_png(path.as_ptr(), empty.as_ptr(), page, 10, 10, &mut len);
+                pdf_free_buffer(png, len);
+                assert!(png.is_null());
+                assert!(CStr::from_ptr(pdf_last_error())
+                    .to_str()
+                    .unwrap()
+                    .starts_with("PAGE_OUT_OF_RANGE:"));
+                let (mut width, mut height) = (0, 0);
+                let rgba = pdf_render_page_rgba(
+                    path.as_ptr(),
+                    empty.as_ptr(),
+                    page,
+                    10,
+                    10,
+                    &mut width,
+                    &mut height,
+                    &mut len,
+                );
+                pdf_free_buffer(rgba, len);
+                assert!(rgba.is_null());
+                assert!(CStr::from_ptr(pdf_last_error())
+                    .to_str()
+                    .unwrap()
+                    .starts_with("PAGE_OUT_OF_RANGE:"));
+                let (mut w, mut h) = (0.0, 0.0);
+                assert_eq!(
+                    pdf_page_size(path.as_ptr(), empty.as_ptr(), page, &mut w, &mut h),
+                    -1
+                );
+                assert!(CStr::from_ptr(pdf_last_error())
+                    .to_str()
+                    .unwrap()
+                    .starts_with("PAGE_OUT_OF_RANGE:"));
+            }
+        }
+    }
+
+    #[test]
+    fn text_extraction_rejects_negative_pages_but_zero_still_means_all() {
+        let path = fixture_path();
+        let empty = c("");
+        unsafe {
+            let invalid = pdf_extract_text(path.as_ptr(), empty.as_ptr(), -1);
+            pdf_free_string(invalid);
+            assert!(invalid.is_null());
+            assert!(CStr::from_ptr(pdf_last_error())
+                .to_str()
+                .unwrap()
+                .starts_with("PAGE_OUT_OF_RANGE:"));
+            let all = pdf_extract_text(path.as_ptr(), empty.as_ptr(), 0);
+            let first = pdf_extract_text(path.as_ptr(), empty.as_ptr(), 1);
+            assert!(!all.is_null() && !first.is_null());
+            assert_eq!(CStr::from_ptr(all), CStr::from_ptr(first));
+            pdf_free_string(all);
+            pdf_free_string(first);
+        }
+    }
+
+    #[test]
+    fn failed_renders_clear_outputs_and_previous_warnings() {
+        let path = fixture_path();
+        let empty = c("");
+        unsafe {
+            for input in [path.as_ptr(), std::ptr::null()] {
+                let mut len = 123;
+                set_warnings(&["previous render".to_owned()]);
+                assert!(pdf_render_page_png(input, empty.as_ptr(), 99, 10, 10, &mut len).is_null());
+                assert_eq!(len, 0);
+                assert!(CStr::from_ptr(pdf_last_warnings()).to_bytes().is_empty());
+                let (mut width, mut height, mut len) = (123, 123, 123);
+                set_warnings(&["previous render".to_owned()]);
+                assert!(pdf_render_page_rgba(
+                    input,
+                    empty.as_ptr(),
+                    99,
+                    10,
+                    10,
+                    &mut width,
+                    &mut height,
+                    &mut len
+                )
+                .is_null());
+                assert_eq!((width, height, len), (0, 0, 0));
+                assert!(CStr::from_ptr(pdf_last_warnings()).to_bytes().is_empty());
+                let (mut w, mut h) = (123.0, 123.0);
+                assert_eq!(pdf_page_size(input, empty.as_ptr(), 99, &mut w, &mut h), -1);
+                assert_eq!((w, h), (0.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn null_render_outputs_fail_before_rendering() {
+        let path = fixture_path();
+        let empty = c("");
+        unsafe {
+            assert!(pdf_render_page_png(
+                path.as_ptr(),
+                empty.as_ptr(),
+                0,
+                10,
+                10,
+                std::ptr::null_mut()
+            )
+            .is_null());
+            let (mut width, mut height) = (123, 123);
+            assert!(pdf_render_page_rgba(
+                path.as_ptr(),
+                empty.as_ptr(),
+                0,
+                10,
+                10,
+                &mut width,
+                &mut height,
+                std::ptr::null_mut()
+            )
+            .is_null());
+            assert_eq!((width, height), (0, 0));
+        }
     }
 
     #[test]
