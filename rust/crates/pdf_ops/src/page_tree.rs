@@ -10,6 +10,14 @@ use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 
 pub const INHERITABLE_KEYS: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 
+fn is_null(doc: &PdfDocument, value: &PdfObject) -> bool {
+    let value = match value {
+        PdfObject::Reference(id) => doc.resolve(*id),
+        value => Some(value),
+    };
+    matches!(value, None | Some(PdfObject::Null))
+}
+
 /// A page with its inherited attributes materialized.
 #[derive(Debug, Clone)]
 pub struct PageRef {
@@ -46,6 +54,9 @@ pub fn effective_page_dict(doc: &PdfDocument, page_id: ObjectId) -> Result<Dicti
         .and_then(PdfObject::as_dict)
         .cloned()
         .ok_or_else(|| PdfError::Structure(format!("page object {page_id:?} missing")))?;
+    // A null dictionary value is an absent entry (PDF 1.7, section 3.2.6).
+    // Keep non-null references intact so inherited resources remain shared.
+    dict.retain(|key, value| !INHERITABLE_KEYS.contains(&key.as_str()) || !is_null(doc, value));
     // Walk up /Parent links for any missing inheritable attribute.
     let mut parent = dict.get("Parent").and_then(PdfObject::as_ref);
     let mut depth = 0;
@@ -60,7 +71,9 @@ pub fn effective_page_dict(doc: &PdfDocument, page_id: ObjectId) -> Result<Dicti
         for key in INHERITABLE_KEYS {
             if !dict.contains_key(key) {
                 if let Some(value) = parent_dict.get(key) {
-                    dict.insert(key.to_owned(), value.clone());
+                    if !is_null(doc, value) {
+                        dict.insert(key.to_owned(), value.clone());
+                    }
                 }
             }
         }
@@ -80,7 +93,10 @@ pub fn page_attribute(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Option
         }
         let dict = doc.resolve(id).and_then(PdfObject::as_dict)?;
         if let Some(value) = dict.get(key) {
-            return Some(doc.resolve_value(value));
+            let value = doc.resolve_value(value);
+            if !matches!(value, PdfObject::Null) {
+                return Some(value);
+            }
         }
         current = dict.get("Parent").and_then(PdfObject::as_ref);
     }
@@ -213,6 +229,61 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::nested_doc;
     use super::*;
+
+    #[test]
+    fn null_attributes_inherit_through_ancestors_and_survive_rebuild() {
+        let mut doc = nested_doc(1);
+        let id = doc.collect_page_ids().unwrap()[0];
+        let null_id = doc.add_object(PdfObject::Null);
+        let mut page = doc.resolve(id).unwrap().as_dict().unwrap().clone();
+        page.insert("Rotate".into(), PdfObject::Null);
+        page.insert("MediaBox".into(), PdfObject::Reference(null_id));
+        doc.set_object(id, PdfObject::Dictionary(page));
+        let inner_id = ObjectId::new(3, 0);
+        let mut inner = doc.resolve(inner_id).unwrap().as_dict().unwrap().clone();
+        inner.insert("MediaBox".into(), PdfObject::Null);
+        doc.set_object(inner_id, PdfObject::Dictionary(inner));
+
+        assert_eq!(
+            page_attribute(&doc, id, "Rotate"),
+            Some(PdfObject::Integer(90))
+        );
+        let effective = effective_page_dict(&doc, id).unwrap();
+        assert_eq!(effective["Rotate"], PdfObject::Integer(90));
+        assert!(matches!(effective["MediaBox"], PdfObject::Array(_)));
+        assert_eq!(
+            page_attribute(&doc, id, "MediaBox"),
+            Some(effective["MediaBox"].clone())
+        );
+
+        rebuild_page_tree(&mut doc, &[id]).unwrap();
+        let reread = PdfDocument::from_bytes(&doc.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            effective_page_dict(&reread, id).unwrap()["MediaBox"],
+            effective["MediaBox"]
+        );
+        assert_eq!(
+            page_attribute(&reread, id, "Rotate"),
+            Some(PdfObject::Integer(90))
+        );
+    }
+
+    #[test]
+    fn explicit_zero_rotation_overrides_inheritance() {
+        let mut doc = nested_doc(1);
+        let id = doc.collect_page_ids().unwrap()[0];
+        let mut page = doc.resolve(id).unwrap().as_dict().unwrap().clone();
+        page.insert("Rotate".into(), PdfObject::Integer(0));
+        doc.set_object(id, PdfObject::Dictionary(page));
+        assert_eq!(
+            page_attribute(&doc, id, "Rotate"),
+            Some(PdfObject::Integer(0))
+        );
+        assert_eq!(
+            effective_page_dict(&doc, id).unwrap()["Rotate"],
+            PdfObject::Integer(0)
+        );
+    }
 
     #[test]
     fn walks_nested_tree_in_order() {

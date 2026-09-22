@@ -19,7 +19,7 @@ pub struct Chunk {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkOptions {
-    /// Target maximum characters per chunk.
+    /// Maximum Unicode characters per chunk. Zero is treated as one.
     pub max_chars: usize,
     /// Characters of trailing context repeated at the start of the next chunk.
     pub overlap: usize,
@@ -36,7 +36,7 @@ impl Default for ChunkOptions {
 
 /// Chunk page texts (one string per page, 0-based order).
 pub fn chunk_pages(pages: &[String], options: ChunkOptions) -> Vec<Chunk> {
-    let max_chars = options.max_chars.max(64);
+    let max_chars = options.max_chars.max(1);
     let overlap = options.overlap.min(max_chars / 2);
 
     // Flatten into (page_index, paragraph) units.
@@ -52,6 +52,10 @@ pub fn chunk_pages(pages: &[String], options: ChunkOptions) -> Vec<Chunk> {
 
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut current = String::new();
+    // End character offset and source page for each paragraph in `current`.
+    // Keep this provenance when carrying a suffix into the next chunk.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut current_chars = 0;
     let mut page_start: usize = 0;
     let mut page_end: usize = 0;
 
@@ -71,9 +75,12 @@ pub fn chunk_pages(pages: &[String], options: ChunkOptions) -> Vec<Chunk> {
         };
 
     for (page, para) in units {
+        let para_chars = para.chars().count();
         // Oversized paragraph: hard-split it on its own.
-        if para.chars().count() > max_chars {
+        if para_chars > max_chars {
             flush(&mut current, page_start, page_end, &mut chunks);
+            spans.clear();
+            current_chars = 0;
             for piece in split_hard(para, max_chars, overlap) {
                 chunks.push(Chunk {
                     id: chunks.len(),
@@ -88,21 +95,32 @@ pub fn chunk_pages(pages: &[String], options: ChunkOptions) -> Vec<Chunk> {
             continue;
         }
 
-        if current.is_empty() {
-            page_start = page;
-        } else if current.chars().count() + para.chars().count() + 2 > max_chars {
-            // Take the overlap tail before flushing.
-            let tail = overlap_tail(&current, overlap);
+        if !current.is_empty() && current_chars + para_chars + 2 > max_chars {
+            // Leave room for the new paragraph and its separator. Overlap is
+            // optional context; it must never make a chunk exceed the limit.
+            let available = max_chars.saturating_sub(para_chars).saturating_sub(2);
+            let tail = overlap_tail(&current, overlap.min(available));
+            let tail_chars = tail.chars().count();
+            let start = current_chars - tail_chars;
+            spans = spans
+                .into_iter()
+                .filter(|(end, _)| *end > start)
+                .map(|(end, source)| (end - start, source))
+                .collect();
             flush(&mut current, page_start, page_end, &mut chunks);
-            if !tail.is_empty() {
-                current.push_str(&tail);
-                current.push_str("\n\n");
-            }
-            page_start = page;
+            current = tail;
+            current_chars = tail_chars;
+        }
+        page_start = spans.first().map(|(_, source)| *source).unwrap_or(page);
+        if current.is_empty() {
+            current_chars = 0;
         } else {
             current.push_str("\n\n");
+            current_chars += 2;
         }
         current.push_str(para);
+        current_chars += para_chars;
+        spans.push((current_chars, page));
         page_end = page;
     }
     flush(&mut current, page_start, page_end, &mut chunks);
@@ -164,6 +182,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlap_fits_alongside_near_limit_paragraphs() {
+        let first = "word ".repeat(35).trim().to_owned();
+        let second = "next ".repeat(39).trim().to_owned();
+        let chunks = chunk_pages(
+            &[format!("{first}\n\n{second}")],
+            ChunkOptions {
+                max_chars: 200,
+                overlap: 40,
+            },
+        );
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].text.contains(&first));
+        assert!(chunks[1].text.contains(&second));
+        assert!(chunks.iter().all(|chunk| chunk.char_count <= 200));
+    }
+
+    #[test]
+    fn overlap_keeps_the_pages_that_contributed_its_text() {
+        let pages = vec!["zero ".repeat(8), "one ".repeat(8), "two ".repeat(8)];
+        let chunks = chunk_pages(
+            &pages,
+            ChunkOptions {
+                max_chars: 64,
+                overlap: 20,
+            },
+        );
+        let ranges: Vec<_> = chunks
+            .iter()
+            .map(|chunk| (chunk.page_start, chunk.page_end))
+            .collect();
+        assert_eq!(ranges, vec![(0, 0), (0, 1), (1, 2)]);
+        assert!(chunks[1].text.contains("zero"));
+        assert!(chunks[2].text.contains("one"));
+    }
+
+    #[test]
+    fn small_limits_count_unicode_characters_and_preserve_content() {
+        let original = "你好🙂世界".repeat(8);
+        for max_chars in [0, 1, 2, 12] {
+            let chunks = chunk_pages(
+                std::slice::from_ref(&original),
+                ChunkOptions {
+                    max_chars,
+                    overlap: 0,
+                },
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.text.as_str())
+                    .collect::<String>(),
+                original
+            );
+            for chunk in chunks {
+                assert_eq!(chunk.char_count, chunk.text.chars().count());
+                assert!((1..=max_chars.max(1)).contains(&chunk.char_count));
+            }
+        }
+    }
+
+    #[test]
     fn small_input_is_one_chunk() {
         let pages = vec!["Hello world.".to_string(), "Second page.".to_string()];
         let chunks = chunk_pages(&pages, ChunkOptions::default());
@@ -187,7 +266,11 @@ mod tests {
         );
         assert!(chunks.len() >= 2, "got {} chunks", chunks.len());
         for chunk in &chunks {
-            assert!(chunk.char_count <= 260, "chunk too big: {}", chunk.char_count);
+            assert!(
+                chunk.char_count <= 200,
+                "chunk too big: {}",
+                chunk.char_count
+            );
             assert_eq!(chunk.id, chunks.iter().position(|c| c == chunk).unwrap());
         }
     }

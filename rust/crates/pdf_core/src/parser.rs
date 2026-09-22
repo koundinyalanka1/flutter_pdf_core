@@ -43,8 +43,8 @@ impl<'a> Parser<'a> {
             ..
         }, ..] = self.lookahead.as_slice()
         {
-            if r == "R" && *obj >= 0 && *gen >= 0 {
-                let id = ObjectId::new(*obj as u32, *gen as u16);
+            if r == "R" {
+                let id = checked_object_id(*obj, *gen, self.position())?;
                 self.take()?;
                 self.take()?;
                 self.take()?;
@@ -75,9 +75,7 @@ impl<'a> Parser<'a> {
     pub fn parse_indirect_object(&mut self) -> Result<IndirectObject> {
         let obj = self.expect_integer("object number")?;
         let gen = self.expect_integer("generation number")?;
-        if obj < 0 || gen < 0 {
-            return Err(PdfError::parse(self.position(), "negative object id"));
-        }
+        let id = checked_object_id(obj, gen, self.position())?;
         self.expect_keyword("obj")?;
         let mut value = self.parse_object()?;
         self.fill(1)?;
@@ -105,10 +103,7 @@ impl<'a> Parser<'a> {
             value = PdfObject::Stream(PdfStream::new(dictionary, data));
         }
         self.expect_keyword("endobj")?;
-        Ok(IndirectObject {
-            id: ObjectId::new(obj as u32, gen as u16),
-            value,
-        })
+        Ok(IndirectObject { id, value })
     }
 
     fn parse_array(&mut self, start: usize) -> Result<PdfObject> {
@@ -189,9 +184,51 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn checked_object_id(number: i64, generation: i64, offset: usize) -> Result<ObjectId> {
+    let number = u32::try_from(number)
+        .map_err(|_| PdfError::parse(offset, "object number is out of range"))?;
+    let generation = u16::try_from(generation)
+        .map_err(|_| PdfError::parse(offset, "generation number is out of range"))?;
+    Ok(ObjectId::new(number, generation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_object_ids_that_would_wrap() {
+        for (number, generation) in [(4_294_967_297i64, 0), (1, 65_536), (-1, 0), (1, -1)] {
+            let reference = format!("{number} {generation} R");
+            assert!(
+                Parser::new(reference.as_bytes()).parse_object().is_err(),
+                "{reference}"
+            );
+            let indirect = format!("{number} {generation} obj null endobj");
+            assert!(
+                Parser::new(indirect.as_bytes())
+                    .parse_indirect_object()
+                    .is_err(),
+                "{indirect}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_object_id_boundaries() {
+        let id = ObjectId::new(u32::MAX, u16::MAX);
+        assert_eq!(
+            Parser::new(b"4294967295 65535 R").parse_object().unwrap(),
+            PdfObject::Reference(id)
+        );
+        assert_eq!(
+            Parser::new(b"4294967295 65535 obj null endobj")
+                .parse_indirect_object()
+                .unwrap()
+                .id,
+            id
+        );
+    }
 
     #[test]
     fn parses_primitives_and_reference() {

@@ -16,6 +16,16 @@ pub struct Rect {
 }
 
 impl Rect {
+    fn has_finite_area(self) -> bool {
+        let width = self.x1 - self.x0;
+        let height = self.y1 - self.y0;
+        [self.x0, self.y0, self.x1, self.y1, width, height]
+            .iter()
+            .all(|value| value.is_finite())
+            && width > 0.0
+            && height > 0.0
+    }
+
     pub fn to_array(self) -> PdfObject {
         PdfObject::Array(vec![
             PdfObject::Real(self.x0),
@@ -94,7 +104,8 @@ pub fn get_rotation(doc: &PdfDocument, index: usize) -> Result<i64> {
 /// Rotate one page by `delta` degrees relative to its current rotation.
 pub fn rotate_page(doc: &mut PdfDocument, index: usize, delta: i64) -> Result<()> {
     let current = get_rotation(doc, index)?;
-    let target = normalize_degrees(current + delta)?;
+    // Reduce the delta before adding so even large i64 inputs cannot wrap.
+    let target = normalize_degrees(current + normalize_degrees(delta)?)?;
     let page_id = page_id_at(doc, index)?;
     update_page_dict(doc, page_id, |dict| {
         dict.insert("Rotate".into(), PdfObject::Integer(target));
@@ -150,8 +161,10 @@ pub fn get_crop_box(doc: &PdfDocument, index: usize) -> Result<Rect> {
 
 /// Set the crop box of one page.
 pub fn set_crop_box(doc: &mut PdfDocument, index: usize, rect: Rect) -> Result<()> {
-    if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 {
-        return Err(PdfError::Structure("crop box has no area".into()));
+    if !rect.has_finite_area() {
+        return Err(PdfError::Structure(
+            "crop box must have finite, positive dimensions".into(),
+        ));
     }
     let page_id = page_id_at(doc, index)?;
     update_page_dict(doc, page_id, |dict| {
@@ -161,8 +174,10 @@ pub fn set_crop_box(doc: &mut PdfDocument, index: usize, rect: Rect) -> Result<(
 
 /// Set the media box of one page.
 pub fn set_media_box(doc: &mut PdfDocument, index: usize, rect: Rect) -> Result<()> {
-    if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 {
-        return Err(PdfError::Structure("media box has no area".into()));
+    if !rect.has_finite_area() {
+        return Err(PdfError::Structure(
+            "media box must have finite, positive dimensions".into(),
+        ));
     }
     let page_id = page_id_at(doc, index)?;
     update_page_dict(doc, page_id, |dict| {
@@ -174,6 +189,49 @@ pub fn set_media_box(doc: &mut PdfDocument, index: usize, rect: Rect) -> Result<
 mod tests {
     use super::*;
     use crate::page_tree::test_support::nested_doc;
+
+    #[test]
+    fn large_rotation_deltas_do_not_overflow() {
+        let mut doc = nested_doc(1);
+        let delta = i64::MAX - i64::MAX.rem_euclid(90);
+        rotate_page(&mut doc, 0, delta).unwrap();
+        assert_eq!(
+            get_rotation(&doc, 0).unwrap(),
+            (90 + delta.rem_euclid(360)) % 360
+        );
+        assert!(rotate_page(&mut doc, 0, i64::MAX).is_err());
+        assert!(rotate_page(&mut doc, 0, i64::MIN).is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_page_boxes_without_changing_the_document() {
+        let mut doc = nested_doc(1);
+        let original = doc.to_bytes().unwrap();
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for coordinate in 0..4 {
+                let mut values = [0.0, 0.0, 100.0, 200.0];
+                values[coordinate] = invalid;
+                let rect = Rect {
+                    x0: values[0],
+                    y0: values[1],
+                    x1: values[2],
+                    y1: values[3],
+                };
+                assert!(set_crop_box(&mut doc, 0, rect).is_err());
+                assert!(set_media_box(&mut doc, 0, rect).is_err());
+                assert_eq!(doc.to_bytes().unwrap(), original);
+            }
+        }
+        let overflowing = Rect {
+            x0: -f64::MAX,
+            y0: 0.0,
+            x1: f64::MAX,
+            y1: 1.0,
+        };
+        assert!(set_crop_box(&mut doc, 0, overflowing).is_err());
+        assert!(set_media_box(&mut doc, 0, overflowing).is_err());
+        assert_eq!(doc.to_bytes().unwrap(), original);
+    }
 
     #[test]
     fn rotation_is_relative_to_inherited_value() {
