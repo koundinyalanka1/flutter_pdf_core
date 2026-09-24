@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 flate2.workspace = true
+tempfile.workspace = true
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"

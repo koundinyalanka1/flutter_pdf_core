@@ -14,11 +14,17 @@
 * Keep AI chunks within their Unicode character limit, including overlap,
   and retain the source-page range of overlapping text. Rust chunk limits
   below 64 are now honoured; zero is treated as one character.
+* Reject objects nested more than 128 levels deep instead of overflowing the
+  stack, which aborts the process even behind the FFI panic guard.
+* Write output files atomically, including `pdf_encrypt`: a failed save
+  leaves an existing destination untouched.
+* Link Android libraries for 16 KB memory pages (Android 15+), and build
+  them with `--locked`.
+* Export `PdfRenderedPng` from the package library.
 
-These changes preserve the Dart API and C ABI. Rebuild the native libraries
-with `scripts/build_android.sh`, `scripts/build_ios.sh`, or
-`scripts/build_macos.sh` before distributing a package with these fixes;
-the checked-in platform binaries have not been regenerated for this update.
+These changes preserve the C ABI; the Dart API only gains the
+`PdfRenderedPng` export. The checked-in Android and iOS binaries have been
+regenerated from this source.
 
 ## 0.1.0
 

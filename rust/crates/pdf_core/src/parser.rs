@@ -6,13 +6,19 @@ use crate::stream::PdfStream;
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     lookahead: Vec<SpannedToken>,
+    depth: usize,
 }
+
+// PDF files are untrusted input. A stack overflow aborts the process even
+// when the FFI entry point catches ordinary Rust panics.
+const MAX_OBJECT_DEPTH: usize = 128;
 
 impl<'a> Parser<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             lexer: Lexer::new(data),
             lookahead: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -20,6 +26,7 @@ impl<'a> Parser<'a> {
         Self {
             lexer: Lexer::with_offset(data, offset),
             lookahead: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -31,6 +38,16 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_object(&mut self) -> Result<PdfObject> {
+        if self.depth >= MAX_OBJECT_DEPTH {
+            return Err(PdfError::parse(self.position(), "object nesting limit exceeded"));
+        }
+        self.depth += 1;
+        let result = self.parse_object_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_object_inner(&mut self) -> Result<PdfObject> {
         self.fill(3)?;
         if let [SpannedToken {
             token: Token::Integer(obj),
@@ -195,6 +212,15 @@ fn checked_object_id(number: i64, generation: i64, offset: usize) -> Result<Obje
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_deeply_nested_objects_without_overflowing_the_stack() {
+        for (open, close) in [("[", "]"), ("<< /Nested ", ">>")] {
+            let input = format!("{}null{}", open.repeat(1000), close.repeat(1000));
+            let err = Parser::new(input.as_bytes()).parse_object().unwrap_err();
+            assert!(err.to_string().contains("nesting limit"));
+        }
+    }
 
     #[test]
     fn rejects_object_ids_that_would_wrap() {

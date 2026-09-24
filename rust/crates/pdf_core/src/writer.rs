@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 
 use crate::document::PdfDocument;
@@ -12,11 +11,20 @@ pub struct PdfWriter;
 
 impl PdfWriter {
     pub fn write_document(document: &PdfDocument, output_path: impl AsRef<Path>) -> Result<()> {
-        let file = File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
         let bytes = Self::write_document_to_vec(document)?;
-        writer.write_all(&bytes)?;
-        writer.flush()?;
+        Self::write_bytes_atomic(&bytes, output_path)
+    }
+
+    /// Replace a destination only after all bytes have been written successfully.
+    /// A sibling temporary file keeps the final rename on the same filesystem.
+    pub fn write_bytes_atomic(bytes: &[u8], output_path: impl AsRef<Path>) -> Result<()> {
+        let output_path = output_path.as_ref();
+        let parent = output_path.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(output_path).map_err(|err| PdfError::Io(err.error))?;
         Ok(())
     }
 
@@ -256,6 +264,29 @@ mod tests {
     use super::*;
 
     use crate::stream::PdfStream;
+
+    #[test]
+    fn failed_serialization_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        let original = include_bytes!("../../../fixtures/simple.pdf");
+        std::fs::write(&path, original).unwrap();
+        let mut doc = PdfDocument::from_bytes(original).unwrap();
+        doc.add_object(PdfObject::Real(f64::NAN));
+        assert!(doc.save_as(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn saves_over_existing_document_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, b"old contents").unwrap();
+        let doc = PdfDocument::from_bytes(include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        doc.save_as(&path).unwrap();
+        assert_eq!(PdfDocument::from_path(&path).unwrap().page_count(), Some(1));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn serializes_pdf_objects() {

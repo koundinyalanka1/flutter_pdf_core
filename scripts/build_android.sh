@@ -27,7 +27,7 @@ mkdir -p "$JNI_DIR"
     -t armeabi-v7a \
     -t x86_64 \
     -o "../$JNI_DIR" \
-    build -p pdf_ffi $PROFILE_FLAG
+    build --locked -p pdf_ffi $PROFILE_FLAG
 )
 
 echo "Done. Bundled libraries:"

@@ -534,7 +534,7 @@ pub unsafe extern "C" fn pdf_encrypt(
     run_int(|| {
         let doc = open(path, password)?;
         let bytes = encrypt_to_bytes(&doc, user_pw, owner_pw)?;
-        std::fs::write(out, bytes)?;
+        pdf_core::writer::PdfWriter::write_bytes_atomic(&bytes, out)?;
         Ok(0)
     })
 }
