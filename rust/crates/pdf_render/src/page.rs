@@ -734,9 +734,14 @@ impl Renderer<'_> {
                     .unwrap_or_else(|| resources.clone());
 
                 if let Ok(data) = self.doc.stream_data(&stream) {
+                    // Font resource names are local to this Form. A form's
+                    // /F1 may differ from the page's /F1; inherited selected
+                    // fonts remain alive in `inner.font` through their Rc.
+                    let outer_fonts = std::mem::take(&mut self.fonts);
                     self.depth += 1;
                     let _ = self.run(&data, &inner_resources, &mut inner);
                     self.depth -= 1;
+                    self.fonts = outer_fonts;
                 }
             }
             _ => {}

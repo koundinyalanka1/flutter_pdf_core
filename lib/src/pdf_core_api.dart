@@ -141,6 +141,105 @@ class PdfPageSize {
   double get aspectRatio => height == 0 ? 1 : width / height;
 }
 
+/// Text and glyph geometry for one displayed page, including its rotation.
+/// Coordinates are page points (1/72 inch), with the origin at the top left,
+/// matching the page raster. Offsets index [text] in Dart UTF-16 code units.
+class PdfPageTextLayout {
+  const PdfPageTextLayout({
+    required this.text,
+    required this.width,
+    required this.height,
+    required this.glyphs,
+  });
+
+  factory PdfPageTextLayout.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final rawGlyphs = json['glyphs'];
+    final width = _textLayoutNumber(json['width'], 'width');
+    final height = _textLayoutNumber(json['height'], 'height');
+    if (text is! String || rawGlyphs is! List || width <= 0 || height <= 0) {
+      throw const FormatException('Invalid PDF page text layout.');
+    }
+    final glyphs = <PdfTextGlyph>[];
+    for (final raw in rawGlyphs) {
+      if (raw is! Map<String, dynamic>) {
+        throw const FormatException('Invalid PDF text glyph.');
+      }
+      final glyph = PdfTextGlyph.fromJson(raw);
+      if (glyph.end > text.length) {
+        throw const FormatException('PDF glyph offsets exceed the page text.');
+      }
+      glyphs.add(glyph);
+    }
+    return PdfPageTextLayout(
+      text: text,
+      width: width,
+      height: height,
+      glyphs: List.unmodifiable(glyphs),
+    );
+  }
+
+  final String text;
+  final double width;
+  final double height;
+  final List<PdfTextGlyph> glyphs;
+
+  bool get hasText => text.trim().isNotEmpty && glyphs.isNotEmpty;
+}
+
+/// Bounds for one glyph or glyph cluster in [PdfPageTextLayout.text].
+/// [start] is inclusive and [end] is exclusive, both UTF-16 offsets. A ligature
+/// or a supplementary Unicode character can span multiple code units.
+class PdfTextGlyph {
+  const PdfTextGlyph({
+    required this.start,
+    required this.end,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+  });
+
+  factory PdfTextGlyph.fromJson(Map<String, dynamic> json) {
+    final start = json['start'];
+    final end = json['end'];
+    final bounds = json['bounds'];
+    if (start is! int || end is! int || start < 0 || end <= start ||
+        bounds is! List || bounds.length != 4) {
+      throw const FormatException('Invalid PDF text glyph offsets or bounds.');
+    }
+    final left = _textLayoutNumber(bounds[0], 'left');
+    final top = _textLayoutNumber(bounds[1], 'top');
+    final right = _textLayoutNumber(bounds[2], 'right');
+    final bottom = _textLayoutNumber(bounds[3], 'bottom');
+    if (right < left || bottom < top) {
+      throw const FormatException('Invalid PDF text glyph bounds.');
+    }
+    return PdfTextGlyph(
+      start: start,
+      end: end,
+      left: left,
+      top: top,
+      right: right,
+      bottom: bottom,
+    );
+  }
+
+  final int start;
+  final int end;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+}
+
+double _textLayoutNumber(Object? value, String field) {
+  if (value is! num || !value.isFinite) {
+    throw FormatException('Invalid PDF text layout $field.');
+  }
+  return value.toDouble();
+}
+
 /// How an image is placed on its page by [PdfCore.imagesToPdf].
 enum PdfImageFit {
   /// Fixed page size; the image is scaled to fit and centred (letterboxed).
@@ -187,6 +286,35 @@ class PdfCore {
     return _withUtf8([path, password], (args) {
       final out = _b.extractText(args[0], args[1], page ?? 0);
       return _takeString(out);
+    });
+  }
+
+  /// Extract selectable text and its displayed geometry on a background
+  /// isolate. [page] is 1-based, unlike the raster API's 0-based page index.
+  /// Empty/scanned pages return an empty text layout; they do not run OCR.
+  /// Throws `TEXT_SELECTION_UNAVAILABLE` with older native binaries.
+  static Future<PdfPageTextLayout> pageTextLayout(
+    String path, {
+    required int page,
+    String password = '',
+  }) async {
+    if (page < 1) {
+      throw RangeError.range(page, 1, null, 'page');
+    }
+    return Isolate.run(() {
+      final extract = _b.pageTextLayoutJson;
+      if (extract == null) {
+        throw PdfException(
+          'TEXT_SELECTION_UNAVAILABLE',
+          'Text selection is unavailable in this version of the PDF engine.',
+        );
+      }
+      return _withUtf8([path, password], (args) {
+        final json = _takeString(extract(args[0], args[1], page));
+        return PdfPageTextLayout.fromJson(
+          jsonDecode(json) as Map<String, dynamic>,
+        );
+      });
     });
   }
 

@@ -12,6 +12,10 @@ use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 
 use crate::content_stream::{parse_content, Operation};
 use crate::font::{load_font, Font};
+use crate::layout::{
+    font_vertical_metrics, page_geometry, transformed_bounds, LayoutFontLoader,
+    LayoutFontMetrics, PageGeometry, PageTextLayout, TextGlyph,
+};
 use crate::text_state::{Matrix, TextObject, TextState};
 
 /// Extract text from every page.
@@ -42,8 +46,32 @@ fn extract_page_by_id(doc: &PdfDocument, page_id: ObjectId) -> Result<String> {
         .and_then(|o| o.as_dict().cloned())
         .unwrap_or_default();
     let mut extractor = Extractor::new(doc);
-    extractor.run(&content, &resources, Matrix::IDENTITY, 0)?;
+    extractor.run(&content, &resources, Matrix::IDENTITY, 0, TextState::default())?;
     Ok(extractor.finish())
+}
+
+pub(crate) fn extract_layout<'a>(
+    doc: &'a PdfDocument,
+    page_index: usize,
+    loader: Option<&'a LayoutFontLoader<'a>>,
+) -> Result<PageTextLayout> {
+    let pages = doc.collect_page_ids()
+        .ok_or_else(|| PdfError::Structure("document has no page tree".into()))?;
+    let &page_id = pages.get(page_index).ok_or(PdfError::PageIndex(page_index))?;
+    let geometry = page_geometry(doc, page_id)?;
+    let content = page_content(doc, page_id)?;
+    let resources = inherited_attribute(doc, page_id, "Resources")
+        .and_then(|o| o.as_dict().cloned()).unwrap_or_default();
+    let mut extractor = Extractor::new(doc);
+    extractor.geometry = Some(geometry);
+    extractor.metric_loader = loader;
+    extractor.run(&content, &resources, Matrix::IDENTITY, 0, TextState::default())?;
+    extractor.trim_output();
+    let geometry = extractor.geometry.unwrap();
+    Ok(PageTextLayout {
+        text: extractor.out, width: geometry.width, height: geometry.height,
+        glyphs: extractor.glyphs,
+    })
 }
 
 /// Concatenated, decoded content streams of a page.
@@ -71,7 +99,7 @@ fn page_content(doc: &PdfDocument, page_id: ObjectId) -> Result<Vec<u8>> {
 }
 
 /// Inherited page attribute lookup (local to avoid a pdf_ops dependency).
-fn inherited_attribute(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Option<PdfObject> {
+pub(crate) fn inherited_attribute(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Option<PdfObject> {
     let mut current = Some(page_id);
     for _ in 0..256 {
         let id = current?;
@@ -86,11 +114,30 @@ fn inherited_attribute(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Optio
 
 struct Extractor<'a> {
     doc: &'a PdfDocument,
-    font_cache: HashMap<String, Font>,
+    font_cache: HashMap<String, LoadedFont>,
+    next_scope: usize,
+    geometry: Option<PageGeometry>,
+    metric_loader: Option<&'a LayoutFontLoader<'a>>,
+    glyphs: Vec<TextGlyph>,
+    utf16_len: usize,
+    last_baseline: Option<Baseline>,
     out: String,
     last_y: Option<f64>,
     last_x_end: f64,
     last_size: f64,
+}
+
+struct LoadedFont {
+    text: Font,
+    metrics: Option<Box<dyn LayoutFontMetrics>>,
+    ascent: f64,
+    descent: f64,
+}
+
+struct Baseline {
+    end: (f64, f64),
+    direction: (f64, f64),
+    size: f64,
 }
 
 impl<'a> Extractor<'a> {
@@ -98,6 +145,12 @@ impl<'a> Extractor<'a> {
         Self {
             doc,
             font_cache: HashMap::new(),
+            next_scope: 0,
+            geometry: None,
+            metric_loader: None,
+            glyphs: Vec::new(),
+            utf16_len: 0,
+            last_baseline: None,
             out: String::new(),
             last_y: None,
             last_x_end: 0.0,
@@ -106,10 +159,24 @@ impl<'a> Extractor<'a> {
     }
 
     fn finish(mut self) -> String {
+        self.trim_output();
+        self.out
+    }
+
+    fn trim_output(&mut self) {
         while self.out.ends_with(['\n', ' ']) {
             self.out.pop();
         }
-        self.out
+        self.utf16_len = self.out.encode_utf16().count();
+        self.glyphs.retain_mut(|glyph| {
+            glyph.end = glyph.end.min(self.utf16_len);
+            glyph.start < glyph.end
+        });
+    }
+
+    fn append(&mut self, value: &str) {
+        self.out.push_str(value);
+        self.utf16_len += value.encode_utf16().count();
     }
 
     fn run(
@@ -118,6 +185,7 @@ impl<'a> Extractor<'a> {
         resources: &Dictionary,
         base_ctm: Matrix,
         depth: usize,
+        mut state: TextState,
     ) -> Result<()> {
         if depth > 8 {
             return Ok(()); // form XObject recursion guard
@@ -127,9 +195,10 @@ impl<'a> Extractor<'a> {
             Err(_) => return Ok(()), // tolerate broken content streams
         };
 
+        let scope = self.next_scope;
+        self.next_scope += 1;
         let mut ctm = base_ctm;
         let mut ctm_stack: Vec<Matrix> = Vec::new();
-        let mut state = TextState::default();
         let mut state_stack: Vec<TextState> = Vec::new();
         let mut text: Option<TextObject> = None;
 
@@ -160,11 +229,12 @@ impl<'a> Extractor<'a> {
                 "TL" => state.leading = num(&operands, 0),
                 "Ts" => state.rise = num(&operands, 0),
                 "Tf" => {
-                    state.font_key = operands.first().and_then(|o| o.as_name().map(str::to_owned));
+                    state.font_key = operands.first().and_then(|o| o.as_name()).map(|name| {
+                        let key = format!("{scope}:{name}");
+                        self.ensure_font(&key, name, resources);
+                        key
+                    });
                     state.font_size = num(&operands, 1);
-                    if let Some(key) = state.font_key.clone() {
-                        self.ensure_font(&key, resources);
-                    }
                 }
                 "Td" => {
                     if let Some(t) = text.as_mut() {
@@ -237,7 +307,7 @@ impl<'a> Extractor<'a> {
                 }
                 "Do" => {
                     if let Some(name) = operands.first().and_then(PdfObject::as_name) {
-                        self.run_form_xobject(name, resources, ctm, depth)?;
+                        self.run_form_xobject(name, resources, ctm, depth, state.clone())?;
                     }
                 }
                 _ => {}
@@ -252,6 +322,7 @@ impl<'a> Extractor<'a> {
         resources: &Dictionary,
         ctm: Matrix,
         depth: usize,
+        state: TextState,
     ) -> Result<()> {
         let Some(xobjects) = resources
             .get("XObject")
@@ -270,8 +341,9 @@ impl<'a> Extractor<'a> {
         let inner_ctm = stream
             .dictionary
             .get("Matrix")
+            .map(|m| self.doc.resolve_value(m))
             .and_then(|m| match m {
-                PdfObject::Array(items) => matrix_from(items),
+                PdfObject::Array(items) => matrix_from(&items),
                 _ => None,
             })
             .map(|m| m.multiply(&ctm))
@@ -283,21 +355,22 @@ impl<'a> Extractor<'a> {
             .cloned()
             .unwrap_or_else(|| resources.clone());
         let data = self.doc.stream_data(&stream)?;
-        self.run(&data, &inner_resources, inner_ctm, depth + 1)
+        self.run(&data, &inner_resources, inner_ctm, depth + 1, state)
     }
 
-    fn ensure_font(&mut self, key: &str, resources: &Dictionary) {
+    fn ensure_font(&mut self, key: &str, name: &str, resources: &Dictionary) {
         if self.font_cache.contains_key(key) {
             return;
         }
-        let font = resources
+        let dict = resources
             .get("Font")
             .and_then(|f| self.doc.resolve_dict(f))
-            .and_then(|fonts| fonts.get(key))
-            .and_then(|f| self.doc.resolve_dict(f))
-            .and_then(|dict| load_font(self.doc, dict).ok())
-            .unwrap_or_default();
-        self.font_cache.insert(key.to_owned(), font);
+            .and_then(|fonts| fonts.get(name))
+            .and_then(|f| self.doc.resolve_dict(f));
+        let text = dict.and_then(|d| load_font(self.doc, d).ok()).unwrap_or_default();
+        let metrics = dict.and_then(|dict| self.metric_loader.map(|loader| loader(self.doc, dict)));
+        let (ascent, descent) = dict.map(|d| font_vertical_metrics(self.doc, d)).unwrap_or((800.0, -200.0));
+        self.font_cache.insert(key.to_owned(), LoadedFont { text, metrics, ascent, descent });
     }
 
     fn show_text(
@@ -310,35 +383,102 @@ impl<'a> Extractor<'a> {
         let Some(text) = text.as_mut() else {
             return; // show-text outside BT/ET: ignore
         };
-        // Decode first so the font borrow ends before we mutate `self`.
-        let (shown, advance_total) = {
+        // Decode/measure first so the font borrow ends before output changes.
+        let glyphs = {
             let default_font = Font::default();
-            let font = state
+            let loaded = state
                 .font_key
                 .as_deref()
-                .and_then(|k| self.font_cache.get(k))
-                .unwrap_or(&default_font);
-            let mut shown = String::new();
-            let mut advance_total = 0.0;
+                .and_then(|k| self.font_cache.get(k));
+            let font = loaded.map(|f| &f.text).unwrap_or(&default_font);
+            let mut glyphs = Vec::new();
             for code in font.codes(bytes) {
-                shown.push_str(&font.decode_code(code));
-                let mut advance =
-                    font.width(code) / 1000.0 * state.font_size + state.char_spacing;
+                let decoded = font.decode_code(code);
+                let width = loaded.and_then(|f| f.metrics.as_ref())
+                    .map(|f| f.advance_width(code)).unwrap_or_else(|| font.width(code));
+                let mut advance = width / 1000.0 * state.font_size + state.char_spacing;
                 if font.is_space_code(code) {
                     advance += state.word_spacing;
                 }
-                advance_total += advance * state.horiz_scale;
+                let mut bounds = [0.0,
+                    loaded.map(|f| f.descent).unwrap_or(-200.0),
+                    width,
+                    loaded.map(|f| f.ascent).unwrap_or(800.0)];
+                if let Some(ink) = loaded.and_then(|f| f.metrics.as_ref())
+                    .and_then(|f| f.glyph_bounds(code)) {
+                    bounds[0] = bounds[0].min(ink[0]);
+                    bounds[1] = bounds[1].min(ink[1]);
+                    bounds[2] = bounds[2].max(ink[2]);
+                    bounds[3] = bounds[3].max(ink[3]);
+                }
+                glyphs.push((decoded, advance * state.horiz_scale, bounds));
             }
-            (shown, advance_total)
+            glyphs
         };
 
-        let (x, y) = text.position(ctm);
-        self.position_break(x, y, state.font_size.max(1.0));
-        self.out.push_str(&shown);
-        text.advance(advance_total);
+        let has_text = glyphs.iter().any(|g| !g.0.is_empty());
+        let user_matrix = text.text_matrix.multiply(ctm);
+        if has_text {
+            if self.geometry.is_some() {
+                self.layout_position_break(user_matrix, state);
+            } else {
+                let (x, y) = text.position(ctm);
+                self.position_break(x, y, state.font_size.max(1.0));
+            }
+        }
+        for (decoded, advance, rect) in glyphs {
+            let start = self.utf16_len;
+            self.append(&decoded);
+            if let Some(geometry) = &self.geometry {
+                let transform = Matrix::new(state.font_size * state.horiz_scale / 1000.0,
+                    0.0, 0.0, state.font_size / 1000.0, 0.0, state.rise)
+                    .multiply(&text.text_matrix).multiply(ctm).multiply(&geometry.transform);
+                if let Some(mut bounds) = transformed_bounds(rect, transform) {
+                    bounds[0] = bounds[0].clamp(0.0, geometry.width);
+                    bounds[1] = bounds[1].clamp(0.0, geometry.height);
+                    bounds[2] = bounds[2].clamp(0.0, geometry.width);
+                    bounds[3] = bounds[3].clamp(0.0, geometry.height);
+                    if start < self.utf16_len && bounds[2] > bounds[0] && bounds[3] > bounds[1] {
+                        self.glyphs.push(TextGlyph { start, end: self.utf16_len, bounds });
+                    }
+                }
+            }
+            if advance.is_finite() {
+                text.advance(advance);
+            }
+        }
         let (x_end, _) = text.position(ctm);
         self.last_x_end = x_end;
         self.last_size = state.font_size.max(1.0);
+        if self.geometry.is_some() && has_text {
+            let scale = user_matrix.a.hypot(user_matrix.b).max(1e-8);
+            let sign = (state.font_size * state.horiz_scale).signum();
+            self.last_baseline = Some(Baseline {
+                end: text.position(ctm),
+                direction: (user_matrix.a / scale * sign, user_matrix.b / scale * sign),
+                size: (user_matrix.c.hypot(user_matrix.d) * state.font_size.abs()).max(1.0),
+            });
+        }
+    }
+
+    /// Project gaps onto the previous baseline instead of assuming all text
+    /// runs horizontally. This preserves words split across TJ on rotated text.
+    fn layout_position_break(&mut self, matrix: Matrix, state: &TextState) {
+        let Some(last) = &self.last_baseline else { return; };
+        let size = (matrix.c.hypot(matrix.d) * state.font_size.abs()).max(1.0);
+        let dx = matrix.e - last.end.0;
+        let dy = matrix.f - last.end.1;
+        let across = (dx * -last.direction.1 + dy * last.direction.0).abs();
+        let along = dx * last.direction.0 + dy * last.direction.1;
+        if across > 0.5 * size.min(last.size) {
+            if across > 1.8 * last.size {
+                self.append("\n\n");
+            } else {
+                self.append("\n");
+            }
+        } else if along > 0.25 * size && !self.out.ends_with([' ', '\n']) && !self.out.is_empty() {
+            self.append(" ");
+        }
     }
 
     /// Insert spaces / newlines based on position deltas.
@@ -350,15 +490,15 @@ impl<'a> Extractor<'a> {
                 if dy > 0.5 * size.min(self.last_size) {
                     // Larger vertical gaps become paragraph breaks.
                     if dy > 1.8 * self.last_size {
-                        self.out.push_str("\n\n");
+                        self.append("\n\n");
                     } else {
-                        self.out.push('\n');
+                        self.append("\n");
                     }
                 } else {
                     let gap = x - self.last_x_end;
                     if gap > 0.25 * size && !self.out.ends_with([' ', '\n']) && !self.out.is_empty()
                     {
-                        self.out.push(' ');
+                        self.append(" ");
                     }
                 }
             }

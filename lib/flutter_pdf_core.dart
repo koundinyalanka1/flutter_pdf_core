@@ -14,5 +14,7 @@ export 'src/pdf_core_api.dart'
         PdfInfo,
         PdfMetadata,
         PdfPageSize,
+        PdfPageTextLayout,
+        PdfTextGlyph,
         PdfRenderedPage,
         PdfRenderedPng;

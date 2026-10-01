@@ -478,6 +478,53 @@ pub unsafe extern "C" fn pdf_extract_text(
     })
 }
 
+struct RenderTextMetrics(pdf_render::font::RenderFont);
+
+impl pdf_text::layout::LayoutFontMetrics for RenderTextMetrics {
+    fn advance_width(&self, code: u32) -> f64 {
+        self.0.advance_width(code)
+    }
+
+    fn glyph_bounds(&self, code: u32) -> Option<[f64; 4]> {
+        let (left, bottom, right, top) = self.0.outline(code)?.bounds()?;
+        let scale = 1000.0 / self.0.units_per_em();
+        Some([left * scale, bottom * scale, right * scale, top * scale])
+    }
+}
+
+/// Selectable text for one page (1-based, unlike the rendering API).
+/// Returns JSON `{text,width,height,glyphs:[{start,end,bounds:[l,t,r,b]}]}`.
+/// Offsets are UTF-16 code units, end exclusive. Bounds use top-left displayed
+/// page points, including CropBox origin and /Rotate, matching page rendering.
+/// Empty/scanned pages return empty text and glyphs; hidden OCR remains included.
+/// Free the returned string with `pdf_free_string`; NULL means `pdf_last_error`.
+///
+/// # Safety
+/// See `pdf_page_count`.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_page_text_layout_json(
+    path: *const c_char,
+    password: *const c_char,
+    page: c_int,
+) -> *mut c_char {
+    if page < 1 {
+        set_error(format!("PAGE_OUT_OF_RANGE: page index {page} must be 1-based"));
+        return std::ptr::null_mut();
+    }
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let doc = open(path, password)?;
+        let layout = pdf_text::layout::extract_page_layout_with_metrics(
+            &doc,
+            (page - 1) as usize,
+            &|doc, dict| Box::new(RenderTextMetrics(pdf_render::font::RenderFont::load(doc, dict))),
+        )?;
+        serde_json::to_string(&layout).map_err(|e| PdfError::Structure(e.to_string()))
+    })
+}
+
 /// AI-ready export. `ndjson` 0 = single JSON document, 1 = NDJSON lines.
 ///
 /// # Safety

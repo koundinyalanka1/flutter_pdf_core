@@ -83,7 +83,8 @@ typedef _ImagesToPdfDart = int Function(
 /// Lazily-resolved bindings to the native library.
 class PdfBindings {
   PdfBindings._(DynamicLibrary lib)
-      : version = lib.lookupFunction<_VersionC, _VersionC>('pdf_core_version'),
+      : _library = lib,
+        version = lib.lookupFunction<_VersionC, _VersionC>('pdf_core_version'),
         lastError = lib.lookupFunction<_LastErrorC, _LastErrorC>('pdf_last_error'),
         lastWarnings =
             lib.lookupFunction<_LastErrorC, _LastErrorC>('pdf_last_warnings'),
@@ -141,6 +142,24 @@ class PdfBindings {
   final _FreeBufferDart freeBuffer;
   final _PageSizeDart pageSize;
   final _ImagesToPdfDart imagesToPdf;
+
+  final DynamicLibrary _library;
+
+  /// Optional until every installed native binary supports text selection.
+  /// Resolving this lazily keeps rendering and other existing APIs usable
+  /// with an older library that does not export the new symbol yet.
+  late final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, int)?
+      pageTextLayoutJson = _lookupPageTextLayout();
+
+  _ExtractTextDart? _lookupPageTextLayout() {
+    try {
+      return _library.lookupFunction<_ExtractTextC, _ExtractTextDart>(
+        'pdf_page_text_layout_json',
+      );
+    } on ArgumentError {
+      return null;
+    }
+  }
 
   static PdfBindings? _instance;
 

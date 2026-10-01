@@ -14,6 +14,20 @@ use flate2::Compression;
 use crate::error::{PdfError, Result};
 use crate::object::{Dictionary, PdfObject};
 
+/// Bound each stage of a filter chain, including highly compressed streams.
+/// This permits large scanned images without letting a small PDF exhaust the
+/// mobile process's memory. Limits are errors, never recovered partial data.
+pub const MAX_DECODED_STREAM_BYTES: usize = 128 * 1024 * 1024;
+
+fn check_output_size(current: usize, additional: usize, limit: usize) -> Result<()> {
+    if current.checked_add(additional).is_none_or(|size| size > limit) {
+        return Err(PdfError::Filter(format!(
+            "decoded stream exceeds the {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
 /// Decode parameters relevant to FlateDecode predictors.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeParms {
@@ -54,8 +68,10 @@ impl DecodeParms {
     }
 }
 
-/// Apply a single named filter.
+/// Apply a single named filter. Input and output are limited to 128 MiB;
+/// exceeding the limit returns a filter error instead of partial output.
 pub fn decode(filter: &str, data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
+    check_output_size(0, data.len(), MAX_DECODED_STREAM_BYTES)?;
     match filter {
         "FlateDecode" | "Fl" => {
             let inflated = flate_decode(data)?;
@@ -77,6 +93,7 @@ pub fn decode(filter: &str, data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>>
 
 /// Decode stream data given its (already direct) dictionary.
 pub fn decode_with_dict(dict: &Dictionary, data: &[u8]) -> Result<Vec<u8>> {
+    check_output_size(0, data.len(), MAX_DECODED_STREAM_BYTES)?;
     let filters = filter_names(dict);
     if filters.is_empty() {
         return Ok(data.to_vec());
@@ -121,10 +138,19 @@ fn decode_parms_list(dict: &Dictionary, n: usize) -> Vec<DecodeParms> {
     out
 }
 
+/// Inflate at most 128 MiB, rejecting larger output even for damaged streams.
 pub fn flate_decode(data: &[u8]) -> Result<Vec<u8>> {
+    flate_decode_limited(data, MAX_DECODED_STREAM_BYTES)
+}
+
+fn flate_decode_limited(data: &[u8], limit: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut decoder = ZlibDecoder::new(data);
-    match decoder.read_to_end(&mut out) {
+    // Read one extra byte to distinguish an exactly-full stream from one
+    // that was truncated by the limit. Check before recovering damaged data.
+    let mut decoder = ZlibDecoder::new(data).take((limit as u64).saturating_add(1));
+    let result = decoder.read_to_end(&mut out);
+    check_output_size(0, out.len(), limit)?;
+    match result {
         Ok(_) => Ok(out),
         // A truncated stream still inflated everything up to the damage, and
         // most of a page is worth more than none of it. This matches how
@@ -158,18 +184,24 @@ const LZW_MAX: usize = 4096;
 /// Damaged or truncated streams stop at the damage and return what was
 /// recovered rather than erroring, because a partly-decoded content stream
 /// still draws most of a page.
+/// Output larger than 128 MiB is always an error.
 pub fn lzw_decode(data: &[u8], early_change: bool) -> Result<Vec<u8>> {
+    lzw_decode_limited(data, early_change, MAX_DECODED_STREAM_BYTES)
+}
+
+fn lzw_decode_limited(data: &[u8], early_change: bool, limit: usize) -> Result<Vec<u8>> {
     let early = usize::from(early_change);
     let mut table: Vec<Vec<u8>> = Vec::with_capacity(LZW_MAX);
     reset_lzw_table(&mut table);
 
-    let mut out: Vec<u8> = Vec::with_capacity(data.len() * 3);
+    let mut out: Vec<u8> = Vec::with_capacity(data.len().saturating_mul(3).min(limit));
     let mut width = 9usize;
     let mut previous: Option<u16> = None;
     let mut bit = 0usize;
-    let total_bits = data.len() * 8;
+    let total_bits = data.len().checked_mul(8)
+        .ok_or_else(|| PdfError::Filter("LZW input size overflow".into()))?;
 
-    while bit + width <= total_bits {
+    while total_bits - bit >= width {
         let mut code = 0u16;
         for i in 0..width {
             let at = bit + i;
@@ -195,6 +227,9 @@ pub fn lzw_decode(data: &[u8], early_change: bool) -> Result<Vec<u8>> {
         let entry: Vec<u8> = match table.get(code as usize) {
             Some(existing) if !existing.is_empty() => existing.clone(),
             _ => {
+                if usize::from(code) != table.len() {
+                    break;
+                }
                 let Some(prev) = previous else { break };
                 let Some(base) = table.get(prev as usize) else { break };
                 if base.is_empty() {
@@ -205,6 +240,7 @@ pub fn lzw_decode(data: &[u8], early_change: bool) -> Result<Vec<u8>> {
                 built
             }
         };
+        check_output_size(out.len(), entry.len(), limit)?;
         out.extend_from_slice(&entry);
 
         if let Some(prev) = previous {
@@ -247,7 +283,11 @@ fn reset_lzw_table(table: &mut Vec<Vec<u8>>) {
 /// Length byte `n`: 0–127 means copy the next `n + 1` bytes literally,
 /// 129–255 means repeat the next byte `257 - n` times, and 128 ends the data.
 pub fn run_length_decode(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len() * 2);
+    run_length_decode_limited(data, MAX_DECODED_STREAM_BYTES)
+}
+
+fn run_length_decode_limited(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len().saturating_mul(2).min(limit));
     let mut i = 0usize;
     while i < data.len() {
         let length = data[i];
@@ -256,13 +296,16 @@ pub fn run_length_decode(data: &[u8]) -> Result<Vec<u8>> {
             128 => break,
             0..=127 => {
                 let take = usize::from(length) + 1;
-                let end = (i + take).min(data.len());
+                let end = i + take.min(data.len() - i);
+                check_output_size(out.len(), end - i, limit)?;
                 out.extend_from_slice(&data[i..end]);
                 i = end;
             }
             _ => {
                 let Some(&byte) = data.get(i) else { break };
-                out.extend(std::iter::repeat(byte).take(257 - usize::from(length)));
+                let count = 257 - usize::from(length);
+                check_output_size(out.len(), count, limit)?;
+                out.extend(std::iter::repeat(byte).take(count));
                 i += 1;
             }
         }
@@ -279,12 +322,19 @@ fn apply_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
     }
 }
 
-fn bytes_per_pixel(parms: &DecodeParms) -> usize {
-    (parms.colors * parms.bits_per_component).div_ceil(8)
-}
-
-fn row_len(parms: &DecodeParms) -> usize {
-    (parms.columns * parms.colors * parms.bits_per_component).div_ceil(8)
+fn predictor_layout(parms: &DecodeParms) -> Result<(usize, usize)> {
+    if !(1..=32).contains(&parms.colors)
+        || !matches!(parms.bits_per_component, 1 | 2 | 4 | 8 | 16)
+        || parms.columns == 0
+    {
+        return Err(PdfError::Filter("invalid predictor dimensions".into()));
+    }
+    let pixel_bits = parms.colors * parms.bits_per_component;
+    let row_bits = parms.columns.checked_mul(pixel_bits)
+        .ok_or_else(|| PdfError::Filter("predictor row size overflow".into()))?;
+    let row = row_bits.div_ceil(8);
+    check_output_size(0, row, MAX_DECODED_STREAM_BYTES)?;
+    Ok((row, pixel_bits.div_ceil(8)))
 }
 
 fn tiff_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
@@ -293,8 +343,7 @@ fn tiff_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
             "TIFF predictor only supported for 8 bits per component".into(),
         ));
     }
-    let row = row_len(parms);
-    let bpp = bytes_per_pixel(parms);
+    let (row, bpp) = predictor_layout(parms)?;
     let mut out = data.to_vec();
     for r in out.chunks_mut(row) {
         for i in bpp..r.len() {
@@ -305,18 +354,15 @@ fn tiff_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
 }
 
 fn png_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
-    let row = row_len(parms);
-    let bpp = bytes_per_pixel(parms).max(1);
-    if row == 0 {
-        return Ok(Vec::new());
-    }
+    let (row, bpp) = predictor_layout(parms)?;
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
-    let mut prev_row = vec![0u8; row];
+    // Damaged tiny streams must not allocate a full metadata-sized row.
+    let mut prev_row = vec![0u8; row.min(data.len())];
     let mut pos = 0;
     while pos < data.len() {
         let ft = data[pos];
         pos += 1;
-        let end = (pos + row).min(data.len());
+        let end = pos + row.min(data.len() - pos);
         let mut current = data[pos..end].to_vec();
         pos = end;
         match ft {
@@ -352,7 +398,7 @@ fn png_predictor(data: &[u8], parms: &DecodeParms) -> Result<Vec<u8>> {
         }
         prev_row.clear();
         prev_row.extend_from_slice(&current);
-        prev_row.resize(row, 0);
+        prev_row.resize(row.min(data.len()), 0);
         out.extend_from_slice(&current);
     }
     Ok(out)
@@ -394,6 +440,10 @@ fn ascii_hex_decode(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
+    ascii85_decode_limited(data, MAX_DECODED_STREAM_BYTES)
+}
+
+fn ascii85_decode_limited(data: &[u8], limit: usize) -> Result<Vec<u8>> {
     // Strip optional <~ prefix.
     let bytes = if data.starts_with(b"<~") {
         &data[2..]
@@ -414,6 +464,7 @@ fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
             break; // ~> terminator
         }
         if b == b'z' && n == 0 {
+            check_output_size(out.len(), 4, limit)?;
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
@@ -423,7 +474,8 @@ fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
         group[n] = b - b'!';
         n += 1;
         if n == 5 {
-            let value = group.iter().fold(0u32, |acc, &d| acc * 85 + d as u32);
+            let value = ascii85_value(&group)?;
+            check_output_size(out.len(), 4, limit)?;
             out.extend_from_slice(&value.to_be_bytes());
             n = 0;
         }
@@ -435,15 +487,90 @@ fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
         for slot in group.iter_mut().skip(n) {
             *slot = 84;
         }
-        let value = group.iter().fold(0u32, |acc, &d| acc * 85 + d as u32);
+        let value = ascii85_value(&group)?;
+        check_output_size(out.len(), n - 1, limit)?;
         out.extend_from_slice(&value.to_be_bytes()[..n - 1]);
     }
     Ok(out)
 }
 
+fn ascii85_value(group: &[u8; 5]) -> Result<u32> {
+    let value = group.iter().fold(0u64, |acc, &d| acc * 85 + u64::from(d));
+    u32::try_from(value).map_err(|_| PdfError::Filter("ASCII85 group overflows 32 bits".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flate_expansion_limit_is_an_error_even_for_damaged_streams() {
+        let encoded = flate_encode(&vec![b'x'; 4096]);
+        assert_eq!(flate_decode_limited(&encoded, 4096).unwrap().len(), 4096);
+        for bytes in [&encoded[..], &encoded[..encoded.len() - 2]] {
+            let err = flate_decode_limited(bytes, 1024).unwrap_err();
+            assert!(err.to_string().contains("1024-byte limit"));
+        }
+    }
+
+    #[test]
+    fn lzw_expansion_limit_accepts_exactly_full_streams() {
+        let payload = vec![b'x'; 4096];
+        for early_change in [false, true] {
+            let encoded = lzw_encode(&payload, early_change);
+            assert_eq!(lzw_decode_limited(&encoded, early_change, 4096).unwrap(), payload);
+            let err = lzw_decode_limited(&encoded, early_change, 1024).unwrap_err();
+            assert!(err.to_string().contains("1024-byte limit"));
+        }
+    }
+
+    #[test]
+    fn other_expanding_filters_enforce_output_limits() {
+        assert_eq!(run_length_decode_limited(&[129, b'x', 128], 128).unwrap().len(), 128);
+        assert!(run_length_decode_limited(&[129, b'x', 128], 127).is_err());
+        assert!(run_length_decode_limited(&[2, 1, 2, 3], 2).is_err());
+        assert_eq!(ascii85_decode_limited(b"zz", 8).unwrap(), [0; 8]);
+        assert!(ascii85_decode_limited(b"zz", 7).is_err());
+        assert!(ascii85_decode_limited(b"87cURDZ~>", 4).is_err());
+    }
+
+    #[test]
+    fn output_limit_check_rejects_integer_overflow() {
+        assert!(check_output_size(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn predictors_reject_invalid_and_oversized_metadata() {
+        for predictor in [2, 12] {
+            for parms in [
+                DecodeParms { columns: 0, ..DecodeParms::default() },
+                DecodeParms { colors: 0, ..DecodeParms::default() },
+                DecodeParms { colors: usize::MAX, ..DecodeParms::default() },
+                DecodeParms { columns: usize::MAX, ..DecodeParms::default() },
+                DecodeParms { columns: MAX_DECODED_STREAM_BYTES + 1, ..DecodeParms::default() },
+                DecodeParms { bits_per_component: usize::MAX, ..DecodeParms::default() },
+            ] {
+                let parms = DecodeParms { predictor, ..parms };
+                assert!(apply_predictor(&[0, 1, 2], &parms).is_err(), "{parms:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn png_predictor_recovers_a_short_row_without_full_row_allocation() {
+        let parms = DecodeParms {
+            predictor: 12,
+            columns: MAX_DECODED_STREAM_BYTES,
+            ..DecodeParms::default()
+        };
+        assert_eq!(apply_predictor(&[2, 4, 5], &parms).unwrap(), [4, 5]);
+    }
+
+    #[test]
+    fn ascii85_rejects_groups_that_overflow_u32() {
+        assert!(ascii85_decode(b"uuuuu~>").is_err());
+        assert!(ascii85_decode(b"uu~>").is_err());
+    }
 
     /// Encodes with the same 9→12-bit scheme the decoder expects, so the
     /// round trip exercises table growth rather than a hand-picked vector.
