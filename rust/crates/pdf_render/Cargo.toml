@@ -10,7 +10,8 @@ pdf_text = { path = "../pdf_text" }
 thiserror.workspace = true
 flate2.workspace = true
 
-# Image codecs only — not PDF libraries. DCTDecode images are baseline JPEG
-# and JPXDecode is out of scope, so this is the one decoder the rasterizer
-# cannot write itself without shipping a second JPEG implementation.
+# Standalone image codecs only, not a replacement PDF renderer. Disable SIMD
+# and image-crate adapters to keep all Android ABIs on the same safe Rust path.
 jpeg-decoder = { version = "0.3", default-features = false }
+hayro-jpeg2000 = { path = "../../vendor/hayro-jpeg2000", version = "=0.4.1", default-features = false, features = ["std"] }
+hayro-jbig2 = { path = "../../vendor/hayro-jbig2", version = "=0.3.1", default-features = false, features = ["std"] }

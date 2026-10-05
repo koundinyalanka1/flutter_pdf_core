@@ -2,12 +2,16 @@
 //!
 //! Every source document's pages are copied — with object renumbering and
 //! reference rewriting — into one fresh document with a flat page tree.
+//! AcroForm field trees and outline hierarchies are combined; colliding field
+//! names and default-appearance resources are made unique across sources.
+//! XFA forms are rejected instead of silently losing their data.
 
 use pdf_core::document::PdfDocument;
 use pdf_core::error::{PdfError, Result};
 use pdf_core::object::{ObjectId, PdfObject};
 
-use crate::page_tree::effective_page_dict;
+use crate::page_tree::rebuild_page_tree;
+use crate::preserve::import_pages;
 use crate::split::{copy_objects_into, install_catalog};
 
 /// Merge whole documents, in order.
@@ -24,24 +28,17 @@ pub fn merge_documents(sources: &[&PdfDocument]) -> Result<PdfDocument> {
         .to_owned();
     let mut target = PdfDocument::new_empty(&version);
 
+    install_catalog(&mut target, &[])?;
     let mut all_page_ids: Vec<ObjectId> = Vec::new();
-    for source in sources {
+    for (batch, source) in sources.iter().enumerate() {
         let page_ids = source
             .collect_page_ids()
             .ok_or_else(|| PdfError::Structure("a source document has no page tree".into()))?;
-        let mut roots = Vec::with_capacity(page_ids.len());
-        for page_id in page_ids {
-            let mut dict = effective_page_dict(source, page_id)?;
-            dict.remove("Parent");
-            roots.push((page_id, PdfObject::Dictionary(dict)));
-        }
-        // One copy pass per source document: pages of the same document keep
-        // sharing resources; documents never share objects with each other.
-        let new_ids = copy_objects_into(&mut target, source, &roots)?;
+        let new_ids = import_pages(&mut target, source, &page_ids, batch)?;
         all_page_ids.extend(new_ids);
     }
 
-    install_catalog(&mut target, &all_page_ids)?;
+    rebuild_page_tree(&mut target, &all_page_ids)?;
 
     // Take /Info from the first source that has one.
     for source in sources {
@@ -55,6 +52,7 @@ pub fn merge_documents(sources: &[&PdfDocument]) -> Result<PdfDocument> {
             }
         }
     }
+    target.garbage_collect();
     Ok(target)
 }
 

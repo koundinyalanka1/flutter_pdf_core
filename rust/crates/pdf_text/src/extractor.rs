@@ -13,8 +13,8 @@ use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 use crate::content_stream::{parse_content, Operation};
 use crate::font::{load_font, Font};
 use crate::layout::{
-    font_vertical_metrics, page_geometry, transformed_bounds, LayoutFontLoader,
-    LayoutFontMetrics, PageGeometry, PageTextLayout, TextGlyph,
+    font_vertical_metrics, page_geometry, transformed_bounds, LayoutFontLoader, LayoutFontMetrics,
+    PageGeometry, PageTextLayout, TextGlyph,
 };
 use crate::text_state::{Matrix, TextObject, TextState};
 
@@ -46,7 +46,13 @@ fn extract_page_by_id(doc: &PdfDocument, page_id: ObjectId) -> Result<String> {
         .and_then(|o| o.as_dict().cloned())
         .unwrap_or_default();
     let mut extractor = Extractor::new(doc);
-    extractor.run(&content, &resources, Matrix::IDENTITY, 0, TextState::default())?;
+    extractor.run(
+        &content,
+        &resources,
+        Matrix::IDENTITY,
+        0,
+        TextState::default(),
+    )?;
     Ok(extractor.finish())
 }
 
@@ -55,21 +61,33 @@ pub(crate) fn extract_layout<'a>(
     page_index: usize,
     loader: Option<&'a LayoutFontLoader<'a>>,
 ) -> Result<PageTextLayout> {
-    let pages = doc.collect_page_ids()
+    let pages = doc
+        .collect_page_ids()
         .ok_or_else(|| PdfError::Structure("document has no page tree".into()))?;
-    let &page_id = pages.get(page_index).ok_or(PdfError::PageIndex(page_index))?;
+    let &page_id = pages
+        .get(page_index)
+        .ok_or(PdfError::PageIndex(page_index))?;
     let geometry = page_geometry(doc, page_id)?;
     let content = page_content(doc, page_id)?;
     let resources = inherited_attribute(doc, page_id, "Resources")
-        .and_then(|o| o.as_dict().cloned()).unwrap_or_default();
+        .and_then(|o| o.as_dict().cloned())
+        .unwrap_or_default();
     let mut extractor = Extractor::new(doc);
     extractor.geometry = Some(geometry);
     extractor.metric_loader = loader;
-    extractor.run(&content, &resources, Matrix::IDENTITY, 0, TextState::default())?;
+    extractor.run(
+        &content,
+        &resources,
+        Matrix::IDENTITY,
+        0,
+        TextState::default(),
+    )?;
     extractor.trim_output();
     let geometry = extractor.geometry.unwrap();
     Ok(PageTextLayout {
-        text: extractor.out, width: geometry.width, height: geometry.height,
+        text: extractor.out,
+        width: geometry.width,
+        height: geometry.height,
         glyphs: extractor.glyphs,
     })
 }
@@ -99,13 +117,22 @@ fn page_content(doc: &PdfDocument, page_id: ObjectId) -> Result<Vec<u8>> {
 }
 
 /// Inherited page attribute lookup (local to avoid a pdf_ops dependency).
-pub(crate) fn inherited_attribute(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Option<PdfObject> {
+pub(crate) fn inherited_attribute(
+    doc: &PdfDocument,
+    page_id: ObjectId,
+    key: &str,
+) -> Option<PdfObject> {
     let mut current = Some(page_id);
     for _ in 0..256 {
         let id = current?;
         let dict = doc.resolve(id).and_then(PdfObject::as_dict)?;
         if let Some(value) = dict.get(key) {
-            return Some(doc.resolve_value(value));
+            let value = doc.resolve_value(value);
+            // Null means an absent dictionary entry, including an indirect
+            // null. Match the page tree used by the renderer.
+            if !matches!(value, PdfObject::Null) {
+                return Some(value);
+            }
         }
         current = dict.get("Parent").and_then(PdfObject::as_ref);
     }
@@ -294,9 +321,8 @@ impl<'a> Extractor<'a> {
                                         _ => 0.0,
                                     };
                                     if let Some(t) = text.as_mut() {
-                                        let tx = -adjust / 1000.0
-                                            * state.font_size
-                                            * state.horiz_scale;
+                                        let tx =
+                                            -adjust / 1000.0 * state.font_size * state.horiz_scale;
                                         t.advance(tx);
                                     }
                                 }
@@ -335,7 +361,12 @@ impl<'a> Extractor<'a> {
         else {
             return Ok(());
         };
-        if stream.dictionary.get("Subtype").and_then(PdfObject::as_name) != Some("Form") {
+        if stream
+            .dictionary
+            .get("Subtype")
+            .and_then(PdfObject::as_name)
+            != Some("Form")
+        {
             return Ok(());
         }
         let inner_ctm = stream
@@ -367,10 +398,22 @@ impl<'a> Extractor<'a> {
             .and_then(|f| self.doc.resolve_dict(f))
             .and_then(|fonts| fonts.get(name))
             .and_then(|f| self.doc.resolve_dict(f));
-        let text = dict.and_then(|d| load_font(self.doc, d).ok()).unwrap_or_default();
+        let text = dict
+            .and_then(|d| load_font(self.doc, d).ok())
+            .unwrap_or_default();
         let metrics = dict.and_then(|dict| self.metric_loader.map(|loader| loader(self.doc, dict)));
-        let (ascent, descent) = dict.map(|d| font_vertical_metrics(self.doc, d)).unwrap_or((800.0, -200.0));
-        self.font_cache.insert(key.to_owned(), LoadedFont { text, metrics, ascent, descent });
+        let (ascent, descent) = dict
+            .map(|d| font_vertical_metrics(self.doc, d))
+            .unwrap_or((800.0, -200.0));
+        self.font_cache.insert(
+            key.to_owned(),
+            LoadedFont {
+                text,
+                metrics,
+                ascent,
+                descent,
+            },
+        );
     }
 
     fn show_text(
@@ -394,18 +437,24 @@ impl<'a> Extractor<'a> {
             let mut glyphs = Vec::new();
             for code in font.codes(bytes) {
                 let decoded = font.decode_code(code);
-                let width = loaded.and_then(|f| f.metrics.as_ref())
-                    .map(|f| f.advance_width(code)).unwrap_or_else(|| font.width(code));
+                let width = loaded
+                    .and_then(|f| f.metrics.as_ref())
+                    .map(|f| f.advance_width(code))
+                    .unwrap_or_else(|| font.width(code));
                 let mut advance = width / 1000.0 * state.font_size + state.char_spacing;
                 if font.is_space_code(code) {
                     advance += state.word_spacing;
                 }
-                let mut bounds = [0.0,
+                let mut bounds = [
+                    0.0,
                     loaded.map(|f| f.descent).unwrap_or(-200.0),
                     width,
-                    loaded.map(|f| f.ascent).unwrap_or(800.0)];
-                if let Some(ink) = loaded.and_then(|f| f.metrics.as_ref())
-                    .and_then(|f| f.glyph_bounds(code)) {
+                    loaded.map(|f| f.ascent).unwrap_or(800.0),
+                ];
+                if let Some(ink) = loaded
+                    .and_then(|f| f.metrics.as_ref())
+                    .and_then(|f| f.glyph_bounds(code))
+                {
                     bounds[0] = bounds[0].min(ink[0]);
                     bounds[1] = bounds[1].min(ink[1]);
                     bounds[2] = bounds[2].max(ink[2]);
@@ -430,16 +479,28 @@ impl<'a> Extractor<'a> {
             let start = self.utf16_len;
             self.append(&decoded);
             if let Some(geometry) = &self.geometry {
-                let transform = Matrix::new(state.font_size * state.horiz_scale / 1000.0,
-                    0.0, 0.0, state.font_size / 1000.0, 0.0, state.rise)
-                    .multiply(&text.text_matrix).multiply(ctm).multiply(&geometry.transform);
+                let transform = Matrix::new(
+                    state.font_size * state.horiz_scale / 1000.0,
+                    0.0,
+                    0.0,
+                    state.font_size / 1000.0,
+                    0.0,
+                    state.rise,
+                )
+                .multiply(&text.text_matrix)
+                .multiply(ctm)
+                .multiply(&geometry.transform);
                 if let Some(mut bounds) = transformed_bounds(rect, transform) {
                     bounds[0] = bounds[0].clamp(0.0, geometry.width);
                     bounds[1] = bounds[1].clamp(0.0, geometry.height);
                     bounds[2] = bounds[2].clamp(0.0, geometry.width);
                     bounds[3] = bounds[3].clamp(0.0, geometry.height);
                     if start < self.utf16_len && bounds[2] > bounds[0] && bounds[3] > bounds[1] {
-                        self.glyphs.push(TextGlyph { start, end: self.utf16_len, bounds });
+                        self.glyphs.push(TextGlyph {
+                            start,
+                            end: self.utf16_len,
+                            bounds,
+                        });
                     }
                 }
             }
@@ -464,7 +525,9 @@ impl<'a> Extractor<'a> {
     /// Project gaps onto the previous baseline instead of assuming all text
     /// runs horizontally. This preserves words split across TJ on rotated text.
     fn layout_position_break(&mut self, matrix: Matrix, state: &TextState) {
-        let Some(last) = &self.last_baseline else { return; };
+        let Some(last) = &self.last_baseline else {
+            return;
+        };
         let size = (matrix.c.hypot(matrix.d) * state.font_size.abs()).max(1.0);
         let dx = matrix.e - last.end.0;
         let dy = matrix.f - last.end.1;
@@ -599,26 +662,22 @@ mod tests {
 
     #[test]
     fn extracts_simple_text_with_spacing() {
-        let doc = doc_with_content(
-            b"BT /F1 12 Tf 72 720 Td (Hello) Tj 1 0 0 1 110 720 Tm (world) Tj ET",
-        );
+        let doc =
+            doc_with_content(b"BT /F1 12 Tf 72 720 Td (Hello) Tj 1 0 0 1 110 720 Tm (world) Tj ET");
         // Visible x gap between "Hello" end and "world" start -> space.
         assert_eq!(extract_page_text(&doc, 0).unwrap(), "Hello world");
     }
 
     #[test]
     fn newline_on_vertical_movement() {
-        let doc = doc_with_content(
-            b"BT /F1 12 Tf 72 720 Td (Line one) Tj 0 -14 Td (Line two) Tj ET",
-        );
+        let doc =
+            doc_with_content(b"BT /F1 12 Tf 72 720 Td (Line one) Tj 0 -14 Td (Line two) Tj ET");
         assert_eq!(extract_page_text(&doc, 0).unwrap(), "Line one\nLine two");
     }
 
     #[test]
     fn tj_array_and_quote_operators() {
-        let doc = doc_with_content(
-            b"BT /F1 12 Tf 14 TL 72 720 Td [(Wo) -30 (rld)] TJ (next) ' ET",
-        );
+        let doc = doc_with_content(b"BT /F1 12 Tf 14 TL 72 720 Td [(Wo) -30 (rld)] TJ (next) ' ET");
         assert_eq!(extract_page_text(&doc, 0).unwrap(), "World\nnext");
     }
 

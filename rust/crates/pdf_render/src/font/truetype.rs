@@ -75,7 +75,11 @@ impl TrueTypeFont {
             .unwrap_or_default();
 
         let mut font = TrueTypeFont {
-            units_per_em: if units_per_em > 0.0 { units_per_em } else { 1000.0 },
+            units_per_em: if units_per_em > 0.0 {
+                units_per_em
+            } else {
+                1000.0
+            },
             num_glyphs,
             loca,
             cmap: HashMap::new(),
@@ -172,17 +176,7 @@ impl TrueTypeFont {
 
         let contour_count = read_i16(&self.data, start)?;
         if contour_count >= 0 {
-            self.append_simple_glyph(
-                start,
-                contour_count as usize,
-                path,
-                a,
-                b,
-                c,
-                d,
-                e,
-                f,
-            )
+            self.append_simple_glyph(start, contour_count as usize, path, a, b, c, d, e, f)
         } else {
             self.append_composite_glyph(start, end, path, a, b, c, d, e, f, depth)
         }

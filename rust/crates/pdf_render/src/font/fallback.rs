@@ -106,14 +106,7 @@ impl FallbackFont {
         if !self.style.italic {
             return Some(outline);
         }
-        Some(outline.transform(&Matrix::new(
-            1.0,
-            0.0,
-            OBLIQUE_SHEAR,
-            1.0,
-            0.0,
-            0.0,
-        )))
+        Some(outline.transform(&Matrix::new(1.0, 0.0, OBLIQUE_SHEAR, 1.0, 0.0, 0.0)))
     }
 
     /// Advance for a character, in text-space units (em/1000), for use only
@@ -152,10 +145,7 @@ mod tests {
         .expect("fallback available");
         for ch in ['A', 'g', '7', '%'] {
             let outline = font.outline_for_char(ch).expect("outline should exist");
-            assert!(
-                !outline.is_empty(),
-                "{ch} should have a non-empty outline"
-            );
+            assert!(!outline.is_empty(), "{ch} should have a non-empty outline");
         }
         // A space is a real glyph with no contours; that is not a failure.
         assert!(font.advance(' ').unwrap_or(0.0) > 0.0);
@@ -199,7 +189,10 @@ mod tests {
         .expect("fallback available");
         let narrow = font.advance('i').unwrap();
         let wide = font.advance('W').unwrap();
-        assert!(wide > narrow, "W ({wide}) should be wider than i ({narrow})");
+        assert!(
+            wide > narrow,
+            "W ({wide}) should be wider than i ({narrow})"
+        );
     }
 
     #[test]

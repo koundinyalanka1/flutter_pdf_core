@@ -25,6 +25,9 @@ pub struct Font {
     pub widths: HashMap<u32, f64>,
     /// Default width for codes missing from `widths`.
     pub default_width: f64,
+    /// The default comes from the PDF (/MissingWidth or CID /DW, including
+    /// the CID default of 1000), so a substitute font must not override it.
+    pub authoritative_default_width: bool,
 }
 
 impl Font {
@@ -67,7 +70,10 @@ impl Font {
 
     /// Advance width for one code, in text-space units (em/1000).
     pub fn width(&self, code: u32) -> f64 {
-        self.widths.get(&code).copied().unwrap_or(self.default_width)
+        self.widths
+            .get(&code)
+            .copied()
+            .unwrap_or(self.default_width)
     }
 
     /// The width the document itself gave for this code, if it gave one.
@@ -87,7 +93,10 @@ impl Font {
 
 /// Build a `Font` from a font dictionary.
 pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
-    let subtype = dict.get("Subtype").and_then(PdfObject::as_name).unwrap_or("");
+    let subtype = dict
+        .get("Subtype")
+        .and_then(PdfObject::as_name)
+        .unwrap_or("");
     let mut font = Font {
         default_width: 500.0,
         ..Default::default()
@@ -99,19 +108,37 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
             Some("Identity-H") | Some("Identity-V") | None
         );
         font.default_width = 1000.0;
+        font.authoritative_default_width = true;
         // Descendant CIDFont carries /W and /DW.
-        if let Some(PdfObject::Array(desc)) = dict.get("DescendantFonts").map(|d| doc.resolve_value(d))
+        if let Some(PdfObject::Array(desc)) =
+            dict.get("DescendantFonts").map(|d| doc.resolve_value(d))
         {
             if let Some(cid_dict) = desc.first().and_then(|d| doc.resolve_dict(d)) {
-                if let Some(dw) = cid_dict.get("DW").and_then(PdfObject::as_i64) {
-                    font.default_width = dw as f64;
+                if let Some(dw) = cid_dict
+                    .get("DW")
+                    .map(|value| doc.resolve_value(value))
+                    .as_ref()
+                    .and_then(number)
+                {
+                    font.default_width = dw;
                 }
                 if let Some(PdfObject::Array(w)) = cid_dict.get("W").map(|w| doc.resolve_value(w)) {
-                    parse_cid_widths(&w, &mut font.widths);
+                    parse_cid_widths(doc, &w, &mut font.widths);
                 }
             }
         }
     } else {
+        if let Some(width) = dict
+            .get("FontDescriptor")
+            .and_then(|value| doc.resolve_dict(value))
+            .and_then(|descriptor| descriptor.get("MissingWidth"))
+            .map(|value| doc.resolve_value(value))
+            .as_ref()
+            .and_then(number)
+        {
+            font.default_width = width;
+            font.authoritative_default_width = true;
+        }
         // Simple font: base encoding + differences.
         match dict.get("Encoding").map(|e| doc.resolve_value(e)) {
             Some(PdfObject::Name(name)) => apply_base_encoding(&name, &mut font.encoding),
@@ -128,13 +155,14 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
             _ => apply_base_encoding("StandardEncoding", &mut font.encoding),
         }
         // /Widths indexed from /FirstChar.
-        let first = dict.get("FirstChar").and_then(PdfObject::as_i64).unwrap_or(0);
+        let first = dict
+            .get("FirstChar")
+            .and_then(PdfObject::as_i64)
+            .unwrap_or(0);
         if let Some(PdfObject::Array(widths)) = dict.get("Widths").map(|w| doc.resolve_value(w)) {
             for (i, w) in widths.iter().enumerate() {
-                let value = match w {
-                    PdfObject::Integer(v) => *v as f64,
-                    PdfObject::Real(v) => *v,
-                    _ => continue,
+                let Some(value) = number(&doc.resolve_value(w)) else {
+                    continue;
                 };
                 font.widths.insert((first + i as i64).max(0) as u32, value);
             }
@@ -151,18 +179,26 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
 }
 
 /// CID /W array: [ c [w1 w2 …] ] or [ c1 c2 w ].
-fn parse_cid_widths(items: &[PdfObject], out: &mut HashMap<u32, f64>) {
+fn parse_cid_widths(doc: &PdfDocument, items: &[PdfObject], out: &mut HashMap<u32, f64>) {
     let mut i = 0;
     while i < items.len() {
-        let Some(first) = items[i].as_i64() else {
+        let Some(first) = doc.resolve_value(&items[i]).as_i64() else {
             i += 1;
             continue;
         };
-        match items.get(i + 1) {
+        // A /W array can contain an indirect width array (e.g. [0 9 0 R]).
+        // Treating that reference as a range endpoint discards every width
+        // and makes a proportional font advance by /DW for every glyph.
+        match items.get(i + 1).map(|value| doc.resolve_value(value)) {
             Some(PdfObject::Array(widths)) => {
-                for (offset, w) in widths.iter().enumerate() {
-                    if let Some(value) = number(w) {
-                        out.insert((first + offset as i64).max(0) as u32, value);
+                for (offset, w) in widths.iter().take(65536).enumerate() {
+                    let Some(code) = first.checked_add(offset as i64) else {
+                        break;
+                    };
+                    if (0..=65535).contains(&code) {
+                        if let Some(value) = number(&doc.resolve_value(w)) {
+                            out.insert(code as u32, value);
+                        }
                     }
                 }
                 i += 2;
@@ -172,12 +208,19 @@ fn parse_cid_widths(items: &[PdfObject], out: &mut HashMap<u32, f64>) {
                     i += 2;
                     continue;
                 };
-                let Some(value) = items.get(i + 2).and_then(number) else {
+                let Some(value) = items
+                    .get(i + 2)
+                    .map(|value| doc.resolve_value(value))
+                    .as_ref()
+                    .and_then(number)
+                else {
                     i += 3;
                     continue;
                 };
-                for code in first..=last {
-                    out.insert(code.max(0) as u32, value);
+                // CIDs are 16-bit; malformed ranges must not cause an
+                // unbounded allocation or wrap large codes onto valid ones.
+                for code in first.max(0)..=last.min(65535) {
+                    out.insert(code as u32, value);
                 }
                 i += 3;
             }
@@ -189,7 +232,7 @@ fn parse_cid_widths(items: &[PdfObject], out: &mut HashMap<u32, f64>) {
 fn number(object: &PdfObject) -> Option<f64> {
     match object {
         PdfObject::Integer(v) => Some(*v as f64),
-        PdfObject::Real(v) => Some(*v),
+        PdfObject::Real(v) if v.is_finite() => Some(*v),
         _ => None,
     }
 }
@@ -562,9 +605,46 @@ endcmap
             PdfObject::Integer(12),
             PdfObject::Integer(250),
         ];
-        parse_cid_widths(&items, &mut widths);
+        parse_cid_widths(&PdfDocument::new_empty("1.7"), &items, &mut widths);
         assert_eq!(widths.get(&1), Some(&500.0));
         assert_eq!(widths.get(&2), Some(&600.0));
         assert_eq!(widths.get(&11), Some(&250.0));
+    }
+
+    #[test]
+    fn cid_width_array_may_be_indirect() {
+        let mut doc = PdfDocument::new_empty("1.7");
+        let widths = doc.add_object(PdfObject::Array(vec![
+            PdfObject::Integer(250),
+            PdfObject::Integer(566),
+            PdfObject::Real(555.5),
+        ]));
+        let cid = Dictionary::from([
+            ("DW".into(), PdfObject::Integer(1000)),
+            (
+                "W".into(),
+                PdfObject::Array(vec![
+                    PdfObject::Integer(0),
+                    PdfObject::Reference(widths),
+                    PdfObject::Integer(10),
+                    PdfObject::Integer(12),
+                    PdfObject::Integer(700),
+                ]),
+            ),
+        ]);
+        let dict = Dictionary::from([
+            ("Subtype".into(), PdfObject::Name("Type0".into())),
+            ("Encoding".into(), PdfObject::Name("Identity-H".into())),
+            (
+                "DescendantFonts".into(),
+                PdfObject::Array(vec![PdfObject::Dictionary(cid)]),
+            ),
+        ]);
+        let font = load_font(&doc, &dict).unwrap();
+        assert_eq!(font.width(0), 250.0);
+        assert_eq!(font.width(1), 566.0);
+        assert_eq!(font.width(2), 555.5);
+        assert_eq!(font.width(11), 700.0);
+        assert_eq!(font.width(3), 1000.0);
     }
 }

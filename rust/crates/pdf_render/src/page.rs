@@ -7,18 +7,30 @@
 //! Supported: the graphics state stack, path construction and painting
 //! (fill/stroke/even-odd), arbitrary clipping paths, DeviceGray/RGB/CMYK plus
 //! ICCBased/Indexed/Separation colour, constant alpha from `/ExtGState`,
-//! image XObjects (JPEG, CCITT G3/G4, Flate, LZW, stencil masks, soft masks),
-//! form XObjects, and text in TrueType or CFF outlines.
+//! image XObjects (JPEG, JPEG2000, JBIG2, CCITT, Flate, LZW and masks),
+//! inline images, transparency groups, standard blend modes, annotation
+//! appearances/fallbacks, all standard shadings, tiling patterns and TrueType/CFF
+//! text including stroke and clipping modes.
 //!
 //! Text whose font the document did not embed — the standard 14, or a program
 //! in a format this renderer cannot parse — is drawn in a substitute face; see
 //! [`crate::font::fallback`]. It is drawn, not skipped, because a page of
 //! invisible text is indistinguishable from a broken file.
 //!
-//! Not supported, and deliberately skipped rather than failed: shading
-//! patterns (`sh`), tiling patterns, inline images (`BI…EI`), blend modes and
-//! JPX/JBIG2 image codecs. Pages using those render with everything else
-//! intact, and [`RenderedPage::warnings`] says what was left out.
+//! Damaged input, resource limits, unsupported colour-space combinations and
+//! approximate missing-appearance fallbacks are reported in
+//! [`RenderedPage::warnings`]. Rendering a signature appearance does not verify it.
+
+#[path = "page_annotations.rs"]
+mod annotations;
+#[path = "page_forms.rs"]
+mod forms;
+#[path = "page_optional_content.rs"]
+mod optional_content;
+#[path = "page_paints.rs"]
+mod paints;
+#[path = "page_strokes.rs"]
+mod strokes;
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -29,7 +41,7 @@ use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 use pdf_ops::page_tree::effective_page_dict;
 use pdf_text::content_stream::{parse_content, Operation};
 
-use crate::canvas::{stroke_outline, Canvas, ClipMask, Rgb};
+use crate::canvas::{stroke_outline, BlendMode, Canvas, ClipMask, Rgb};
 use crate::font::RenderFont;
 use crate::geom::{FillRule, Matrix, Path};
 use crate::image::decode_image;
@@ -148,13 +160,20 @@ pub fn render_page(
         canvas: &mut canvas,
         fonts: HashMap::new(),
         depth: 0,
-        warnings: Vec::new(),
+        pattern_pixels: 0.0,
+        temporary_bytes: 0,
+        generated_mask_bytes: 0,
+        warnings: doc.recovery_warnings.clone(),
+        visible: true,
     };
     let mut state = GraphicsState::new(base_ctm);
     // Parsing recovers from damage rather than failing, so this only errors
     // in cases the renderer genuinely cannot proceed from; the page
     // background is still a better answer than no page at all.
     let _ = renderer.run(&content.data, &resources, &mut state);
+
+    renderer.configure_canvas(&GraphicsState::new(base_ctm));
+    renderer.draw_annotations(&page, &resources, base_ctm);
 
     let mut warnings = renderer.warnings;
     if content.failed > 0 {
@@ -257,11 +276,24 @@ struct GraphicsState {
     ctm: Matrix,
     fill: Rgb,
     stroke: Rgb,
+    fill_pattern: Option<String>,
+    stroke_pattern: Option<String>,
+    fill_pattern_space: bool,
+    stroke_pattern_space: bool,
+    pattern_ctm: Matrix,
     fill_components: usize,
     stroke_components: usize,
     line_width: f64,
+    line_cap: i64,
+    line_join: i64,
+    miter_limit: f64,
+    dash: Vec<f64>,
+    dash_phase: f64,
     fill_alpha: f32,
     stroke_alpha: f32,
+    blend_mode: BlendMode,
+    soft_mask: ClipMask,
+    alpha_is_shape: bool,
     clip: ClipMask,
     font: Option<Rc<RenderFont>>,
     font_size: f64,
@@ -281,11 +313,24 @@ impl GraphicsState {
             ctm,
             fill: Rgb::BLACK,
             stroke: Rgb::BLACK,
+            fill_pattern: None,
+            stroke_pattern: None,
+            fill_pattern_space: false,
+            stroke_pattern_space: false,
+            pattern_ctm: ctm,
             fill_components: 1,
             stroke_components: 1,
             line_width: 1.0,
+            line_cap: 0,
+            line_join: 0,
+            miter_limit: 10.0,
+            dash: Vec::new(),
+            dash_phase: 0.0,
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            soft_mask: None,
+            alpha_is_shape: false,
             clip: None,
             font: None,
             font_size: 0.0,
@@ -306,10 +351,19 @@ struct Renderer<'a> {
     canvas: &'a mut Canvas,
     fonts: HashMap<String, Rc<RenderFont>>,
     depth: usize,
+    pattern_pixels: f64,
+    temporary_bytes: usize,
+    generated_mask_bytes: usize,
     warnings: Vec<String>,
+    visible: bool,
 }
 
 impl Renderer<'_> {
+    fn configure_canvas(&mut self, state: &GraphicsState) {
+        self.canvas.blend_mode = state.blend_mode;
+        self.canvas.soft_mask = state.soft_mask.clone();
+        self.canvas.alpha_is_shape = state.alpha_is_shape;
+    }
     /// Record something the page needed but this build could not draw.
     ///
     /// Deduplicated on the way in, not just on the way out: `show_text` runs
@@ -332,14 +386,33 @@ impl Renderer<'_> {
     ) -> Result<()> {
         let operations = parse_content(content)?;
         let mut stack: Vec<GraphicsState> = Vec::new();
+        let mut skipped_saves = 0usize;
         let mut path = Path::with_tolerance(0.25);
         let mut pending_clip: Option<FillRule> = None;
+        let mut text_clip: Option<Path> = None;
+        let inherited_visibility = self.visible;
+        let mut marked_visibility = Vec::new();
 
         for op in &operations {
+            if skipped_saves != 0 {
+                match op.operator.as_str() {
+                    "q" => skipped_saves += 1,
+                    "Q" => skipped_saves -= 1,
+                    _ => {}
+                }
+                continue;
+            }
             let n = |i: usize| number(op, i);
             match op.operator.as_str() {
                 // -- graphics state ------------------------------------------
-                "q" => stack.push(state.clone()),
+                "q" => {
+                    if stack.len() >= 128 {
+                        self.warn("content skipped: graphics-state nesting exceeds renderer limit");
+                        skipped_saves = 1;
+                    } else {
+                        stack.push(state.clone());
+                    }
+                }
                 "Q" => {
                     if let Some(previous) = stack.pop() {
                         *state = previous;
@@ -352,6 +425,9 @@ impl Renderer<'_> {
                     }
                 }
                 "w" => state.line_width = n(0),
+                "J" => state.line_cap = n(0) as i64,
+                "j" => state.line_join = n(0) as i64,
+                "d" => self.set_dash(&op.operands, state),
                 "gs" => self.apply_ext_gstate(op, resources, state),
 
                 // -- path construction ---------------------------------------
@@ -359,7 +435,9 @@ impl Renderer<'_> {
                 "l" => path.line_to(n(0), n(1)),
                 "c" => path.curve_to(n(0), n(1), n(2), n(3), n(4), n(5)),
                 "v" => {
-                    let current = path.current_point().unwrap_or(crate::geom::Point::new(n(0), n(1)));
+                    let current = path
+                        .current_point()
+                        .unwrap_or(crate::geom::Point::new(n(0), n(1)));
                     path.curve_to(current.x, current.y, n(0), n(1), n(2), n(3));
                 }
                 "y" => path.curve_to(n(0), n(1), n(2), n(3), n(2), n(3)),
@@ -372,33 +450,44 @@ impl Renderer<'_> {
 
                 // -- path painting --------------------------------------------
                 "n" | "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" => {
-                    self.paint(&op.operator, &mut path, state, &mut pending_clip);
+                    self.paint(&op.operator, &mut path, resources, state, &mut pending_clip);
                     path = Path::with_tolerance(0.25);
                 }
 
                 // -- colour ----------------------------------------------------
                 "g" => {
+                    state.fill_pattern_space = false;
+                    state.fill_pattern = None;
                     state.fill = Rgb::gray(n(0) as f32);
                     state.fill_components = 1;
                 }
                 "G" => {
+                    state.stroke_pattern_space = false;
+                    state.stroke_pattern = None;
                     state.stroke = Rgb::gray(n(0) as f32);
                     state.stroke_components = 1;
                 }
                 "rg" => {
+                    state.fill_pattern_space = false;
+                    state.fill_pattern = None;
                     state.fill = Rgb::new(n(0) as f32, n(1) as f32, n(2) as f32);
                     state.fill_components = 3;
                 }
                 "RG" => {
+                    state.stroke_pattern_space = false;
+                    state.stroke_pattern = None;
                     state.stroke = Rgb::new(n(0) as f32, n(1) as f32, n(2) as f32);
                     state.stroke_components = 3;
                 }
                 "k" => {
-                    state.fill =
-                        Rgb::from_cmyk(n(0) as f32, n(1) as f32, n(2) as f32, n(3) as f32);
+                    state.fill_pattern_space = false;
+                    state.fill_pattern = None;
+                    state.fill = Rgb::from_cmyk(n(0) as f32, n(1) as f32, n(2) as f32, n(3) as f32);
                     state.fill_components = 4;
                 }
                 "K" => {
+                    state.stroke_pattern_space = false;
+                    state.stroke_pattern = None;
                     state.stroke =
                         Rgb::from_cmyk(n(0) as f32, n(1) as f32, n(2) as f32, n(3) as f32);
                     state.stroke_components = 4;
@@ -406,15 +495,31 @@ impl Renderer<'_> {
                 "cs" | "CS" => {
                     let components = self.space_components(op, resources);
                     let black = Rgb::BLACK;
+                    let pattern = self.is_pattern_space(op, resources);
                     if op.operator == "cs" {
+                        state.fill_pattern_space = pattern;
+                        state.fill_pattern = None;
                         state.fill_components = components;
                         state.fill = black;
                     } else {
+                        state.stroke_pattern_space = pattern;
+                        state.stroke_pattern = None;
                         state.stroke_components = components;
                         state.stroke = black;
                     }
                 }
                 "sc" | "scn" | "SC" | "SCN" => {
+                    let is_fill = op.operator.starts_with('s');
+                    let pattern = op
+                        .operands
+                        .last()
+                        .and_then(PdfObject::as_name)
+                        .map(str::to_owned);
+                    if is_fill {
+                        state.fill_pattern = pattern;
+                    } else {
+                        state.stroke_pattern = pattern;
+                    }
                     let values: Vec<f64> = op.operands.iter().filter_map(as_number).collect();
                     if let Some(color) = color_from(&values) {
                         if op.operator.starts_with('s') {
@@ -427,10 +532,15 @@ impl Renderer<'_> {
 
                 // -- text ------------------------------------------------------
                 "BT" => {
+                    text_clip = None;
                     state.text_matrix = Matrix::IDENTITY;
                     state.line_matrix = Matrix::IDENTITY;
                 }
-                "ET" => {}
+                "ET" => {
+                    if let Some(path) = text_clip.take() {
+                        self.clip_path(&path, FillRule::NonZero, state);
+                    }
+                }
                 "Tf" => {
                     state.font_size = n(1);
                     if let Some(PdfObject::Name(name)) = op.operands.first() {
@@ -458,16 +568,18 @@ impl Renderer<'_> {
                 "Tw" => state.word_spacing = n(0),
                 "Tz" => state.horizontal_scale = n(0) / 100.0,
                 "Ts" => state.rise = n(0),
-                "Tr" => state.render_mode = op.operands.first().and_then(PdfObject::as_i64).unwrap_or(0),
+                "Tr" => {
+                    state.render_mode = op.operands.first().and_then(PdfObject::as_i64).unwrap_or(0)
+                }
                 "Tj" => {
                     if let Some(bytes) = string_operand(op, 0) {
-                        self.show_text(&bytes, state);
+                        self.show_text(&bytes, resources, state, &mut text_clip);
                     }
                 }
                 "'" => {
                     next_line(state);
                     if let Some(bytes) = string_operand(op, 0) {
-                        self.show_text(&bytes, state);
+                        self.show_text(&bytes, resources, state, &mut text_clip);
                     }
                 }
                 "\"" => {
@@ -475,16 +587,15 @@ impl Renderer<'_> {
                     state.char_spacing = n(1);
                     next_line(state);
                     if let Some(bytes) = string_operand(op, 2) {
-                        self.show_text(&bytes, state);
+                        self.show_text(&bytes, resources, state, &mut text_clip);
                     }
                 }
                 "TJ" => {
                     if let Some(PdfObject::Array(items)) = op.operands.first() {
                         for item in items {
                             match item {
-                                PdfObject::LiteralString(bytes)
-                                | PdfObject::HexString(bytes) => {
-                                    self.show_text(bytes, state)
+                                PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => {
+                                    self.show_text(bytes, resources, state, &mut text_clip)
                                 }
                                 other => {
                                     if let Some(adjust) = as_number(other) {
@@ -493,8 +604,8 @@ impl Renderer<'_> {
                                         let tx = -adjust / 1000.0
                                             * state.font_size
                                             * state.horizontal_scale;
-                                        state.text_matrix = Matrix::translate(tx, 0.0)
-                                            .then(&state.text_matrix);
+                                        state.text_matrix =
+                                            Matrix::translate(tx, 0.0).then(&state.text_matrix);
                                     }
                                 }
                             }
@@ -509,9 +620,58 @@ impl Renderer<'_> {
                     }
                 }
 
-                _ => {} // sh, BI/ID/EI, marked content, compatibility ops
+                "sh" if self.visible => {
+                    if let Some(name) = op.operands.first().and_then(PdfObject::as_name) {
+                        if let Some(shading) = self.resource_object(resources, "Shading", name) {
+                            self.draw_shading(&shading, resources, state, false);
+                        } else {
+                            self.warn("shading skipped: missing resource");
+                        }
+                    }
+                }
+                "BI" => {
+                    if let Some(PdfObject::Stream(stream)) = op.operands.first() {
+                        let mut stream = stream.clone();
+                        self.resolve_inline_color_space(&mut stream, resources);
+                        self.draw_image(&stream, state);
+                    } else {
+                        self.warn("inline image skipped: malformed or truncated image data");
+                    }
+                }
+                "sh" => {}
+                "BMC" | "BDC" => {
+                    marked_visibility.push(self.visible);
+                    if op.operator == "BDC"
+                        && op.operands.first().and_then(PdfObject::as_name) == Some("OC")
+                    {
+                        let property = op.operands.get(1).and_then(|value| {
+                            if let PdfObject::Name(name) = value {
+                                resources
+                                    .get("Properties")
+                                    .and_then(|v| self.doc.resolve_dict(v))
+                                    .and_then(|d| d.get(name))
+                                    .cloned()
+                            } else {
+                                Some(value.clone())
+                            }
+                        });
+                        if let Some(property) = property {
+                            self.visible = self.visible && self.optional_visible(&property, 0);
+                        } else {
+                            self.warn("optional content has no readable layer property; visibility may differ");
+                        }
+                    }
+                }
+                "EMC" => self.visible = marked_visibility.pop().unwrap_or(inherited_visibility),
+                "MP" | "DP" | "BX" | "EX" => {}
+                "M" => state.miter_limit = n(0).max(1.0),
+                "ri" | "i" => {} // device-space rendering intent and flatness hints
+                other => self.warn(format!(
+                    "unsupported content operator {other}; appearance may differ"
+                )),
             }
         }
+        self.visible = inherited_visibility;
         Ok(())
     }
 
@@ -519,6 +679,7 @@ impl Renderer<'_> {
         &mut self,
         operator: &str,
         path: &mut Path,
+        resources: &Dictionary,
         state: &mut GraphicsState,
         pending_clip: &mut Option<FillRule>,
     ) {
@@ -535,26 +696,11 @@ impl Renderer<'_> {
             FillRule::NonZero
         };
 
-        if fills && !device.is_empty() {
-            self.canvas.fill_path(
-                &device,
-                state.fill,
-                rule,
-                state.fill_alpha,
-                state.clip.as_deref(),
-            );
+        if fills && self.visible && !device.is_empty() {
+            self.paint_color(&device, rule, true, resources, state);
         }
-        if strokes && !device.is_empty() {
-            // Line width is in user space; scale it into device space.
-            let width = state.line_width * state.ctm.mean_scale();
-            let outline = stroke_outline(&device, width);
-            self.canvas.fill_path(
-                &outline,
-                state.stroke,
-                FillRule::NonZero,
-                state.stroke_alpha,
-                state.clip.as_deref(),
-            );
+        if strokes && self.visible && !device.is_empty() {
+            self.paint_stroke(path, resources, state);
         }
 
         // `W` names the clip, but it only takes effect after the painting
@@ -580,14 +726,81 @@ impl Renderer<'_> {
         let Some(dict) = self.resource(resources, "ExtGState", name) else {
             return;
         };
-        if let Some(value) = dict.get("ca").and_then(as_number) {
+        self.apply_ext_gstate_dict(&dict, resources, state);
+    }
+
+    fn apply_ext_gstate_dict(
+        &mut self,
+        dict: &Dictionary,
+        resources: &Dictionary,
+        state: &mut GraphicsState,
+    ) {
+        let doc = self.doc;
+        let numeric = |key: &str| {
+            dict.get(key)
+                .map(|v| doc.resolve_value(v))
+                .as_ref()
+                .and_then(as_number)
+        };
+        if let Some(value) = numeric("ca") {
             state.fill_alpha = value.clamp(0.0, 1.0) as f32;
         }
-        if let Some(value) = dict.get("CA").and_then(as_number) {
+        if let Some(value) = numeric("CA") {
             state.stroke_alpha = value.clamp(0.0, 1.0) as f32;
         }
-        if let Some(value) = dict.get("LW").and_then(as_number) {
+        if let Some(mode) = dict.get("BM").map(|v| self.doc.resolve_value(v)) {
+            let selected = match mode {
+                PdfObject::Name(name) => BlendMode::from_name(&name),
+                PdfObject::Array(items) => items.iter().find_map(|v| {
+                    self.doc
+                        .resolve_value(v)
+                        .as_name()
+                        .and_then(BlendMode::from_name)
+                }),
+                _ => None,
+            };
+            state.blend_mode = selected.unwrap_or(BlendMode::Normal);
+            if selected.is_none() {
+                self.warn("unknown blend mode; Normal is used");
+            }
+        }
+        if let Some(value) = dict.get("SMask").map(|v| self.doc.resolve_value(v)) {
+            if value.as_name() == Some("None") {
+                state.soft_mask = None;
+            } else {
+                state.soft_mask = self.render_soft_mask(&value, resources, state);
+            }
+        }
+        if let Some(PdfObject::Bool(value)) = dict.get("AIS").map(|v| self.doc.resolve_value(v)) {
+            state.alpha_is_shape = value;
+        }
+        if let Some(value) = numeric("ML") {
+            state.miter_limit = value.max(1.0);
+        }
+        if let Some(value) = numeric("LW") {
             state.line_width = value;
+        }
+        if let Some(value) = numeric("LC").map(|v| v as i64) {
+            state.line_cap = value;
+        }
+        if let Some(value) = numeric("LJ").map(|v| v as i64) {
+            state.line_join = value;
+        }
+        if let Some(PdfObject::Array(values)) = dict.get("D").map(|v| self.doc.resolve_value(v)) {
+            self.set_dash(&values, state);
+        }
+        if let Some(PdfObject::Array(values)) = dict.get("Font").map(|v| doc.resolve_value(v)) {
+            if let (Some(font), Some(size)) = (
+                values.first().and_then(|v| doc.resolve_dict(v)),
+                values
+                    .get(1)
+                    .map(|v| doc.resolve_value(v))
+                    .as_ref()
+                    .and_then(as_number),
+            ) {
+                state.font = Some(Rc::new(RenderFont::load(doc, font)));
+                state.font_size = size;
+            }
         }
     }
 
@@ -617,13 +830,21 @@ impl Renderer<'_> {
         Some(font)
     }
 
-    fn show_text(&mut self, bytes: &[u8], state: &mut GraphicsState) {
+    fn show_text(
+        &mut self,
+        bytes: &[u8],
+        resources: &Dictionary,
+        state: &mut GraphicsState,
+        text_clip: &mut Option<Path>,
+    ) {
         let Some(font) = state.font.clone() else {
+            if state.render_mode != 3 {
+                self.warn("some text could not be drawn: missing font resource");
+            }
             return;
         };
-        // Render mode 3 (and 7) is invisible text — the OCR layer sitting
-        // under a scanned image. Advance through it without drawing.
-        let invisible = state.render_mode == 3 || state.render_mode == 7;
+        // Mode 3 is invisible; mode 7 contributes outlines to the clip at ET.
+        let invisible = !self.visible || state.render_mode == 3;
         let units_per_em = font.units_per_em();
 
         if !invisible {
@@ -645,23 +866,20 @@ impl Renderer<'_> {
                         state.font_size / units_per_em,
                     );
                     let offset = Matrix::translate(0.0, state.rise);
-                    let trm = scale
-                        .then(&offset)
-                        .then(&state.text_matrix)
-                        .then(&state.ctm);
-                    let device = outline.transform(&trm);
-                    let color = if state.render_mode == 1 || state.render_mode == 5 {
-                        state.stroke
-                    } else {
-                        state.fill
-                    };
-                    self.canvas.fill_path(
-                        &device,
-                        color,
-                        FillRule::NonZero,
-                        state.fill_alpha,
-                        state.clip.as_deref(),
-                    );
+                    let user = outline.transform(&scale.then(&offset).then(&state.text_matrix));
+                    let device = user.transform(&state.ctm);
+                    if matches!(state.render_mode, 0 | 2 | 4 | 6) {
+                        self.paint_color(&device, FillRule::NonZero, true, resources, state);
+                    }
+                    if matches!(state.render_mode, 1 | 2 | 5 | 6) {
+                        self.paint_stroke(&user, resources, state);
+                    }
+                    if matches!(state.render_mode, 4..=7) {
+                        text_clip
+                            .get_or_insert_with(Path::new)
+                            .subpaths
+                            .extend(device.subpaths);
+                    }
                 }
             }
 
@@ -677,8 +895,12 @@ impl Renderer<'_> {
     }
 
     fn draw_xobject(&mut self, name: &str, resources: &Dictionary, state: &mut GraphicsState) {
+        if !self.visible {
+            return;
+        }
         if self.depth > 12 {
-            return; // guard against recursive form XObjects
+            self.warn("form skipped: recursive content exceeds renderer limit");
+            return;
         }
         let Some(object) = self.resource_object(resources, "XObject", name) else {
             return;
@@ -686,6 +908,13 @@ impl Renderer<'_> {
         let PdfObject::Stream(stream) = object else {
             return;
         };
+        if stream
+            .dictionary
+            .get("OC")
+            .is_some_and(|value| !self.optional_visible(value, 0))
+        {
+            return;
+        }
         let subtype = stream
             .dictionary
             .get("Subtype")
@@ -694,56 +923,7 @@ impl Renderer<'_> {
 
         match subtype {
             "Image" => self.draw_image(&stream, state),
-            "Form" => {
-                let mut inner = state.clone();
-                if let Some(PdfObject::Array(items)) = stream
-                    .dictionary
-                    .get("Matrix")
-                    .map(|o| self.doc.resolve_value(o))
-                {
-                    let values: Vec<f64> = items.iter().filter_map(as_number).collect();
-                    if values.len() >= 6 {
-                        let m = Matrix::new(
-                            values[0], values[1], values[2], values[3], values[4], values[5],
-                        );
-                        inner.ctm = m.then(&inner.ctm);
-                    }
-                }
-                // /BBox clips the form's contents.
-                if let Some(bbox) = array_rect(self.doc, &stream.dictionary, "BBox") {
-                    let mut clip_path = Path::new();
-                    clip_path.rect(
-                        bbox.0.min(bbox.2),
-                        bbox.1.min(bbox.3),
-                        (bbox.2 - bbox.0).abs(),
-                        (bbox.3 - bbox.1).abs(),
-                    );
-                    let device = clip_path.transform(&inner.ctm);
-                    let mask = self.canvas.rasterize_mask(&device, FillRule::NonZero);
-                    inner.clip = Some(Rc::new(match inner.clip.as_deref() {
-                        Some(existing) => existing.intersect(&mask),
-                        None => mask,
-                    }));
-                }
-
-                let inner_resources = stream
-                    .dictionary
-                    .get("Resources")
-                    .map(|o| self.doc.resolve_value(o))
-                    .and_then(|o| self.doc.resolve_dict(&o).cloned())
-                    .unwrap_or_else(|| resources.clone());
-
-                if let Ok(data) = self.doc.stream_data(&stream) {
-                    // Font resource names are local to this Form. A form's
-                    // /F1 may differ from the page's /F1; inherited selected
-                    // fonts remain alive in `inner.font` through their Rc.
-                    let outer_fonts = std::mem::take(&mut self.fonts);
-                    self.depth += 1;
-                    let _ = self.run(&data, &inner_resources, &mut inner);
-                    self.depth -= 1;
-                    self.fonts = outer_fonts;
-                }
-            }
+            "Form" => self.draw_form(&stream, resources, state),
             _ => {}
         }
     }
@@ -754,11 +934,23 @@ impl Renderer<'_> {
     /// handles rotation and skew for free and never allocates a resampled
     /// intermediate.
     fn draw_image(&mut self, stream: &pdf_core::stream::PdfStream, state: &GraphicsState) {
+        if !self.visible {
+            return;
+        }
+        self.configure_canvas(state);
         let Some(image) = decode_image(self.doc, stream) else {
             let codec = image_codec_name(self.doc, stream);
-            self.warn(format!("image skipped: {codec} is not supported"));
+            self.warn(format!(
+                "image skipped: {codec} is unsupported or its data is damaged"
+            ));
             return;
         };
+        if image.is_stencil && state.fill_pattern_space {
+            self.warn(
+                "pattern-coloured stencil image skipped: this paint combination is unsupported",
+            );
+            return;
+        }
         let Some(inverse) = state.ctm.invert() else {
             return;
         };
@@ -860,7 +1052,11 @@ fn components_of_space(doc: &PdfDocument, object: &PdfObject) -> usize {
 fn color_from(values: &[f64]) -> Option<Rgb> {
     match values.len() {
         1 => Some(Rgb::gray(values[0] as f32)),
-        3 => Some(Rgb::new(values[0] as f32, values[1] as f32, values[2] as f32)),
+        3 => Some(Rgb::new(
+            values[0] as f32,
+            values[1] as f32,
+            values[2] as f32,
+        )),
         4 => Some(Rgb::from_cmyk(
             values[0] as f32,
             values[1] as f32,
@@ -963,7 +1159,7 @@ fn array_rect(doc: &PdfDocument, dict: &Dictionary, key: &str) -> Option<(f64, f
         .map(|o| doc.resolve_value(o))
         .filter_map(|o| as_number(&o))
         .collect();
-    if values.len() < 4 {
+    if values.len() != 4 || values.iter().any(|v| !v.is_finite()) {
         return None;
     }
     Some((
@@ -1157,7 +1353,7 @@ mod tests {
     }
 
     /// Build a one-page document whose content stream is `content`.
-    fn doc_with_content(content: &str, media: [i64; 4]) -> PdfDocument {
+    pub(super) fn doc_with_content(content: &str, media: [i64; 4]) -> PdfDocument {
         let mut doc = PdfDocument::new_empty("1.7");
         let mut stream_dict = Dictionary::new();
         stream_dict.insert("Length".into(), PdfObject::Integer(content.len() as i64));
@@ -1195,7 +1391,7 @@ mod tests {
         doc
     }
 
-    fn pixel(page: &RenderedPage, x: u32, y: u32) -> (u8, u8, u8) {
+    pub(super) fn pixel(page: &RenderedPage, x: u32, y: u32) -> (u8, u8, u8) {
         let offset = ((y * page.width + x) * 4) as usize;
         (
             page.pixels[offset],
@@ -1405,3 +1601,11 @@ mod tests {
         assert_eq!(page_size_points(&doc, 0).unwrap(), (612.0, 792.0));
     }
 }
+
+#[cfg(test)]
+#[path = "page_regressions.rs"]
+mod regressions;
+
+#[cfg(test)]
+#[path = "page_transparency_tests.rs"]
+mod transparency_tests;

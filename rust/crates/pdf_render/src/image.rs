@@ -6,9 +6,8 @@
 //! [`crate::ccitt`], and everything else comes back as raw component samples
 //! read through the image's colour space.
 //!
-//! JPXDecode (JPEG 2000) and JBIG2Decode remain unread. They are reported by
-//! name rather than skipped silently, so a page missing an image says which
-//! format it wanted.
+//! JPEG 2000 and JBIG2 use standalone Rust codecs with resource checks before
+//! decoding. Embedded JBIG2 symbol dictionaries are resolved via JBIG2Globals.
 
 use pdf_core::document::PdfDocument;
 use pdf_core::filter::{decode, DecodeParms};
@@ -17,6 +16,9 @@ use pdf_core::stream::PdfStream;
 
 use crate::canvas::Rgb;
 use crate::ccitt;
+
+#[path = "image_codecs.rs"]
+mod codecs;
 
 const MAX_IMAGE_PIXELS: usize = 64_000_000;
 const MAX_IMAGE_DEPTH: usize = 8;
@@ -114,10 +116,7 @@ impl ColorSpace {
                 let Some(values) = lookup.get(start..).and_then(|tail| tail.get(..n)) else {
                     return Rgb::BLACK;
                 };
-                let values: Vec<f64> = values
-                    .iter()
-                    .map(|&b| b as f64 / 255.0)
-                    .collect();
+                let values: Vec<f64> = values.iter().map(|&b| b as f64 / 255.0).collect();
                 base.to_rgb(&values, 0)
             }
             // One or more inks; treat maximum coverage as darkness.
@@ -129,8 +128,8 @@ impl ColorSpace {
     }
 }
 
-/// Decode an image XObject. Returns `None` for formats this renderer cannot
-/// read (JPXDecode/JBIG2, chiefly) rather than failing the whole page.
+/// Decode an image XObject. Returns `None` for damaged or resource-limited
+/// images rather than failing the whole page.
 /// Images are limited to 64 million pixels, 32 colour components and 16 levels
 /// of colour-space nesting. Cyclic masks and mask chains beyond eight images
 /// are ignored while preserving the base image.
@@ -144,7 +143,9 @@ fn decode_image_inner(
     ancestors: &[&PdfStream],
 ) -> Option<DecodedImage> {
     if ancestors.len() >= MAX_IMAGE_DEPTH
-        || ancestors.iter().any(|ancestor| std::ptr::eq(*ancestor, stream))
+        || ancestors
+            .iter()
+            .any(|ancestor| std::ptr::eq(*ancestor, stream))
     {
         return None;
     }
@@ -185,13 +186,48 @@ fn decode_image_inner(
 
     let mut image = if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
         decode_jpeg(&data, width, height)?
+    } else if filters.iter().any(|f| f == "JPXDecode") {
+        codecs::decode_jpx(doc, dict, &data, is_stencil, decode_array.as_deref())?
+    } else if let Some(index) = filters.iter().position(|f| f == "JBIG2Decode") {
+        let parms = raw_decode_parms(doc, dict, filters.len());
+        let globals = parms[index].as_ref().and_then(|p| p.get("JBIG2Globals"));
+        let globals = match globals {
+            Some(object) => {
+                let PdfObject::Stream(stream) = resolve_object(doc, object)? else {
+                    return None;
+                };
+                if stream.data.len() > codecs::MAX_CODEC_BYTES {
+                    return None;
+                }
+                Some(doc.stream_data(stream).ok()?)
+            }
+            None => None,
+        };
+        let (samples, w, h) = codecs::decode_jbig2(&data, globals.as_deref())?;
+        decode_raw(
+            &samples,
+            w,
+            h,
+            1,
+            &ColorSpace::Gray,
+            decode_array.as_deref(),
+            is_stencil,
+        )?
     } else {
         let space = if is_stencil {
             ColorSpace::Gray
         } else {
             color_space(doc, dict)?
         };
-        decode_raw(&data, width, height, bpc, &space, decode_array.as_deref(), is_stencil)?
+        decode_raw(
+            &data,
+            width,
+            height,
+            bpc,
+            &space,
+            decode_array.as_deref(),
+            is_stencil,
+        )?
     };
 
     if is_stencil {
@@ -218,13 +254,16 @@ fn defilter(
         match name.as_str() {
             // JPEG is decoded by the image path rather than here, so its
             // bytes pass through untouched.
-            "DCTDecode" | "DCT" => return Some(data),
+            "DCTDecode" | "DCT" | "JPXDecode" | "JBIG2Decode" => return Some(data),
             "CCITTFaxDecode" | "CCF" => {
-                let params = ccitt_params(doc, raw_parms.get(i).and_then(Option::as_ref), width, height)?;
+                let params = ccitt_params(
+                    doc,
+                    raw_parms.get(i).and_then(Option::as_ref),
+                    width,
+                    height,
+                )?;
                 return ccitt::decode(&data, &params);
             }
-            // Still out of scope; the renderer reports these by name.
-            "JPXDecode" | "JBIG2Decode" => return None,
             _ => {
                 data = decode(name, &data, &parms[i]).ok()?;
             }
@@ -235,11 +274,7 @@ fn defilter(
 
 /// The per-filter `/DecodeParms` dictionaries themselves, which CCITT needs
 /// because its parameters do not fit the byte-filter `DecodeParms` struct.
-fn raw_decode_parms(
-    doc: &PdfDocument,
-    dict: &Dictionary,
-    count: usize,
-) -> Vec<Option<Dictionary>> {
+fn raw_decode_parms(doc: &PdfDocument, dict: &Dictionary, count: usize) -> Vec<Option<Dictionary>> {
     let mut out = vec![None; count.max(1)];
     let raw = dict
         .get("DecodeParms")
@@ -286,7 +321,11 @@ fn ccitt_params(
         return None;
     }
     let requested_rows = usize::try_from(get("Rows", height as i64)).ok()?;
-    let rows = if requested_rows == 0 { height } else { requested_rows.min(height) };
+    let rows = if requested_rows == 0 {
+        height
+    } else {
+        requested_rows.min(height)
+    };
     image_pixel_count(columns, rows)?;
     Some(ccitt::CcittParams {
         k: get("K", 0).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
@@ -366,9 +405,7 @@ fn decode_jpeg(data: &[u8], width: usize, height: usize) -> Option<DecodedImage>
 
     let rgb = match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => pixels,
-        jpeg_decoder::PixelFormat::L8 => {
-            pixels.iter().flat_map(|&v| [v, v, v]).collect()
-        }
+        jpeg_decoder::PixelFormat::L8 => pixels.iter().flat_map(|&v| [v, v, v]).collect(),
         jpeg_decoder::PixelFormat::L16 => pixels
             .chunks_exact(2)
             .flat_map(|c| {
@@ -663,12 +700,18 @@ mod tests {
     fn fax_row_metadata_cannot_allocate_padding_beyond_the_image() {
         let doc = PdfDocument::new_empty("1.7");
         let mut stream = gray_stream(255);
-        stream.dictionary.insert("Filter".into(), PdfObject::Name("CCITTFaxDecode".into()));
-        stream.dictionary.insert("BitsPerComponent".into(), PdfObject::Integer(1));
+        stream
+            .dictionary
+            .insert("Filter".into(), PdfObject::Name("CCITTFaxDecode".into()));
+        stream
+            .dictionary
+            .insert("BitsPerComponent".into(), PdfObject::Integer(1));
         let mut parms = Dictionary::new();
         parms.insert("K".into(), PdfObject::Integer(-1));
         parms.insert("Rows".into(), PdfObject::Integer(i64::MAX));
-        stream.dictionary.insert("DecodeParms".into(), PdfObject::Dictionary(parms.clone()));
+        stream
+            .dictionary
+            .insert("DecodeParms".into(), PdfObject::Dictionary(parms.clone()));
         let image = decode_image(&doc, &stream).unwrap();
         assert_eq!(image.rgb, [255, 255, 255]);
 
@@ -685,9 +728,13 @@ mod tests {
         let mut doc = PdfDocument::new_empty("1.7");
         let id = doc.add_object(PdfObject::Null);
         let mut stream = gray_stream(80);
-        stream.dictionary.insert("SMask".into(), PdfObject::Reference(id));
+        stream
+            .dictionary
+            .insert("SMask".into(), PdfObject::Reference(id));
         doc.set_object(id, PdfObject::Stream(stream));
-        let PdfObject::Stream(stream) = doc.resolve(id).unwrap() else { panic!() };
+        let PdfObject::Stream(stream) = doc.resolve(id).unwrap() else {
+            panic!()
+        };
         let image = decode_image(&doc, stream).unwrap();
         assert_eq!(image.rgb, [80, 80, 80]);
         assert!(image.alpha.is_empty());
@@ -699,21 +746,30 @@ mod tests {
         let first = doc.add_object(PdfObject::Null);
         let second = doc.add_object(PdfObject::Null);
         let mut stream = gray_stream(80);
-        stream.dictionary.insert("SMask".into(), PdfObject::Reference(second));
+        stream
+            .dictionary
+            .insert("SMask".into(), PdfObject::Reference(second));
         doc.set_object(first, PdfObject::Stream(stream));
         let mut mask = gray_stream(160);
-        mask.dictionary.insert("SMask".into(), PdfObject::Reference(first));
+        mask.dictionary
+            .insert("SMask".into(), PdfObject::Reference(first));
         doc.set_object(second, PdfObject::Stream(mask));
-        let PdfObject::Stream(stream) = doc.resolve(first).unwrap() else { panic!() };
+        let PdfObject::Stream(stream) = doc.resolve(first).unwrap() else {
+            panic!()
+        };
         assert_eq!(decode_image(&doc, stream).unwrap().alpha, [160]);
 
         let mut next = first;
         for _ in 0..256 {
             let mut stream = gray_stream(40);
-            stream.dictionary.insert("SMask".into(), PdfObject::Reference(next));
+            stream
+                .dictionary
+                .insert("SMask".into(), PdfObject::Reference(next));
             next = doc.add_object(PdfObject::Stream(stream));
         }
-        let PdfObject::Stream(stream) = doc.resolve(next).unwrap() else { panic!() };
+        let PdfObject::Stream(stream) = doc.resolve(next).unwrap() else {
+            panic!()
+        };
         assert_eq!(decode_image(&doc, stream).unwrap().alpha, [40]);
     }
 
@@ -721,12 +777,14 @@ mod tests {
     fn indexed_color_space_cycles_and_excessive_nesting_are_rejected() {
         let mut doc = PdfDocument::new_empty("1.7");
         let id = doc.add_object(PdfObject::Null);
-        let indexed = |base| PdfObject::Array(vec![
-            PdfObject::Name("Indexed".into()),
-            base,
-            PdfObject::Integer(1),
-            PdfObject::HexString(vec![0, 255]),
-        ]);
+        let indexed = |base| {
+            PdfObject::Array(vec![
+                PdfObject::Name("Indexed".into()),
+                base,
+                PdfObject::Integer(1),
+                PdfObject::HexString(vec![0, 255]),
+            ])
+        };
         doc.set_object(id, indexed(PdfObject::Reference(id)));
         assert!(parse_color_space(&doc, &PdfObject::Reference(id), 0).is_none());
 
@@ -735,7 +793,9 @@ mod tests {
             space = indexed(space);
         }
         assert!(parse_color_space(&doc, &space, 0).is_none());
-        assert!(parse_color_space(&doc, &indexed(PdfObject::Name("DeviceRGB".into())), 0).is_some());
+        assert!(
+            parse_color_space(&doc, &indexed(PdfObject::Name("DeviceRGB".into())), 0).is_some()
+        );
     }
 
     #[test]
@@ -743,13 +803,19 @@ mod tests {
         let doc = PdfDocument::new_empty("1.7");
         for (width, height) in [(-1, 1), (1, -1), (0, 1), (i64::MAX, i64::MAX)] {
             let mut stream = gray_stream(1);
-            stream.dictionary.insert("Width".into(), PdfObject::Integer(width));
-            stream.dictionary.insert("Height".into(), PdfObject::Integer(height));
+            stream
+                .dictionary
+                .insert("Width".into(), PdfObject::Integer(width));
+            stream
+                .dictionary
+                .insert("Height".into(), PdfObject::Integer(height));
             assert!(decode_image(&doc, &stream).is_none());
         }
         for bpc in [-1, 0, 3, 32, i64::MAX] {
             let mut stream = gray_stream(1);
-            stream.dictionary.insert("BitsPerComponent".into(), PdfObject::Integer(bpc));
+            stream
+                .dictionary
+                .insert("BitsPerComponent".into(), PdfObject::Integer(bpc));
             assert!(decode_image(&doc, &stream).is_none());
         }
         assert!(decode_raw(&[0], usize::MAX, 2, 8, &ColorSpace::Gray, None, false).is_none());
@@ -782,10 +848,7 @@ mod tests {
     #[test]
     fn indexed_palette_maps_through_the_lookup_table() {
         // Two-entry RGB palette: red then green.
-        let space = ColorSpace::Indexed(
-            Box::new(ColorSpace::Rgb),
-            vec![255, 0, 0, 0, 255, 0],
-        );
+        let space = ColorSpace::Indexed(Box::new(ColorSpace::Rgb), vec![255, 0, 0, 0, 255, 0]);
         // 1 bit per pixel: 0, 1 -> red, green (packed into one byte).
         let image = decode_raw(&[0b0100_0000], 2, 1, 1, &space, None, false).unwrap();
         assert_eq!(&image.rgb[0..3], &[255, 0, 0]);
@@ -794,16 +857,7 @@ mod tests {
 
     #[test]
     fn stencil_mask_paints_where_the_bit_is_zero() {
-        let image = decode_raw(
-            &[0b0100_0000],
-            2,
-            1,
-            1,
-            &ColorSpace::Gray,
-            None,
-            true,
-        )
-        .unwrap();
+        let image = decode_raw(&[0b0100_0000], 2, 1, 1, &ColorSpace::Gray, None, true).unwrap();
         assert!(image.is_stencil);
         assert_eq!(image.alpha, vec![255, 0]);
     }
@@ -826,8 +880,7 @@ mod tests {
     #[test]
     fn cmyk_samples_convert_to_rgb() {
         // Pure cyan: C=1 M=0 Y=0 K=0.
-        let image =
-            decode_raw(&[255, 0, 0, 0], 1, 1, 8, &ColorSpace::Cmyk, None, false).unwrap();
+        let image = decode_raw(&[255, 0, 0, 0], 1, 1, 8, &ColorSpace::Cmyk, None, false).unwrap();
         assert_eq!(&image.rgb[0..3], &[0, 255, 255]);
     }
 

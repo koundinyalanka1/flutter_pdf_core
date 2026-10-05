@@ -59,12 +59,12 @@ impl Matrix {
 /// Text state parameters (PDF 9.3).
 #[derive(Debug, Clone)]
 pub struct TextState {
-    pub char_spacing: f64,  // Tc
-    pub word_spacing: f64,  // Tw
-    pub horiz_scale: f64,   // Tz (as a fraction, default 1.0)
-    pub leading: f64,       // TL
-    pub font_size: f64,     // Tf size
-    pub rise: f64,          // Ts
+    pub char_spacing: f64, // Tc
+    pub word_spacing: f64, // Tw
+    pub horiz_scale: f64,  // Tz (as a fraction, default 1.0)
+    pub leading: f64,      // TL
+    pub font_size: f64,    // Tf size
+    pub rise: f64,         // Ts
     pub font_key: Option<String>,
 }
 

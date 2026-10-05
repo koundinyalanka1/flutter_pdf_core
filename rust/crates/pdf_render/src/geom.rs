@@ -266,9 +266,7 @@ impl Path {
             for p in &subpath.points {
                 bounds = Some(match bounds {
                     None => (p.x, p.y, p.x, p.y),
-                    Some((x0, y0, x1, y1)) => {
-                        (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y))
-                    }
+                    Some((x0, y0, x1, y1)) => (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)),
                 });
             }
         }

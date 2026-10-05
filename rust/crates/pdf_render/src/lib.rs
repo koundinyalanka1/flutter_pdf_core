@@ -13,5 +13,5 @@ pub mod page;
 pub mod png;
 
 pub use canvas::Rgb;
-pub use png::encode_rgba_as_png;
 pub use page::{page_size_points, render_page, RenderOptions, RenderSize, RenderedPage};
+pub use png::encode_rgba_as_png;

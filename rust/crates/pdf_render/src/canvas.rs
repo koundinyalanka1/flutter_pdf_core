@@ -7,6 +7,11 @@
 
 use std::rc::Rc;
 
+#[path = "blend.rs"]
+mod blending;
+pub use blending::lum as luminosity;
+pub use blending::BlendMode;
+
 use crate::geom::{FillRule, Path, Point};
 
 /// Sub-scanlines sampled per pixel row.
@@ -76,7 +81,7 @@ impl Mask {
     }
 }
 
-/// RGBA8 output buffer. Alpha is always 255 — a rendered page is opaque.
+/// Straight RGBA8 output. The page is opaque; intermediate groups can be transparent.
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
@@ -85,6 +90,12 @@ pub struct Canvas {
     /// Reusable coverage row so filling does not allocate per scanline.
     coverage: Vec<f32>,
     crossings: Vec<(f64, i32)>,
+    pub blend_mode: BlendMode,
+    pub soft_mask: ClipMask,
+    pub alpha_is_shape: bool,
+    pub group_alpha: Option<Vec<f32>>,
+    pub group_shape: Option<Vec<f32>>,
+    knockout_backdrop: Option<Vec<u8>>,
 }
 
 impl Canvas {
@@ -95,7 +106,38 @@ impl Canvas {
             pixels: vec![255; width * height * 4],
             coverage: vec![0.0; width + 2],
             crossings: Vec::with_capacity(64),
+            blend_mode: BlendMode::Normal,
+            soft_mask: None,
+            alpha_is_shape: false,
+            group_alpha: None,
+            group_shape: None,
+            knockout_backdrop: None,
         }
+    }
+
+    pub fn transparent(width: usize, height: usize) -> Self {
+        let mut canvas = Self::new(width, height);
+        canvas.pixels.fill(0);
+        canvas
+    }
+
+    pub fn group(backdrop: &Canvas, isolated: bool, knockout: bool) -> Self {
+        let mut canvas = Self::transparent(backdrop.width, backdrop.height);
+        if !isolated {
+            canvas.pixels.copy_from_slice(backdrop.group_backdrop());
+        }
+        if knockout {
+            canvas.knockout_backdrop = Some(canvas.pixels.clone());
+        }
+        canvas.group_alpha = Some(vec![0.0; backdrop.width * backdrop.height]);
+        canvas.group_shape = Some(vec![0.0; backdrop.width * backdrop.height]);
+        canvas
+    }
+
+    /// A non-isolated child of a knockout group inherits the parent's initial
+    /// backdrop, not the objects already painted into that parent (11.4.6).
+    pub fn group_backdrop(&self) -> &[u8] {
+        self.knockout_backdrop.as_deref().unwrap_or(&self.pixels)
     }
 
     pub fn fill_background(&mut self, color: Rgb) {
@@ -119,7 +161,7 @@ impl Canvas {
         alpha: f32,
         clip: Option<&Mask>,
     ) {
-        if alpha <= 0.001 {
+        if alpha <= 0.001 && self.knockout_backdrop.is_none() {
             return;
         }
         self.scan(path, rule, |canvas, y, row| {
@@ -235,51 +277,104 @@ impl Canvas {
         let b = color.b.clamp(0.0, 1.0);
         let row_base = y * self.width;
         for x in 0..self.width {
-            let mut a = coverage[x].clamp(0.0, 1.0) * alpha;
-            if a <= 0.002 {
+            let mut shape = coverage[x].clamp(0.0, 1.0);
+            if shape <= 0.002 {
                 continue;
             }
             if let Some(mask) = clip {
-                a *= mask.data[row_base + x] as f32 / 255.0;
-                if a <= 0.002 {
+                shape *= mask.data[row_base + x] as f32 / 255.0;
+                if shape <= 0.002 {
                     continue;
                 }
             }
-            let offset = (row_base + x) * 4;
-            blend_pixel(&mut self.pixels[offset..offset + 4], r, g, b, a);
+            self.blend_at(row_base + x, [r, g, b], shape * alpha, shape);
         }
     }
 
     /// Blend a single device pixel — used by the image painter.
     pub fn blend(&mut self, x: usize, y: usize, color: Rgb, alpha: f32, clip: Option<&Mask>) {
-        if x >= self.width || y >= self.height || alpha <= 0.002 {
+        if x >= self.width
+            || y >= self.height
+            || (alpha <= 0.002 && self.knockout_backdrop.is_none())
+        {
             return;
         }
         let index = y * self.width + x;
-        let mut a = alpha;
+        let mut shape = 1.0;
         if let Some(mask) = clip {
-            a *= mask.data[index] as f32 / 255.0;
-            if a <= 0.002 {
+            shape *= mask.data[index] as f32 / 255.0;
+            if shape <= 0.002 {
                 return;
             }
         }
-        let offset = index * 4;
-        blend_pixel(
-            &mut self.pixels[offset..offset + 4],
-            color.r.clamp(0.0, 1.0),
-            color.g.clamp(0.0, 1.0),
-            color.b.clamp(0.0, 1.0),
-            a,
+        self.blend_at(
+            index,
+            [
+                color.r.clamp(0.0, 1.0),
+                color.g.clamp(0.0, 1.0),
+                color.b.clamp(0.0, 1.0),
+            ],
+            alpha * shape,
+            shape,
         );
     }
-}
 
-fn blend_pixel(pixel: &mut [u8], r: f32, g: f32, b: f32, a: f32) {
-    let inv = 1.0 - a;
-    pixel[0] = to_u8(pixel[0] as f32 / 255.0 * inv + r * a);
-    pixel[1] = to_u8(pixel[1] as f32 / 255.0 * inv + g * a);
-    pixel[2] = to_u8(pixel[2] as f32 / 255.0 * inv + b * a);
-    pixel[3] = 255;
+    pub(super) fn blend_at(
+        &mut self,
+        index: usize,
+        source: [f32; 3],
+        mut alpha: f32,
+        mut shape: f32,
+    ) {
+        if let Some(mask) = &self.soft_mask {
+            alpha *= mask.data[index] as f32 / 255.0;
+        }
+        alpha = alpha.clamp(0.0, 1.0);
+        if self.alpha_is_shape {
+            shape = alpha;
+        }
+        let offset = index * 4;
+        if let Some(backdrop) = &self.knockout_backdrop {
+            if shape <= 0.0 {
+                return;
+            }
+            let mut painted: [u8; 4] = backdrop[offset..offset + 4].try_into().unwrap();
+            blending::composite(&mut painted, source, alpha / shape, self.blend_mode);
+            let previous = &mut self.pixels[offset..offset + 4];
+            let a_old = previous[3] as f32 / 255.0;
+            let a_new = painted[3] as f32 / 255.0;
+            let a = (1.0 - shape) * a_old + shape * a_new;
+            for c in 0..3 {
+                previous[c] = if a > 0.0 {
+                    (((1.0 - shape) * a_old * previous[c] as f32
+                        + shape * a_new * painted[c] as f32)
+                        / a
+                        + 0.5) as u8
+                } else {
+                    0
+                };
+            }
+            previous[3] = to_u8(a);
+        } else {
+            blending::composite(
+                &mut self.pixels[offset..offset + 4],
+                source,
+                alpha,
+                self.blend_mode,
+            );
+        }
+        if let Some(group_alpha) = &mut self.group_alpha {
+            let factor = if self.knockout_backdrop.is_some() {
+                shape
+            } else {
+                alpha
+            };
+            group_alpha[index] = alpha + (1.0 - factor) * group_alpha[index];
+        }
+        if let Some(group_shape) = &mut self.group_shape {
+            group_shape[index] = shape + (1.0 - shape) * group_shape[index];
+        }
+    }
 }
 
 fn to_u8(v: f32) -> u8 {
@@ -364,53 +459,147 @@ fn push_edge(edges: &mut Vec<Edge>, start: Point, end: Point) {
     });
 }
 
-/// Convert a path into a fillable outline approximating a stroke of
-/// `width` device units. Each segment becomes a quad; joins and caps get a
-/// polygon disc, which is visually indistinguishable from round joins at the
-/// sizes this renderer targets.
+/// Convert a path into a fillable stroke, with PDF cap/join styles.
 pub fn stroke_outline(path: &Path, width: f64) -> Path {
-    let half = (width / 2.0).max(0.35); // never thinner than a hairline
-    let mut out = Path::new();
+    stroke_outline_styled(path, width, 1, 1, 10.0)
+}
 
+pub fn stroke_outline_with_cap(path: &Path, width: f64, cap: i64) -> Path {
+    stroke_outline_styled(path, width, cap, 1, 10.0)
+}
+
+pub fn stroke_outline_styled(
+    path: &Path,
+    width: f64,
+    cap: i64,
+    join: i64,
+    miter_limit: f64,
+) -> Path {
+    let half = width.abs() / 2.0;
+    let mut out = Path::new();
+    if !half.is_finite() || half <= 0.0 {
+        return out;
+    }
     for subpath in &path.subpaths {
         let mut points = subpath.points.clone();
-        if subpath.closed && points.len() > 1 {
-            points.push(points[0]);
+        points.dedup();
+        if subpath.closed && points.len() > 1 && points.first() == points.last() {
+            points.pop();
         }
         if points.len() == 1 {
-            push_disc(&mut out, points[0], half);
+            if cap == 1 {
+                push_disc(&mut out, points[0], half);
+            }
             continue;
         }
-        for pair in points.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let dx = b.x - a.x;
-            let dy = b.y - a.y;
-            let length = dx.hypot(dy);
-            if length < 1e-9 {
+        let count = points.len();
+        if count < 2 {
+            continue;
+        }
+        let segments = if subpath.closed { count } else { count - 1 };
+        for i in 0..segments {
+            let (mut a, mut b) = (points[i], points[(i + 1) % count]);
+            let length = (b.x - a.x).hypot(b.y - a.y);
+            if length < 1e-12 {
                 continue;
             }
-            let nx = -dy / length * half;
-            let ny = dx / length * half;
-            out.move_to(a.x + nx, a.y + ny);
-            out.line_to(b.x + nx, b.y + ny);
-            out.line_to(b.x - nx, b.y - ny);
-            out.line_to(a.x - nx, a.y - ny);
-            out.close();
+            let (dx, dy) = ((b.x - a.x) / length, (b.y - a.y) / length);
+            let (nx, ny) = (-dy * half, dx * half);
+            if cap == 2 && !subpath.closed {
+                if i == 0 {
+                    a.x -= dx * half;
+                    a.y -= dy * half;
+                }
+                if i + 1 == segments {
+                    b.x += dx * half;
+                    b.y += dy * half;
+                }
+            }
+            polygon(
+                &mut out,
+                &[
+                    Point::new(a.x + nx, a.y + ny),
+                    Point::new(b.x + nx, b.y + ny),
+                    Point::new(b.x - nx, b.y - ny),
+                    Point::new(a.x - nx, a.y - ny),
+                ],
+            );
         }
-        // Joins and caps.
-        if half > 0.6 {
-            for point in &points {
-                push_disc(&mut out, *point, half);
+        if !subpath.closed && cap == 1 {
+            push_disc(&mut out, points[0], half);
+            push_disc(&mut out, points[count - 1], half);
+        }
+        let joins = if subpath.closed {
+            0..count
+        } else {
+            1..count - 1
+        };
+        for i in joins {
+            let (a, b, c) = (
+                points[(i + count - 1) % count],
+                points[i],
+                points[(i + 1) % count],
+            );
+            let l1 = (b.x - a.x).hypot(b.y - a.y);
+            let l2 = (c.x - b.x).hypot(c.y - b.y);
+            if l1 < 1e-12 || l2 < 1e-12 {
+                continue;
+            }
+            let (u, v) = (
+                Point::new((b.x - a.x) / l1, (b.y - a.y) / l1),
+                Point::new((c.x - b.x) / l2, (c.y - b.y) / l2),
+            );
+            let cross = u.x * v.y - u.y * v.x;
+            if join == 1 {
+                push_disc(&mut out, b, half);
+                continue;
+            }
+            if cross.abs() < 1e-12 {
+                continue;
+            }
+            let side = -cross.signum();
+            let p = Point::new(b.x - u.y * half * side, b.y + u.x * half * side);
+            let q = Point::new(b.x - v.y * half * side, b.y + v.x * half * side);
+            let t = ((q.x - p.x) * v.y - (q.y - p.y) * v.x) / cross;
+            let tip = Point::new(p.x + t * u.x, p.y + t * u.y);
+            if join == 0 && (tip.x - b.x).hypot(tip.y - b.y) <= half * miter_limit.max(1.0) {
+                polygon(&mut out, &[b, p, tip, q]);
+            } else {
+                polygon(&mut out, &[b, p, q]);
             }
         }
     }
     out
 }
 
+// All component polygons have the same winding so overlaps form a union.
+fn polygon(path: &mut Path, points: &[Point]) {
+    if points.len() < 3 {
+        return;
+    }
+    let area: f64 = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a.x * b.y - b.x * a.y)
+        .sum();
+    path.move_to(points[0].x, points[0].y);
+    if area > 0.0 {
+        for point in points[1..].iter().rev() {
+            path.line_to(point.x, point.y);
+        }
+    } else {
+        for point in &points[1..] {
+            path.line_to(point.x, point.y);
+        }
+    }
+    path.close();
+}
+
 fn push_disc(path: &mut Path, center: Point, radius: f64) {
-    const SEGMENTS: usize = 8;
-    for i in 0..SEGMENTS {
-        let angle = i as f64 / SEGMENTS as f64 * std::f64::consts::TAU;
+    let segments = ((radius * std::f64::consts::TAU / 0.5).ceil() as usize).clamp(12, 128);
+    for i in 0..segments {
+        let angle = -(i as f64) / segments as f64 * std::f64::consts::TAU;
         let (x, y) = (
             center.x + radius * angle.cos(),
             center.y + radius * angle.sin(),
@@ -482,7 +671,10 @@ mod tests {
         path.rect(5.0, 5.5, 10.0, 9.0);
         canvas.fill_path(&path, Rgb::BLACK, FillRule::NonZero, 1.0, None);
         let (r, _, _) = pixel(&canvas, 10, 5);
-        assert!(r > 0 && r < 255, "half-covered pixel should be grey, got {r}");
+        assert!(
+            r > 0 && r < 255,
+            "half-covered pixel should be grey, got {r}"
+        );
     }
 
     #[test]

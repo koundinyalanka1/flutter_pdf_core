@@ -166,6 +166,9 @@ impl RenderFont {
         if let Some(width) = self.text.explicit_width(code) {
             return width;
         }
+        if self.text.authoritative_default_width {
+            return self.text.default_width;
+        }
         if let Some(fallback) = self.fallback.as_ref() {
             if let Some(ch) = self.text.decode_code(code).chars().next() {
                 if let Some(advance) = fallback.advance(ch) {
@@ -283,7 +286,10 @@ fn load_program(doc: &PdfDocument, descriptor: &Dictionary) -> (Option<Program>,
     if prefer_truetype {
         if let Some(font) = TrueTypeFont::parse(data.clone()) {
             if font.has_outlines() {
-                return (Some(Program::TrueType(Box::new(font))), GlyphSource::TrueType);
+                return (
+                    Some(Program::TrueType(Box::new(font))),
+                    GlyphSource::TrueType,
+                );
             }
         }
     }
@@ -295,7 +301,10 @@ fn load_program(doc: &PdfDocument, descriptor: &Dictionary) -> (Option<Program>,
     if !prefer_truetype {
         if let Some(font) = TrueTypeFont::parse(data) {
             if font.has_outlines() {
-                return (Some(Program::TrueType(Box::new(font))), GlyphSource::TrueType);
+                return (
+                    Some(Program::TrueType(Box::new(font))),
+                    GlyphSource::TrueType,
+                );
             }
         }
     }
@@ -314,7 +323,11 @@ fn descendant_font(doc: &PdfDocument, dict: &Dictionary) -> Option<Dictionary> {
 
 /// Returns `(bytes, is_truetype)` for an embedded font program.
 fn font_program(doc: &PdfDocument, descriptor: &Dictionary) -> Option<(Vec<u8>, bool)> {
-    for (key, is_truetype) in [("FontFile2", true), ("FontFile3", false), ("FontFile", false)] {
+    for (key, is_truetype) in [
+        ("FontFile2", true),
+        ("FontFile3", false),
+        ("FontFile", false),
+    ] {
         let Some(entry) = descriptor.get(key) else {
             continue;
         };
@@ -363,7 +376,10 @@ mod tests {
         dict.insert("BaseFont".into(), PdfObject::Name("Helvetica".into()));
         let font = RenderFont::load(&doc, &dict);
         // Roboto's em is 2048; reporting 1000 here would scale text wrongly.
-        assert_eq!(font.units_per_em(), font.fallback.as_ref().unwrap().units_per_em());
+        assert_eq!(
+            font.units_per_em(),
+            font.fallback.as_ref().unwrap().units_per_em()
+        );
         assert!(font.units_per_em() > 0.0);
     }
 
@@ -384,5 +400,41 @@ mod tests {
         // return the flat 500 default that used to pile glyphs up.
         let b = font.advance_width(66);
         assert!(b > 0.0 && b != 500.0, "expected a real metric, got {b}");
+    }
+
+    #[test]
+    fn cid_default_width_wins_over_substitute_metrics() {
+        let doc = PdfDocument::new_empty("2.0");
+        let cid = Dictionary::from([("DW".into(), PdfObject::Real(325.5))]);
+        let dict = Dictionary::from([
+            ("Subtype".into(), PdfObject::Name("Type0".into())),
+            ("Encoding".into(), PdfObject::Name("Identity-H".into())),
+            (
+                "DescendantFonts".into(),
+                PdfObject::Array(vec![PdfObject::Dictionary(cid)]),
+            ),
+        ]);
+        let mut font = RenderFont::load(&doc, &dict);
+        font.text.to_unicode.insert(1, "A".into());
+        assert!(font.is_substituted());
+        assert_eq!(font.advance_width(1), 325.5);
+    }
+
+    #[test]
+    fn missing_width_wins_over_substitute_metrics() {
+        let doc = PdfDocument::new_empty("1.7");
+        let dict = Dictionary::from([
+            ("Subtype".into(), PdfObject::Name("Type1".into())),
+            ("BaseFont".into(), PdfObject::Name("Helvetica".into())),
+            (
+                "FontDescriptor".into(),
+                PdfObject::Dictionary(Dictionary::from([(
+                    "MissingWidth".into(),
+                    PdfObject::Integer(123),
+                )])),
+            ),
+        ]);
+        let font = RenderFont::load(&doc, &dict);
+        assert_eq!(font.advance_width(65), 123.0);
     }
 }

@@ -192,11 +192,7 @@ impl CffFont {
         if self.fd_local_subrs.is_empty() {
             return &self.local_subrs;
         }
-        let fd = self
-            .fd_select
-            .get(usize::from(gid))
-            .copied()
-            .unwrap_or(0) as usize;
+        let fd = self.fd_select.get(usize::from(gid)).copied().unwrap_or(0) as usize;
         self.fd_local_subrs
             .get(fd)
             .map(|v| v.as_slice())
@@ -227,11 +223,13 @@ fn extract_cff_table(data: &[u8]) -> Option<Vec<u8>> {
         let rec = 12 + i * 16;
         let tag = data.get(rec..rec + 4)?;
         if tag == b"CFF " {
-            let offset = u32::from_be_bytes(*data.get(rec + 8..rec + 12)?.first_chunk::<4>()?)
-                as usize;
-            let length = u32::from_be_bytes(*data.get(rec + 12..rec + 16)?.first_chunk::<4>()?)
-                as usize;
-            return data.get(offset..offset.checked_add(length)?).map(<[u8]>::to_vec);
+            let offset =
+                u32::from_be_bytes(*data.get(rec + 8..rec + 12)?.first_chunk::<4>()?) as usize;
+            let length =
+                u32::from_be_bytes(*data.get(rec + 12..rec + 16)?.first_chunk::<4>()?) as usize;
+            return data
+                .get(offset..offset.checked_add(length)?)
+                .map(<[u8]>::to_vec);
         }
     }
     None
@@ -377,7 +375,9 @@ fn read_fd_select(data: &[u8], offset: usize, num_glyphs: usize) -> Vec<u8> {
             let mut pos = offset + 3;
             let mut ranges = Vec::with_capacity(n_ranges);
             for _ in 0..n_ranges {
-                let Some(first) = data.get(pos..pos + 2) else { break };
+                let Some(first) = data.get(pos..pos + 2) else {
+                    break;
+                };
                 let first = u16::from_be_bytes([first[0], first[1]]) as usize;
                 let fd = data.get(pos + 2).copied().unwrap_or(0);
                 ranges.push((first, fd));
@@ -413,7 +413,9 @@ fn read_charset(data: &[u8], offset: usize, num_glyphs: usize) -> Vec<u16> {
         Some(0) => {
             let mut pos = offset + 1;
             while out.len() < num_glyphs {
-                let Some(b) = data.get(pos..pos + 2) else { break };
+                let Some(b) = data.get(pos..pos + 2) else {
+                    break;
+                };
                 out.push(u16::from_be_bytes([b[0], b[1]]));
                 pos += 2;
             }
@@ -422,10 +424,14 @@ fn read_charset(data: &[u8], offset: usize, num_glyphs: usize) -> Vec<u16> {
             let wide = *format == 2;
             let mut pos = offset + 1;
             while out.len() < num_glyphs {
-                let Some(first) = data.get(pos..pos + 2) else { break };
+                let Some(first) = data.get(pos..pos + 2) else {
+                    break;
+                };
                 let first = u16::from_be_bytes([first[0], first[1]]);
                 let n_left = if wide {
-                    let Some(b) = data.get(pos + 2..pos + 4) else { break };
+                    let Some(b) = data.get(pos + 2..pos + 4) else {
+                        break;
+                    };
                     pos += 4;
                     u16::from_be_bytes([b[0], b[1]]) as usize
                 } else {
@@ -455,7 +461,9 @@ fn sid_name(sid: u16, strings: &[(usize, usize)], data: &[u8]) -> Option<String>
         return Some(STANDARD_STRINGS[sid].to_string());
     }
     let (start, end) = *strings.get(sid - STANDARD_STRINGS.len())?;
-    std::str::from_utf8(data.get(start..end)?).ok().map(str::to_string)
+    std::str::from_utf8(data.get(start..end)?)
+        .ok()
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,9 +704,23 @@ impl CharStringCtx<'_> {
                             0.0
                         };
                         if horizontal {
-                            self.curve_to(args[k], 0.0, args[k + 1], args[k + 2], extra, args[k + 3]);
+                            self.curve_to(
+                                args[k],
+                                0.0,
+                                args[k + 1],
+                                args[k + 2],
+                                extra,
+                                args[k + 3],
+                            );
                         } else {
-                            self.curve_to(0.0, args[k], args[k + 1], args[k + 2], args[k + 3], extra);
+                            self.curve_to(
+                                0.0,
+                                args[k],
+                                args[k + 1],
+                                args[k + 2],
+                                args[k + 3],
+                                extra,
+                            );
                         }
                         horizontal = !horizontal;
                         k += 4;
@@ -712,7 +734,9 @@ impl CharStringCtx<'_> {
                     } else {
                         &self.font.global_subrs
                     };
-                    let Some(index) = self.stack.pop() else { continue };
+                    let Some(index) = self.stack.pop() else {
+                        continue;
+                    };
                     let index = index as i32 + bias(subrs.len());
                     if index >= 0 {
                         if let Some(&sub) = subrs.get(index as usize) {
@@ -831,60 +855,397 @@ pub fn standard_name_for_char(ch: char) -> Option<&'static str> {
 /// The 391 predefined CFF strings. Only the name-addressable range matters
 /// here — glyph names for simple fonts.
 const STANDARD_STRINGS: [&str; 391] = [
-    ".notdef", "space", "exclam", "quotedbl", "numbersign", "dollar", "percent", "ampersand",
-    "quoteright", "parenleft", "parenright", "asterisk", "plus", "comma", "hyphen", "period",
-    "slash", "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-    "colon", "semicolon", "less", "equal", "greater", "question", "at", "A", "B", "C", "D", "E",
-    "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X",
-    "Y", "Z", "bracketleft", "backslash", "bracketright", "asciicircum", "underscore",
-    "quoteleft", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
-    "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "braceleft", "bar", "braceright",
-    "asciitilde", "exclamdown", "cent", "sterling", "fraction", "yen", "florin", "section",
-    "currency", "quotesingle", "quotedblleft", "guillemotleft", "guilsinglleft", "guilsinglright",
-    "fi", "fl", "endash", "dagger", "daggerdbl", "periodcentered", "paragraph", "bullet",
-    "quotesinglbase", "quotedblbase", "quotedblright", "guillemotright", "ellipsis", "perthousand",
-    "questiondown", "grave", "acute", "circumflex", "tilde", "macron", "breve", "dotaccent",
-    "dieresis", "ring", "cedilla", "hungarumlaut", "ogonek", "caron", "emdash", "AE",
-    "ordfeminine", "Lslash", "Oslash", "OE", "ordmasculine", "ae", "dotlessi", "lslash", "oslash",
-    "oe", "germandbls", "onesuperior", "logicalnot", "mu", "trademark", "Eth", "onehalf",
-    "plusminus", "Thorn", "onequarter", "divide", "brokenbar", "degree", "thorn",
-    "threequarters", "twosuperior", "registered", "minus", "eth", "multiply", "threesuperior",
-    "copyright", "Aacute", "Acircumflex", "Adieresis", "Agrave", "Aring", "Atilde", "Ccedilla",
-    "Eacute", "Ecircumflex", "Edieresis", "Egrave", "Iacute", "Icircumflex", "Idieresis",
-    "Igrave", "Ntilde", "Oacute", "Ocircumflex", "Odieresis", "Ograve", "Otilde", "Scaron",
-    "Uacute", "Ucircumflex", "Udieresis", "Ugrave", "Yacute", "Ydieresis", "Zcaron", "aacute",
-    "acircumflex", "adieresis", "agrave", "aring", "atilde", "ccedilla", "eacute", "ecircumflex",
-    "edieresis", "egrave", "iacute", "icircumflex", "idieresis", "igrave", "ntilde", "oacute",
-    "ocircumflex", "odieresis", "ograve", "otilde", "scaron", "uacute", "ucircumflex",
-    "udieresis", "ugrave", "yacute", "ydieresis", "zcaron", "exclamsmall", "Hungarumlautsmall",
-    "dollaroldstyle", "dollarsuperior", "ampersandsmall", "Acutesmall", "parenleftsuperior",
-    "parenrightsuperior", "twodotenleader", "onedotenleader", "zerooldstyle", "oneoldstyle",
-    "twooldstyle", "threeoldstyle", "fouroldstyle", "fiveoldstyle", "sixoldstyle",
-    "sevenoldstyle", "eightoldstyle", "nineoldstyle", "commasuperior",
-    "threequartersemdash", "periodsuperior", "questionsmall", "asuperior", "bsuperior",
-    "centsuperior", "dsuperior", "esuperior", "isuperior", "lsuperior", "msuperior",
-    "nsuperior", "osuperior", "rsuperior", "ssuperior", "tsuperior", "ff", "ffi", "ffl",
-    "parenleftinferior", "parenrightinferior", "Circumflexsmall", "hyphensuperior",
-    "Gravesmall", "Asmall", "Bsmall", "Csmall", "Dsmall", "Esmall", "Fsmall", "Gsmall", "Hsmall",
-    "Ismall", "Jsmall", "Ksmall", "Lsmall", "Msmall", "Nsmall", "Osmall", "Psmall", "Qsmall",
-    "Rsmall", "Ssmall", "Tsmall", "Usmall", "Vsmall", "Wsmall", "Xsmall", "Ysmall", "Zsmall",
-    "colonmonetary", "onefitted", "rupiah", "Tildesmall", "exclamdownsmall", "centoldstyle",
-    "Lslashsmall", "Scaronsmall", "Zcaronsmall", "Dieresissmall", "Brevesmall", "Caronsmall",
-    "Dotaccentsmall", "Macronsmall", "figuredash", "hypheninferior", "Ogoneksmall",
-    "Ringsmall", "Cedillasmall", "questiondownsmall", "oneeighth", "threeeighths",
-    "fiveeighths", "seveneighths", "onethird", "twothirds", "zerosuperior", "foursuperior",
-    "fivesuperior", "sixsuperior", "sevensuperior", "eightsuperior", "ninesuperior",
-    "zeroinferior", "oneinferior", "twoinferior", "threeinferior", "fourinferior",
-    "fiveinferior", "sixinferior", "seveninferior", "eightinferior", "nineinferior",
-    "centinferior", "dollarinferior", "periodinferior", "commainferior", "Agravesmall",
-    "Aacutesmall", "Acircumflexsmall", "Atildesmall", "Adieresissmall", "Aringsmall",
-    "AEsmall", "Ccedillasmall", "Egravesmall", "Eacutesmall", "Ecircumflexsmall",
-    "Edieresissmall", "Igravesmall", "Iacutesmall", "Icircumflexsmall", "Idieresissmall",
-    "Ethsmall", "Ntildesmall", "Ogravesmall", "Oacutesmall", "Ocircumflexsmall",
-    "Otildesmall", "Odieresissmall", "OEsmall", "Oslashsmall", "Ugravesmall", "Uacutesmall",
-    "Ucircumflexsmall", "Udieresissmall", "Yacutesmall", "Thornsmall", "Ydieresissmall",
-    "001.000", "001.001", "001.002", "001.003", "Black", "Bold", "Book", "Light", "Medium",
-    "Regular", "Roman", "Semibold",
+    ".notdef",
+    "space",
+    "exclam",
+    "quotedbl",
+    "numbersign",
+    "dollar",
+    "percent",
+    "ampersand",
+    "quoteright",
+    "parenleft",
+    "parenright",
+    "asterisk",
+    "plus",
+    "comma",
+    "hyphen",
+    "period",
+    "slash",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "colon",
+    "semicolon",
+    "less",
+    "equal",
+    "greater",
+    "question",
+    "at",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "bracketleft",
+    "backslash",
+    "bracketright",
+    "asciicircum",
+    "underscore",
+    "quoteleft",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "braceleft",
+    "bar",
+    "braceright",
+    "asciitilde",
+    "exclamdown",
+    "cent",
+    "sterling",
+    "fraction",
+    "yen",
+    "florin",
+    "section",
+    "currency",
+    "quotesingle",
+    "quotedblleft",
+    "guillemotleft",
+    "guilsinglleft",
+    "guilsinglright",
+    "fi",
+    "fl",
+    "endash",
+    "dagger",
+    "daggerdbl",
+    "periodcentered",
+    "paragraph",
+    "bullet",
+    "quotesinglbase",
+    "quotedblbase",
+    "quotedblright",
+    "guillemotright",
+    "ellipsis",
+    "perthousand",
+    "questiondown",
+    "grave",
+    "acute",
+    "circumflex",
+    "tilde",
+    "macron",
+    "breve",
+    "dotaccent",
+    "dieresis",
+    "ring",
+    "cedilla",
+    "hungarumlaut",
+    "ogonek",
+    "caron",
+    "emdash",
+    "AE",
+    "ordfeminine",
+    "Lslash",
+    "Oslash",
+    "OE",
+    "ordmasculine",
+    "ae",
+    "dotlessi",
+    "lslash",
+    "oslash",
+    "oe",
+    "germandbls",
+    "onesuperior",
+    "logicalnot",
+    "mu",
+    "trademark",
+    "Eth",
+    "onehalf",
+    "plusminus",
+    "Thorn",
+    "onequarter",
+    "divide",
+    "brokenbar",
+    "degree",
+    "thorn",
+    "threequarters",
+    "twosuperior",
+    "registered",
+    "minus",
+    "eth",
+    "multiply",
+    "threesuperior",
+    "copyright",
+    "Aacute",
+    "Acircumflex",
+    "Adieresis",
+    "Agrave",
+    "Aring",
+    "Atilde",
+    "Ccedilla",
+    "Eacute",
+    "Ecircumflex",
+    "Edieresis",
+    "Egrave",
+    "Iacute",
+    "Icircumflex",
+    "Idieresis",
+    "Igrave",
+    "Ntilde",
+    "Oacute",
+    "Ocircumflex",
+    "Odieresis",
+    "Ograve",
+    "Otilde",
+    "Scaron",
+    "Uacute",
+    "Ucircumflex",
+    "Udieresis",
+    "Ugrave",
+    "Yacute",
+    "Ydieresis",
+    "Zcaron",
+    "aacute",
+    "acircumflex",
+    "adieresis",
+    "agrave",
+    "aring",
+    "atilde",
+    "ccedilla",
+    "eacute",
+    "ecircumflex",
+    "edieresis",
+    "egrave",
+    "iacute",
+    "icircumflex",
+    "idieresis",
+    "igrave",
+    "ntilde",
+    "oacute",
+    "ocircumflex",
+    "odieresis",
+    "ograve",
+    "otilde",
+    "scaron",
+    "uacute",
+    "ucircumflex",
+    "udieresis",
+    "ugrave",
+    "yacute",
+    "ydieresis",
+    "zcaron",
+    "exclamsmall",
+    "Hungarumlautsmall",
+    "dollaroldstyle",
+    "dollarsuperior",
+    "ampersandsmall",
+    "Acutesmall",
+    "parenleftsuperior",
+    "parenrightsuperior",
+    "twodotenleader",
+    "onedotenleader",
+    "zerooldstyle",
+    "oneoldstyle",
+    "twooldstyle",
+    "threeoldstyle",
+    "fouroldstyle",
+    "fiveoldstyle",
+    "sixoldstyle",
+    "sevenoldstyle",
+    "eightoldstyle",
+    "nineoldstyle",
+    "commasuperior",
+    "threequartersemdash",
+    "periodsuperior",
+    "questionsmall",
+    "asuperior",
+    "bsuperior",
+    "centsuperior",
+    "dsuperior",
+    "esuperior",
+    "isuperior",
+    "lsuperior",
+    "msuperior",
+    "nsuperior",
+    "osuperior",
+    "rsuperior",
+    "ssuperior",
+    "tsuperior",
+    "ff",
+    "ffi",
+    "ffl",
+    "parenleftinferior",
+    "parenrightinferior",
+    "Circumflexsmall",
+    "hyphensuperior",
+    "Gravesmall",
+    "Asmall",
+    "Bsmall",
+    "Csmall",
+    "Dsmall",
+    "Esmall",
+    "Fsmall",
+    "Gsmall",
+    "Hsmall",
+    "Ismall",
+    "Jsmall",
+    "Ksmall",
+    "Lsmall",
+    "Msmall",
+    "Nsmall",
+    "Osmall",
+    "Psmall",
+    "Qsmall",
+    "Rsmall",
+    "Ssmall",
+    "Tsmall",
+    "Usmall",
+    "Vsmall",
+    "Wsmall",
+    "Xsmall",
+    "Ysmall",
+    "Zsmall",
+    "colonmonetary",
+    "onefitted",
+    "rupiah",
+    "Tildesmall",
+    "exclamdownsmall",
+    "centoldstyle",
+    "Lslashsmall",
+    "Scaronsmall",
+    "Zcaronsmall",
+    "Dieresissmall",
+    "Brevesmall",
+    "Caronsmall",
+    "Dotaccentsmall",
+    "Macronsmall",
+    "figuredash",
+    "hypheninferior",
+    "Ogoneksmall",
+    "Ringsmall",
+    "Cedillasmall",
+    "questiondownsmall",
+    "oneeighth",
+    "threeeighths",
+    "fiveeighths",
+    "seveneighths",
+    "onethird",
+    "twothirds",
+    "zerosuperior",
+    "foursuperior",
+    "fivesuperior",
+    "sixsuperior",
+    "sevensuperior",
+    "eightsuperior",
+    "ninesuperior",
+    "zeroinferior",
+    "oneinferior",
+    "twoinferior",
+    "threeinferior",
+    "fourinferior",
+    "fiveinferior",
+    "sixinferior",
+    "seveninferior",
+    "eightinferior",
+    "nineinferior",
+    "centinferior",
+    "dollarinferior",
+    "periodinferior",
+    "commainferior",
+    "Agravesmall",
+    "Aacutesmall",
+    "Acircumflexsmall",
+    "Atildesmall",
+    "Adieresissmall",
+    "Aringsmall",
+    "AEsmall",
+    "Ccedillasmall",
+    "Egravesmall",
+    "Eacutesmall",
+    "Ecircumflexsmall",
+    "Edieresissmall",
+    "Igravesmall",
+    "Iacutesmall",
+    "Icircumflexsmall",
+    "Idieresissmall",
+    "Ethsmall",
+    "Ntildesmall",
+    "Ogravesmall",
+    "Oacutesmall",
+    "Ocircumflexsmall",
+    "Otildesmall",
+    "Odieresissmall",
+    "OEsmall",
+    "Oslashsmall",
+    "Ugravesmall",
+    "Uacutesmall",
+    "Ucircumflexsmall",
+    "Udieresissmall",
+    "Yacutesmall",
+    "Thornsmall",
+    "Ydieresissmall",
+    "001.000",
+    "001.001",
+    "001.002",
+    "001.003",
+    "Black",
+    "Bold",
+    "Book",
+    "Light",
+    "Medium",
+    "Regular",
+    "Roman",
+    "Semibold",
 ];
 
 #[cfg(test)]
@@ -1010,10 +1371,7 @@ mod tests {
     fn sid_beyond_the_standard_set_reads_the_string_index() {
         let data = b"Custom".to_vec();
         let strings = vec![(0usize, 6usize)];
-        assert_eq!(
-            sid_name(391, &strings, &data).as_deref(),
-            Some("Custom")
-        );
+        assert_eq!(sid_name(391, &strings, &data).as_deref(), Some("Custom"));
     }
 
     #[test]

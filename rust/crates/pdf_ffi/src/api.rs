@@ -887,6 +887,78 @@ mod tests {
     }
 
     #[test]
+    fn selectable_bounds_cover_rendered_text_with_substituted_fonts_and_transforms() {
+        use pdf_core::object::{Dictionary, PdfObject};
+        use pdf_core::stream::PdfStream;
+        use pdf_render::page::{render_page, RenderOptions};
+
+        for rotation in [0, 90, 180, 270] {
+            for transform in ["", "0.9 0.15 0.2 1 0 0 cm"] {
+                let mut doc = PdfDocument::from_bytes(include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+                let font = Dictionary::from([
+                    ("Type".into(), PdfObject::Name("Font".into())),
+                    ("Subtype".into(), PdfObject::Name("Type1".into())),
+                    ("BaseFont".into(), PdfObject::Name("Helvetica-Oblique".into())),
+                ]);
+                let font_id = doc.add_object(PdfObject::Dictionary(font));
+                let content = format!("q {transform} BT /F1 10 Tf 30 70 Td (WiWi thin and wide) Tj ET Q");
+                let stream_id = doc.add_object(PdfObject::Stream(PdfStream::new(Dictionary::new(), content.into_bytes())));
+                let page_id = doc.collect_page_ids().unwrap()[0];
+                let mut page = doc.resolve(page_id).unwrap().as_dict().unwrap().clone();
+                page.insert("Resources".into(), PdfObject::Dictionary(Dictionary::from([
+                    ("Font".into(), PdfObject::Dictionary(Dictionary::from([
+                        ("F1".into(), PdfObject::Reference(font_id)),
+                    ]))),
+                ])));
+                page.insert("Contents".into(), PdfObject::Reference(stream_id));
+                page.insert("Rotate".into(), PdfObject::Integer(rotation));
+                page.insert("CropBox".into(), PdfObject::Array([10, 20, 190, 180].into_iter().map(PdfObject::Integer).collect()));
+                doc.set_object(page_id, PdfObject::Dictionary(page));
+                let layout = pdf_text::layout::extract_page_layout_with_metrics(&doc, 0, &|doc, dict| {
+                    Box::new(RenderTextMetrics(pdf_render::font::RenderFont::load(doc, dict)))
+                }).unwrap();
+                let rendered = render_page(&doc, 0, RenderOptions::default()).unwrap();
+                assert_eq!((layout.width, layout.height), (rendered.width as f64, rendered.height as f64));
+                assert_eq!(layout.text, "WiWi thin and wide");
+                let mut ink_pixels = 0;
+                for (index, pixel) in rendered.pixels.chunks_exact(4).enumerate() {
+                    if pixel[0] < 240 {
+                        ink_pixels += 1;
+                        let x = (index % rendered.width as usize) as f64 + 0.5;
+                        let y = (index / rendered.width as usize) as f64 + 0.5;
+                        assert!(layout.glyphs.iter().any(|glyph| {
+                            let [l, t, r, b] = glyph.bounds;
+                            x >= l - 1.0 && x <= r + 1.0 && y >= t - 1.0 && y <= b + 1.0
+                        }), "uncovered pixel ({x},{y}), rotate {rotation}, transform {transform}");
+                    }
+                }
+                assert!(ink_pixels > 50);
+            }
+        }
+    }
+
+    #[test]
+    fn text_layout_ffi_reports_blank_size_and_rejects_nonpositive_pages() {
+        let path = fixture_path();
+        let empty = c("");
+        unsafe {
+            for page in [-1, 0, 2] {
+                let result = pdf_page_text_layout_json(path.as_ptr(), empty.as_ptr(), page);
+                assert!(result.is_null());
+                assert!(last_error().starts_with("PAGE_OUT_OF_RANGE:"));
+            }
+            let result = pdf_page_text_layout_json(path.as_ptr(), empty.as_ptr(), 1);
+            assert!(!result.is_null());
+            let parsed: serde_json::Value = serde_json::from_str(CStr::from_ptr(result).to_str().unwrap()).unwrap();
+            pdf_free_string(result);
+            assert_eq!(parsed["text"], "");
+            assert_eq!(parsed["glyphs"], serde_json::json!([]));
+            assert_eq!(parsed["width"], 200.);
+            assert_eq!(parsed["height"], 200.);
+        }
+    }
+
+    #[test]
     fn negative_page_indices_are_errors() {
         let path = fixture_path();
         let empty = c("");

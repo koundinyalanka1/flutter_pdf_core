@@ -9,7 +9,7 @@ use crate::object::{Dictionary, IndirectObject, ObjectId, PdfObject};
 use crate::parser::Parser;
 use crate::stream::PdfStream;
 use crate::writer::PdfWriter;
-use crate::xref::{parse_xref, XrefLocation, XrefTable};
+use crate::xref::{parse_xref, XrefEntry, XrefLocation, XrefTable};
 
 #[derive(Debug, Clone)]
 pub struct PdfDocument {
@@ -18,6 +18,8 @@ pub struct PdfDocument {
     pub objects: BTreeMap<ObjectId, IndirectObject>,
     /// True when the source file was encrypted (objects are stored decrypted).
     pub was_encrypted: bool,
+    /// Reported to callers/renderers when a damaged index was reconstructed.
+    pub recovery_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,30 +49,22 @@ impl PdfDocument {
 
     pub fn from_bytes_with_password(data: &[u8], password: &str) -> Result<Self> {
         let version = detect_header(data)?;
-        let xref = parse_xref(data)?;
-        let mut objects = BTreeMap::new();
-
-        // Pass 1: load uncompressed objects.
-        for (&number, entry) in &xref.entries {
-            if number == 0 {
-                continue;
+        let mut recovered = false;
+        // Normal files retain the indexed fast path. Recovery only reconstructs
+        // structural damage; password errors never trigger a plaintext retry.
+        let (mut xref, mut objects) = match parse_xref(data) {
+            Ok(xref) => match load_indexed_objects(data, &xref) {
+                Ok(objects) => (xref, objects),
+                Err(error) => {
+                    recovered = true;
+                    crate::recovery::reconstruct(data, Some(xref)).map_err(|_| error)?
+                }
+            },
+            Err(error) => {
+                recovered = true;
+                crate::recovery::reconstruct(data, None).map_err(|_| error)?
             }
-            let XrefLocation::InFile { offset } = entry.location else {
-                continue;
-            };
-            let mut parser = Parser::with_offset(data, offset);
-            let obj = parser.parse_indirect_object()?;
-            if obj.id.number != number {
-                return Err(PdfError::parse(
-                    offset,
-                    format!(
-                        "xref points to object {}, expected {number}",
-                        obj.id.number
-                    ),
-                ));
-            }
-            objects.insert(obj.id, obj);
-        }
+        };
 
         // Decrypt if needed (object streams are decrypted as whole streams,
         // so this must happen before pass 2).
@@ -87,8 +81,7 @@ impl PdfDocument {
                 _ => return Err(PdfError::structure("invalid /Encrypt entry")),
             };
             let encrypt_ref = encrypt_obj.as_ref();
-            let decryptor =
-                Decryptor::new(&encrypt_dict, &xref.trailer, password.as_bytes())?;
+            let decryptor = Decryptor::new(&encrypt_dict, &xref.trailer, password.as_bytes())?;
             for (id, object) in objects.iter_mut() {
                 if Some(*id) == encrypt_ref {
                     continue; // the encryption dictionary itself is not encrypted
@@ -100,6 +93,9 @@ impl PdfDocument {
         // Pass 2: expand object streams (PDF 1.5+ compressed objects).
         let mut from_streams: Vec<IndirectObject> = Vec::new();
         for (&number, entry) in &xref.entries {
+            if recovered {
+                break;
+            }
             let XrefLocation::InStream { stream_number, .. } = entry.location else {
                 continue;
             };
@@ -118,12 +114,47 @@ impl PdfDocument {
             objects.entry(obj.id).or_insert(obj);
         }
 
-        Ok(Self {
+        if recovered {
+            // Without an intact xref, compressed catalogs and page dictionaries
+            // can still be recovered from complete, authenticated object streams.
+            expand_recovered_object_streams(&mut objects, &mut xref);
+            let valid_root = xref
+                .trailer
+                .get("Root")
+                .and_then(PdfObject::as_ref)
+                .and_then(|id| objects.get(&id))
+                .and_then(|o| o.value.as_dict())
+                .is_some_and(|d| d.get("Type").and_then(PdfObject::as_name) == Some("Catalog"));
+            if !valid_root {
+                if let Some((&id, _)) = objects
+                    .iter()
+                    .filter(|(_, o)| {
+                        o.value.as_dict().is_some_and(|d| {
+                            d.get("Type").and_then(PdfObject::as_name) == Some("Catalog")
+                        })
+                    })
+                    .max_by_key(|(id, _)| recovered_object_position(&xref, **id))
+                {
+                    xref.trailer.insert("Root".into(), PdfObject::Reference(id));
+                }
+            }
+        }
+
+        let document = Self {
             version,
             xref,
             objects,
             was_encrypted,
-        })
+            recovery_warnings: if recovered {
+                vec!["The PDF's damaged index was recovered. Some content may be missing; keep the original file.".into()]
+            } else {
+                Vec::new()
+            },
+        };
+        if recovered && document.page_count().unwrap_or(0) == 0 {
+            return Err(PdfError::structure("damaged PDF has no recoverable pages"));
+        }
+        Ok(document)
     }
 
     pub fn save_as(&self, output_path: impl AsRef<Path>) -> Result<()> {
@@ -200,7 +231,8 @@ impl PdfDocument {
         };
         match node.get("Type").and_then(PdfObject::as_name) {
             Some("Pages") => {
-                if let Some(PdfObject::Array(kids)) = node.get("Kids").map(|k| self.resolve_value(k))
+                if let Some(PdfObject::Array(kids)) =
+                    node.get("Kids").map(|k| self.resolve_value(k))
                 {
                     for kid in kids {
                         if let Some(kid_ref) = kid.as_ref() {
@@ -211,7 +243,8 @@ impl PdfDocument {
             }
             // Treat nodes without /Type but with /Kids as intermediate nodes.
             None if node.contains_key("Kids") => {
-                if let Some(PdfObject::Array(kids)) = node.get("Kids").map(|k| self.resolve_value(k))
+                if let Some(PdfObject::Array(kids)) =
+                    node.get("Kids").map(|k| self.resolve_value(k))
                 {
                     for kid in kids {
                         if let Some(kid_ref) = kid.as_ref() {
@@ -312,8 +345,156 @@ impl PdfDocument {
             },
             objects: BTreeMap::new(),
             was_encrypted: false,
+            recovery_warnings: Vec::new(),
         }
     }
+}
+
+fn load_indexed_objects(
+    data: &[u8],
+    xref: &XrefTable,
+) -> Result<BTreeMap<ObjectId, IndirectObject>> {
+    let mut objects = BTreeMap::new();
+    for (&number, entry) in &xref.entries {
+        if number == 0 {
+            continue;
+        }
+        let XrefLocation::InFile { offset } = entry.location else {
+            continue;
+        };
+        let object = Parser::with_offset(data, offset).parse_indirect_object()?;
+        if object.id != ObjectId::new(number, entry.generation) {
+            return Err(PdfError::parse(
+                offset,
+                format!(
+                    "xref points to {:?}, expected {number} {}",
+                    object.id, entry.generation
+                ),
+            ));
+        }
+        objects.insert(object.id, object);
+    }
+    Ok(objects)
+}
+
+fn expand_recovered_object_streams(
+    objects: &mut BTreeMap<ObjectId, IndirectObject>,
+    xref: &mut XrefTable,
+) {
+    // Physical order, not object number, determines the newest complete
+    // definition when a truncated incremental update has lost its index.
+    let mut positions = BTreeMap::new();
+    let mut containers = Vec::new();
+    for (&id, object) in objects.iter() {
+        let Some(offset) = xref.entries.get(&id.number).and_then(XrefEntry::offset) else {
+            continue;
+        };
+        positions.insert(id.number, (offset, id));
+        if let PdfObject::Stream(stream) = &object.value {
+            if stream.dictionary.get("Type").and_then(PdfObject::as_name) == Some("ObjStm") {
+                containers.push((offset, id));
+            }
+        }
+    }
+    containers.sort_unstable();
+    let original_entries = xref.entries.clone();
+    for (offset, container) in containers {
+        let Some(PdfObject::Stream(stream)) = objects.get(&container).map(|o| &o.value) else {
+            continue;
+        };
+        let Ok(items) = extract_all_from_object_stream(stream) else {
+            continue;
+        };
+        for (index, object) in items.into_iter().enumerate() {
+            if object.id.number == 0 || object.id.number == container.number {
+                continue;
+            }
+            let allowed = offset > xref.startxref || original_entries.get(&object.id.number).is_none_or(|entry| {
+                matches!(entry.location, XrefLocation::InStream { stream_number, .. } if stream_number == container.number)
+            });
+            if !allowed {
+                continue;
+            }
+            if let Some(&(previous, id)) = positions.get(&object.id.number) {
+                if previous >= offset {
+                    continue;
+                }
+                objects.remove(&id);
+            }
+            positions.insert(object.id.number, (offset, object.id));
+            xref.entries.insert(
+                object.id.number,
+                XrefEntry {
+                    generation: 0,
+                    location: XrefLocation::InStream {
+                        stream_number: container.number,
+                        index,
+                    },
+                },
+            );
+            objects.insert(object.id, object);
+        }
+    }
+}
+
+/// Catalog inference must consider the physical order of both plain and
+/// compressed definitions, rather than their otherwise arbitrary object IDs.
+fn recovered_object_position(xref: &XrefTable, id: ObjectId) -> (usize, usize) {
+    match xref.entries.get(&id.number).map(|entry| &entry.location) {
+        Some(XrefLocation::InFile { offset }) => (*offset, 0),
+        Some(XrefLocation::InStream {
+            stream_number,
+            index,
+        }) => (
+            xref.entries
+                .get(stream_number)
+                .and_then(XrefEntry::offset)
+                .unwrap_or(0),
+            *index,
+        ),
+        _ => (0, 0),
+    }
+}
+
+fn extract_all_from_object_stream(stream: &PdfStream) -> Result<Vec<IndirectObject>> {
+    let data = decode_with_dict(&stream.dictionary, &stream.data)?;
+    let n = stream
+        .dictionary
+        .get("N")
+        .and_then(PdfObject::as_i64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| PdfError::structure("bad object stream count"))?;
+    let first = stream
+        .dictionary
+        .get("First")
+        .and_then(PdfObject::as_i64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| PdfError::structure("bad object stream offset"))?;
+    if first > data.len() || n > first / 4 {
+        return Err(PdfError::structure("object stream header exceeds its data"));
+    }
+    let mut header = Parser::new(&data[..first]);
+    let mut result = Vec::with_capacity(n);
+    for _ in 0..n {
+        let number = header
+            .parse_object()?
+            .as_i64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| PdfError::structure("bad compressed object number"))?;
+        let offset = header
+            .parse_object()?
+            .as_i64()
+            .and_then(|v| usize::try_from(v).ok())
+            .and_then(|v| first.checked_add(v))
+            .filter(|v| *v < data.len())
+            .ok_or_else(|| PdfError::structure("bad compressed object offset"))?;
+        let value = Parser::with_offset(&data, offset).parse_object()?;
+        result.push(IndirectObject {
+            id: ObjectId::new(number, 0),
+            value,
+        });
+    }
+    Ok(result)
 }
 
 fn collect_refs(object: &PdfObject, out: &mut Vec<ObjectId>) {
@@ -344,7 +525,11 @@ fn extract_from_object_stream(
     wanted_number: u32,
 ) -> Result<Option<IndirectObject>> {
     let dict = &stream.dictionary;
-    let n = dict.get("N").and_then(PdfObject::as_i64).unwrap_or(0).max(0) as usize;
+    let n = dict
+        .get("N")
+        .and_then(PdfObject::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
     let first = dict
         .get("First")
         .and_then(PdfObject::as_i64)

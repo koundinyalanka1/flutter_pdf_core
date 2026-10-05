@@ -3,6 +3,8 @@
 //! Extraction copies the transitive closure of every kept page (contents,
 //! resources, annotations, …) into a fresh document with compact object
 //! numbering, so split output contains no dead weight from dropped pages.
+//! AcroForm fields are pruned to retained widgets, and bookmarks/local links
+//! are remapped to the copied pages. XFA forms are rejected explicitly.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -10,7 +12,8 @@ use pdf_core::document::PdfDocument;
 use pdf_core::error::{PdfError, Result};
 use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 
-use crate::page_tree::{effective_page_dict, rebuild_page_tree};
+use crate::page_tree::rebuild_page_tree;
+use crate::preserve::import_pages;
 
 /// Copy `roots` (and everything they reference) from `source` into `target`.
 /// Returns the new ids assigned to each root, in order.
@@ -86,28 +89,37 @@ fn rewrite_refs(object: &mut PdfObject, map: &BTreeMap<ObjectId, ObjectId>) {
 
 /// Copy the given pages of `source` (0-based indices) into a brand-new
 /// document, in the order given. Indices may repeat (page duplication).
+/// Duplicate pages receive independent editable fields and widget objects.
 pub fn extract_pages(source: &PdfDocument, indices: &[usize]) -> Result<PdfDocument> {
     let page_ids = source
         .collect_page_ids()
         .ok_or_else(|| PdfError::Structure("document has no page tree".into()))?;
-    let mut roots = Vec::with_capacity(indices.len());
+    let mut selected = Vec::new();
     for &index in indices {
-        let &page_id = page_ids.get(index).ok_or(PdfError::PageIndex(index))?;
-        let mut dict = effective_page_dict(source, page_id)?;
-        dict.remove("Parent"); // re-parented after the copy
-        roots.push((page_id, PdfObject::Dictionary(dict)));
+        let &id = page_ids.get(index).ok_or(PdfError::PageIndex(index))?;
+        if !selected.contains(&id) {
+            selected.push(id);
+        }
     }
-
     let mut target = PdfDocument::new_empty(&source.version);
-    // Each requested index gets its own copy pass so a repeated index
-    // yields a distinct page object (viewer-friendly duplication).
+    install_catalog(&mut target, &[])?;
+    let imported = import_pages(&mut target, source, &selected, 0)?;
+    let mut first_copies: BTreeMap<_, _> = selected.iter().copied().zip(imported).collect();
     let mut new_page_ids = Vec::with_capacity(indices.len());
-    for root in roots {
-        let ids = copy_objects_into(&mut target, source, &[root])?;
-        new_page_ids.extend(ids);
+    for (occurrence, &index) in indices.iter().enumerate() {
+        let old_id = page_ids[index];
+        if let Some(id) = first_copies.remove(&old_id) {
+            new_page_ids.push(id);
+        } else {
+            new_page_ids.extend(import_pages(
+                &mut target,
+                source,
+                &[old_id],
+                occurrence + 1,
+            )?);
+        }
     }
-
-    install_catalog(&mut target, &new_page_ids)?;
+    rebuild_page_tree(&mut target, &new_page_ids)?;
 
     // Carry document metadata along.
     if let Some(info_id) = source.info_ref() {
@@ -118,6 +130,7 @@ pub fn extract_pages(source: &PdfDocument, indices: &[usize]) -> Result<PdfDocum
             }
         }
     }
+    target.garbage_collect();
     Ok(target)
 }
 

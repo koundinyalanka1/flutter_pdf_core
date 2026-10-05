@@ -172,6 +172,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hayro-ccitt"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2866f0d976e76497480b853d5e258dab6e4b89ecfe991124e08f15dfa8fd03ad"
+
+[[package]]
+name = "hayro-jbig2"
+version = "0.3.1"
+dependencies = [
+ "hayro-ccitt",
+]
+
+[[package]]
+name = "hayro-jpeg2000"
+version = "0.4.1"
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,6 +319,8 @@ name = "pdf_render"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "hayro-jbig2",
+ "hayro-jpeg2000",
  "jpeg-decoder",
  "pdf_core",
  "pdf_ops",

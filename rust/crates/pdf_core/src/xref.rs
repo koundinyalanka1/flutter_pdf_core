@@ -50,9 +50,9 @@ pub struct XrefTable {
 
 impl XrefTable {
     pub fn get(&self, id: ObjectId) -> Option<&XrefEntry> {
-        self.entries
-            .get(&id.number)
-            .filter(|e| e.generation == id.generation || matches!(e.location, XrefLocation::InStream { .. }))
+        self.entries.get(&id.number).filter(|e| {
+            e.generation == id.generation || matches!(e.location, XrefLocation::InStream { .. })
+        })
     }
 }
 
@@ -60,6 +60,10 @@ const MAX_CHAIN: usize = 64;
 
 pub fn parse_xref(data: &[u8]) -> Result<XrefTable> {
     let startxref = find_startxref(data)?;
+    parse_xref_at(data, startxref)
+}
+
+pub(crate) fn parse_xref_at(data: &[u8], startxref: usize) -> Result<XrefTable> {
     let mut entries: BTreeMap<u32, XrefEntry> = BTreeMap::new();
     let mut trailer = Dictionary::new();
     let mut visited: BTreeSet<usize> = BTreeSet::new();
@@ -450,7 +454,10 @@ mod tests {
 
         let xref = parse_xref(&pdf).unwrap();
         assert_eq!(xref.entries[&0].location, XrefLocation::Free);
-        assert_eq!(xref.entries[&1].location, XrefLocation::InFile { offset: 9 });
+        assert_eq!(
+            xref.entries[&1].location,
+            XrefLocation::InFile { offset: 9 }
+        );
         assert_eq!(
             xref.entries[&2].location,
             XrefLocation::InStream {

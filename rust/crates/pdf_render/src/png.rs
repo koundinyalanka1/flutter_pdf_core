@@ -98,7 +98,10 @@ mod tests {
     fn writes_a_well_formed_png_header() {
         let rgba = vec![255u8; 4 * 4 * 4];
         let png = encode_rgba_as_png(&rgba, 4, 4).unwrap();
-        assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(u32::from_be_bytes([png[16], png[17], png[18], png[19]]), 4);
         assert_eq!(u32::from_be_bytes([png[20], png[21], png[22], png[23]]), 4);
