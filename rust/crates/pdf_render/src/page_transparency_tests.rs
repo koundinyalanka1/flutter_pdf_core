@@ -244,3 +244,45 @@ fn recursive_soft_mask_is_bounded_and_reported() {
         .iter()
         .any(|w| w.contains("recursive content")));
 }
+
+#[test]
+fn device_gray_group_converts_rgb_sources_before_blending_and_returns_to_rgb() {
+    let mut doc = doc_with_content("/G Do 1 0 0 rg 40 0 20 40 re f", [0, 0, 60, 40]);
+    let group = form(
+        &mut doc,
+        "<< /Subtype /Form /BBox [0 0 40 40] /Group << /S /Transparency /CS /DeviceGray >> /Resources << /ExtGState << /M << /BM /Multiply >> >> >> >>",
+        "1 0 0 rg 0 0 40 40 re f /M gs 0 1 0 rg 20 0 20 40 re f",
+    );
+    resources(&mut doc, &format!("<< /XObject << /G {group} 0 R >> >>"));
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    close(pixel(&page, 10, 20), (77, 77, 77));
+    close(pixel(&page, 30, 20), (45, 45, 45));
+    assert_eq!(pixel(&page, 50, 20), (255, 0, 0));
+}
+
+#[test]
+fn nested_group_inherits_gray_unless_it_explicitly_selects_rgb() {
+    let mut doc = doc_with_content("/G Do", [0, 0, 40, 40]);
+    let content = "1 0 0 rg 0 0 20 40 re f /M gs 0 1 0 rg 0 0 20 40 re f";
+    let inherited = form(
+        &mut doc,
+        "<< /Subtype /Form /BBox [0 0 20 40] /Group << /S /Transparency /I true >> /Resources << /ExtGState << /M << /BM /Multiply >> >> >> >>",
+        content,
+    );
+    let rgb = form(
+        &mut doc,
+        "<< /Subtype /Form /BBox [0 0 20 40] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /M << /BM /Multiply >> >> >> >>",
+        content,
+    );
+    let outer = form(
+        &mut doc,
+        &format!("<< /Subtype /Form /BBox [0 0 40 40] /Group << /S /Transparency /CS /DeviceGray >> /Resources << /XObject << /Inherited {inherited} 0 R /RGB {rgb} 0 R >> >> >>"),
+        "/Inherited Do 1 0 0 1 20 0 cm /RGB Do",
+    );
+    resources(&mut doc, &format!("<< /XObject << /G {outer} 0 R >> >>"));
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    close(pixel(&page, 10, 20), (45, 45, 45));
+    assert_eq!(pixel(&page, 30, 20), (0, 0, 0));
+}

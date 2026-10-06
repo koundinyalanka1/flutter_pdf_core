@@ -125,11 +125,17 @@ impl Renderer<'_> {
     }
 
     pub(super) fn clip_path(&mut self, path: &Path, rule: FillRule, state: &mut GraphicsState) {
+        let Some(bytes) = self.reserve_layer(if state.clip.is_some() { 2 } else { 1 }) else {
+            self.stop_for_clip_limit();
+            return;
+        };
         let mask = self.canvas.rasterize_mask(path, rule);
-        state.clip = Some(Rc::new(match state.clip.as_deref() {
+        let mask = match state.clip.as_deref() {
             Some(existing) => existing.intersect(&mask),
             None => mask,
-        }));
+        };
+        state.clip = Some(self.register_mask(mask));
+        self.temporary_bytes -= bytes;
     }
 
     fn draw_tiles(&mut self, stream: &PdfStream, resources: &Dictionary, state: &GraphicsState) {

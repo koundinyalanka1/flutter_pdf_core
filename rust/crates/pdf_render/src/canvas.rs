@@ -48,6 +48,26 @@ impl Rgb {
     }
 }
 
+/// Supported transparency blending spaces. Gray samples use equal RGB channels
+/// in the output buffer, so a completed gray group can be painted into RGB.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlendColorSpace {
+    #[default]
+    DeviceRgb,
+    DeviceGray,
+}
+
+impl BlendColorSpace {
+    fn convert(self, color: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::DeviceRgb => color,
+            // ISO 32000-1, 10.3.2: convert before applying the blend function,
+            // rather than desaturating an already-composited RGB group.
+            Self::DeviceGray => [luminosity(color); 3],
+        }
+    }
+}
+
 /// An 8-bit coverage mask the size of the canvas. Used for clipping.
 #[derive(Debug, Clone)]
 pub struct Mask {
@@ -91,6 +111,8 @@ pub struct Canvas {
     coverage: Vec<f32>,
     crossings: Vec<(f64, i32)>,
     pub blend_mode: BlendMode,
+    pub blend_color_space: BlendColorSpace,
+    pub paint_suppressed: bool,
     pub soft_mask: ClipMask,
     pub alpha_is_shape: bool,
     pub group_alpha: Option<Vec<f32>>,
@@ -107,6 +129,8 @@ impl Canvas {
             coverage: vec![0.0; width + 2],
             crossings: Vec::with_capacity(64),
             blend_mode: BlendMode::Normal,
+            blend_color_space: BlendColorSpace::DeviceRgb,
+            paint_suppressed: false,
             soft_mask: None,
             alpha_is_shape: false,
             group_alpha: None,
@@ -122,9 +146,32 @@ impl Canvas {
     }
 
     pub fn group(backdrop: &Canvas, isolated: bool, knockout: bool) -> Self {
+        Self::group_in_color_space(backdrop, isolated, knockout, backdrop.blend_color_space)
+    }
+
+    pub fn group_in_color_space(
+        backdrop: &Canvas,
+        isolated: bool,
+        knockout: bool,
+        blend_color_space: BlendColorSpace,
+    ) -> Self {
         let mut canvas = Self::transparent(backdrop.width, backdrop.height);
+        canvas.blend_color_space = blend_color_space;
+        canvas.paint_suppressed = backdrop.paint_suppressed;
         if !isolated {
             canvas.pixels.copy_from_slice(backdrop.group_backdrop());
+            if blend_color_space != backdrop.blend_color_space {
+                for pixel in canvas.pixels.chunks_exact_mut(4) {
+                    let color = blend_color_space.convert([
+                        pixel[0] as f32 / 255.0,
+                        pixel[1] as f32 / 255.0,
+                        pixel[2] as f32 / 255.0,
+                    ]);
+                    for (sample, value) in pixel[..3].iter_mut().zip(color) {
+                        *sample = to_u8(value);
+                    }
+                }
+            }
         }
         if knockout {
             canvas.knockout_backdrop = Some(canvas.pixels.clone());
@@ -141,9 +188,10 @@ impl Canvas {
     }
 
     pub fn fill_background(&mut self, color: Rgb) {
-        let r = to_u8(color.r);
-        let g = to_u8(color.g);
-        let b = to_u8(color.b);
+        let [r, g, b] = self
+            .blend_color_space
+            .convert([color.r, color.g, color.b])
+            .map(to_u8);
         for pixel in self.pixels.chunks_exact_mut(4) {
             pixel[0] = r;
             pixel[1] = g;
@@ -161,7 +209,7 @@ impl Canvas {
         alpha: f32,
         clip: Option<&Mask>,
     ) {
-        if alpha <= 0.001 && self.knockout_backdrop.is_none() {
+        if self.paint_suppressed || (alpha <= 0.001 && self.knockout_backdrop.is_none()) {
             return;
         }
         self.scan(path, rule, |canvas, y, row| {
@@ -326,6 +374,10 @@ impl Canvas {
         mut alpha: f32,
         mut shape: f32,
     ) {
+        if self.paint_suppressed {
+            return;
+        }
+        let source = self.blend_color_space.convert(source);
         if let Some(mask) = &self.soft_mask {
             alpha *= mask.data[index] as f32 / 255.0;
         }
@@ -731,5 +783,48 @@ mod tests {
     fn cmyk_black_converts_to_black() {
         let rgb = Rgb::from_cmyk(0.0, 0.0, 0.0, 1.0);
         assert_eq!((rgb.r, rgb.g, rgb.b), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn gray_group_converts_each_source_before_multiplying() {
+        let parent = Canvas::new(1, 1);
+        let mut gray =
+            Canvas::group_in_color_space(&parent, true, false, BlendColorSpace::DeviceGray);
+        gray.blend(0, 0, Rgb::new(1.0, 0.0, 0.0), 1.0, None);
+        gray.blend_mode = BlendMode::Multiply;
+        gray.blend(0, 0, Rgb::new(0.0, 1.0, 0.0), 1.0, None);
+        // Gray(red) * Gray(green) = .30 * .59. Multiplying in RGB first
+        // would incorrectly produce black, even if converted afterward.
+        assert_eq!(pixel(&gray, 0, 0), (45, 45, 45));
+        assert_eq!(gray.pixels[3], 255);
+    }
+
+    #[test]
+    fn gray_knockout_group_uses_a_gray_initial_backdrop() {
+        let mut parent = Canvas::new(1, 1);
+        parent.fill_background(Rgb::new(0.0, 0.0, 1.0));
+        let mut gray =
+            Canvas::group_in_color_space(&parent, false, true, BlendColorSpace::DeviceGray);
+        gray.blend(0, 0, Rgb::new(1.0, 0.0, 0.0), 1.0, None);
+        gray.blend(0, 0, Rgb::new(0.0, 1.0, 0.0), 0.5, None);
+        // Knock out red, then paint half-opaque green over the initial blue.
+        assert_eq!(pixel(&gray, 0, 0), (89, 89, 89));
+        assert_eq!(gray.group_backdrop(), &[28, 28, 28, 255]);
+    }
+
+    #[test]
+    fn suppressed_canvas_does_not_paint_but_can_rasterize_a_clip() {
+        let mut canvas = Canvas::new(2, 2);
+        canvas.paint_suppressed = true;
+        let mut path = Path::new();
+        path.rect(0.0, 0.0, 2.0, 2.0);
+        canvas.fill_path(&path, Rgb::BLACK, FillRule::NonZero, 1.0, None);
+        canvas.blend(0, 0, Rgb::BLACK, 1.0, None);
+        canvas.blend_at(1, [0.0; 3], 1.0, 1.0);
+        assert!(canvas.pixels.iter().all(|&value| value == 255));
+        assert_eq!(
+            canvas.rasterize_mask(&path, FillRule::NonZero).data,
+            vec![255; 4]
+        );
     }
 }

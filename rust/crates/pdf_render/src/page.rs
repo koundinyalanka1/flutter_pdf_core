@@ -25,12 +25,16 @@
 mod annotations;
 #[path = "page_forms.rs"]
 mod forms;
+#[path = "page_limits.rs"]
+mod limits;
 #[path = "page_optional_content.rs"]
 mod optional_content;
 #[path = "page_paints.rs"]
 mod paints;
 #[path = "page_strokes.rs"]
 mod strokes;
+#[path = "page_text.rs"]
+mod text;
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -162,7 +166,9 @@ pub fn render_page(
         depth: 0,
         pattern_pixels: 0.0,
         temporary_bytes: 0,
-        generated_mask_bytes: 0,
+        mask_allocations: Vec::new(),
+        temporary_limit: limits::MAX_TEMPORARY_BYTES,
+        render_stopped: false,
         warnings: doc.recovery_warnings.clone(),
         visible: true,
     };
@@ -303,6 +309,7 @@ struct GraphicsState {
     leading: f64,
     rise: f64,
     render_mode: i64,
+    text_knockout: bool,
     text_matrix: Matrix,
     line_matrix: Matrix,
 }
@@ -340,6 +347,7 @@ impl GraphicsState {
             leading: 0.0,
             rise: 0.0,
             render_mode: 0,
+            text_knockout: true,
             text_matrix: Matrix::IDENTITY,
             line_matrix: Matrix::IDENTITY,
         }
@@ -353,13 +361,16 @@ struct Renderer<'a> {
     depth: usize,
     pattern_pixels: f64,
     temporary_bytes: usize,
-    generated_mask_bytes: usize,
+    mask_allocations: Vec<std::rc::Weak<crate::canvas::Mask>>,
+    temporary_limit: usize,
+    render_stopped: bool,
     warnings: Vec<String>,
     visible: bool,
 }
 
 impl Renderer<'_> {
     fn configure_canvas(&mut self, state: &GraphicsState) {
+        self.canvas.paint_suppressed = self.render_stopped;
         self.canvas.blend_mode = state.blend_mode;
         self.canvas.soft_mask = state.soft_mask.clone();
         self.canvas.alpha_is_shape = state.alpha_is_shape;
@@ -390,10 +401,14 @@ impl Renderer<'_> {
         let mut path = Path::with_tolerance(0.25);
         let mut pending_clip: Option<FillRule> = None;
         let mut text_clip: Option<Path> = None;
+        let mut text_group = None;
         let inherited_visibility = self.visible;
         let mut marked_visibility = Vec::new();
 
-        for op in &operations {
+        for (operation_index, op) in operations.iter().enumerate() {
+            if self.render_stopped {
+                break;
+            }
             if skipped_saves != 0 {
                 match op.operator.as_str() {
                     "q" => skipped_saves += 1,
@@ -532,11 +547,30 @@ impl Renderer<'_> {
 
                 // -- text ------------------------------------------------------
                 "BT" => {
+                    if let Some(group) = text_group.take() {
+                        self.finish_text_group(group, state);
+                        self.warn("nested text object closed implicitly");
+                    }
                     text_clip = None;
                     state.text_matrix = Matrix::IDENTITY;
                     state.line_matrix = Matrix::IDENTITY;
+                    // Opaque Normal text needs no offscreen buffer. A gs in
+                    // the object may change transparency after its first
+                    // glyph, so retain the original backdrop in that case.
+                    let changes_graphics_state = operations[operation_index + 1..]
+                        .iter()
+                        .take_while(|operation| !matches!(operation.operator.as_str(), "BT" | "ET"))
+                        .any(|operation| operation.operator == "gs");
+                    if state.text_knockout
+                        && (self.text_needs_group(state) || changes_graphics_state)
+                    {
+                        text_group = self.begin_text_group(state);
+                    }
                 }
                 "ET" => {
+                    if let Some(group) = text_group.take() {
+                        self.finish_text_group(group, state);
+                    }
                     if let Some(path) = text_clip.take() {
                         self.clip_path(&path, FillRule::NonZero, state);
                     }
@@ -573,13 +607,25 @@ impl Renderer<'_> {
                 }
                 "Tj" => {
                     if let Some(bytes) = string_operand(op, 0) {
-                        self.show_text(&bytes, resources, state, &mut text_clip);
+                        self.show_text(
+                            &bytes,
+                            resources,
+                            state,
+                            &mut text_clip,
+                            text_group.is_some(),
+                        );
                     }
                 }
                 "'" => {
                     next_line(state);
                     if let Some(bytes) = string_operand(op, 0) {
-                        self.show_text(&bytes, resources, state, &mut text_clip);
+                        self.show_text(
+                            &bytes,
+                            resources,
+                            state,
+                            &mut text_clip,
+                            text_group.is_some(),
+                        );
                     }
                 }
                 "\"" => {
@@ -587,7 +633,13 @@ impl Renderer<'_> {
                     state.char_spacing = n(1);
                     next_line(state);
                     if let Some(bytes) = string_operand(op, 2) {
-                        self.show_text(&bytes, resources, state, &mut text_clip);
+                        self.show_text(
+                            &bytes,
+                            resources,
+                            state,
+                            &mut text_clip,
+                            text_group.is_some(),
+                        );
                     }
                 }
                 "TJ" => {
@@ -595,7 +647,13 @@ impl Renderer<'_> {
                         for item in items {
                             match item {
                                 PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => {
-                                    self.show_text(bytes, resources, state, &mut text_clip)
+                                    self.show_text(
+                                        bytes,
+                                        resources,
+                                        state,
+                                        &mut text_clip,
+                                        text_group.is_some(),
+                                    )
                                 }
                                 other => {
                                     if let Some(adjust) = as_number(other) {
@@ -671,6 +729,9 @@ impl Renderer<'_> {
                 )),
             }
         }
+        if let Some(group) = text_group.take() {
+            self.finish_text_group(group, state);
+        }
         self.visible = inherited_visibility;
         Ok(())
     }
@@ -706,11 +767,7 @@ impl Renderer<'_> {
         // `W` names the clip, but it only takes effect after the painting
         // operator that follows it — which is this one.
         if let Some(clip_rule) = pending_clip.take() {
-            let mask = self.canvas.rasterize_mask(&device, clip_rule);
-            state.clip = Some(Rc::new(match state.clip.as_deref() {
-                Some(existing) => existing.intersect(&mask),
-                None => mask,
-            }));
+            self.clip_path(&device, clip_rule, state);
         }
     }
 
@@ -774,6 +831,9 @@ impl Renderer<'_> {
         if let Some(PdfObject::Bool(value)) = dict.get("AIS").map(|v| self.doc.resolve_value(v)) {
             state.alpha_is_shape = value;
         }
+        if let Some(PdfObject::Bool(value)) = dict.get("TK").map(|v| self.doc.resolve_value(v)) {
+            state.text_knockout = value;
+        }
         if let Some(value) = numeric("ML") {
             state.miter_limit = value.max(1.0);
         }
@@ -836,6 +896,7 @@ impl Renderer<'_> {
         resources: &Dictionary,
         state: &mut GraphicsState,
         text_clip: &mut Option<Path>,
+        knockout_group_active: bool,
     ) {
         let Some(font) = state.font.clone() else {
             if state.render_mode != 3 {
@@ -868,12 +929,7 @@ impl Renderer<'_> {
                     let offset = Matrix::translate(0.0, state.rise);
                     let user = outline.transform(&scale.then(&offset).then(&state.text_matrix));
                     let device = user.transform(&state.ctm);
-                    if matches!(state.render_mode, 0 | 2 | 4 | 6) {
-                        self.paint_color(&device, FillRule::NonZero, true, resources, state);
-                    }
-                    if matches!(state.render_mode, 1 | 2 | 5 | 6) {
-                        self.paint_stroke(&user, resources, state);
-                    }
+                    self.paint_glyph(&user, &device, resources, state, knockout_group_active);
                     if matches!(state.render_mode, 4..=7) {
                         text_clip
                             .get_or_insert_with(Path::new)

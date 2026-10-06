@@ -200,13 +200,16 @@ impl Renderer<'_> {
             self.warn("mesh shading skipped: undecodable stream");
             return;
         };
-        let memory = self.canvas.width * self.canvas.height * 4;
-        if data.len() > 32_000_000 || self.temporary_bytes.saturating_add(memory) > 256_000_000 {
+        if data.len() > 32_000_000 {
             self.warn("mesh shading skipped: allocation limit exceeded");
             return;
         }
+        let Some(memory) = self.reserve_layer(4) else {
+            return;
+        };
         let mut pixels = Vec::new();
         if pixels.try_reserve_exact(memory).is_err() {
+            self.temporary_bytes -= memory;
             self.warn("mesh shading skipped: scratch allocation failed");
             return;
         }
@@ -243,6 +246,7 @@ impl Renderer<'_> {
             _ => None,
         };
         if success.is_none() {
+            self.temporary_bytes -= memory;
             self.warn("mesh shading skipped: malformed data or tessellation budget exceeded");
             return;
         }
@@ -265,6 +269,7 @@ impl Renderer<'_> {
                 }
             }
         }
+        self.temporary_bytes -= memory;
     }
 }
 fn triangles(reader: &mut MeshReader<'_>, raster: &mut Raster<'_>) -> Option<()> {

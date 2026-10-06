@@ -1,32 +1,10 @@
 //! Form XObjects, transparency groups and graphics-state soft masks.
 use super::paints::matrix;
 use super::*;
-use crate::canvas::{luminosity, Mask};
+use crate::canvas::{luminosity, BlendColorSpace, Mask};
 use pdf_core::stream::PdfStream;
 
-// Bound simultaneously live offscreen buffers independently of the output limit.
-const MAX_TEMPORARY_BYTES: usize = 128 * 1024 * 1024;
-
 impl Renderer<'_> {
-    fn reserve_layer(&mut self, bytes_per_pixel: usize) -> Option<usize> {
-        let bytes = self
-            .canvas
-            .width
-            .checked_mul(self.canvas.height)?
-            .checked_mul(bytes_per_pixel)?;
-        if bytes
-            > MAX_TEMPORARY_BYTES.saturating_sub(
-                self.temporary_bytes
-                    .saturating_add(self.generated_mask_bytes),
-            )
-        {
-            self.warn("transparency detail exceeds renderer memory limit");
-            return None;
-        }
-        self.temporary_bytes += bytes;
-        Some(bytes)
-    }
-
     pub(super) fn draw_form(
         &mut self,
         stream: &PdfStream,
@@ -44,6 +22,9 @@ impl Renderer<'_> {
             let mut p = Path::new();
             p.rect(bbox.0, bbox.1, bbox.2 - bbox.0, bbox.3 - bbox.1);
             self.clip_path(&p.transform(&inner.ctm), FillRule::NonZero, &mut inner);
+        }
+        if self.render_stopped {
+            return;
         }
         let group = stream
             .dictionary
@@ -71,7 +52,13 @@ impl Renderer<'_> {
         if let Some(group) = group {
             let isolated = boolean(self.doc, &group, "I") || group.contains_key("CS");
             let knockout = boolean(self.doc, &group, "K");
+            let mut blend_space = self.canvas.blend_color_space;
             if let Some(space) = group.get("CS").map(|o| self.doc.resolve_value(o)) {
+                blend_space = if space.as_name() == Some("DeviceGray") {
+                    BlendColorSpace::DeviceGray
+                } else {
+                    BlendColorSpace::DeviceRgb
+                };
                 if !matches!(space.as_name(), Some("DeviceRGB" | "DeviceGray")) {
                     self.warn(
                         "transparency group colour space converted to RGB; colour may differ",
@@ -81,7 +68,8 @@ impl Renderer<'_> {
             let Some(bytes) = self.reserve_layer(if knockout { 16 } else { 12 }) else {
                 return;
             };
-            let offscreen = Canvas::group(self.canvas, isolated, knockout);
+            let offscreen =
+                Canvas::group_in_color_space(self.canvas, isolated, knockout, blend_space);
             let parent = std::mem::replace(self.canvas, offscreen);
             layer = Some((parent, isolated, bytes));
             inner.blend_mode = BlendMode::Normal;
@@ -202,6 +190,10 @@ impl Renderer<'_> {
         self.draw_form(&form, resources, &inner);
         let rendered = std::mem::replace(self.canvas, parent);
         self.configure_canvas(state);
+        if self.render_stopped {
+            self.temporary_bytes -= bytes;
+            return None;
+        }
         let data = rendered
             .pixels
             .chunks_exact(4)
@@ -226,11 +218,7 @@ impl Renderer<'_> {
             })
             .collect();
         self.temporary_bytes -= bytes;
-        // Saved graphics states can retain earlier masks through q/Q. Count
-        // generated masks cumulatively to bound them without strong references
-        // or a platform allocator; exhausting this conservative budget warns.
-        self.generated_mask_bytes += rendered.width * rendered.height;
-        Some(Rc::new(Mask {
+        Some(self.register_mask(Mask {
             width: rendered.width,
             height: rendered.height,
             data,

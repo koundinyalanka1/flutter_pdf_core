@@ -291,6 +291,9 @@ impl Renderer<'_> {
             return;
         };
         for item in items {
+            if self.render_stopped {
+                break;
+            }
             let Some(mut annotation) = self.doc.resolve_dict(&item).cloned() else {
                 self.warn("annotation skipped: missing or malformed dictionary");
                 continue;
@@ -409,6 +412,10 @@ impl Renderer<'_> {
                         if subtype == "Highlight" {
                             // Highlights multiply the backdrop so black text
                             // remains readable even without an explicit /AP.
+                            let Some(bytes) = self.reserve_layer(1) else {
+                                self.stop_for_clip_limit();
+                                break;
+                            };
                             let mask = self.canvas.rasterize_mask(&path.transform(&ctm), FillRule::NonZero);
                             for (i, coverage) in mask.data.iter().enumerate() {
                                 let a = alpha * *coverage as f32 / 255.0;
@@ -418,6 +425,7 @@ impl Renderer<'_> {
                                     *pixel = (*pixel as f32 * (1.0 - a + a * value.clamp(0.0,1.0))).round() as u8;
                                 }
                             }
+                            self.temporary_bytes -= bytes;
                         } else {
                             let mut line = Path::new();
                             // QuadPoints' first edge follows the text direction,
