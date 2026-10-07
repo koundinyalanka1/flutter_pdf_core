@@ -47,6 +47,16 @@ await PdfCore.imagesToPdfAsync(
 
 Heavy calls have `...Async` variants that run on a background isolate. Errors throw `PdfException` with stable codes (`ENCRYPTED`, `WRONG_PASSWORD`, …). Page selections are 1-based range strings like `'1-3,5'`.
 
+Every call reads and parses its file afresh. A screen that keeps reading one
+document (a viewer rendering pages, measuring them and loading text at once)
+should pin it, so read-only calls share one parse while the file is unchanged:
+
+```dart
+final pages = await PdfCore.openDocument('/big-scan.pdf', password: pw);
+// ... renders, page sizes, text and text layout reuse that parse ...
+await PdfCore.closeDocument('/big-scan.pdf', password: pw);
+```
+
 ## Fidelity and recovery
 
 Rendering supports shading types 1–7, sampled/calculator colour functions,
@@ -75,10 +85,16 @@ signature's appearance does not verify its validity.
 If an index is damaged, the reader tries to recover complete objects and
 surviving trailer information. Password checks still apply. Render warnings
 identify recovered files, which may be incomplete; keep the original.
-Recovery cannot recreate missing content from a truncated download.
+Recovery cannot recreate missing content from a truncated download. Common
+writer quirks are not damage: index entries in use at offset 0, `endobj`
+omitted before the next object or the index, and overflowing object numbers
+(references to them read as null) are read as intact files.
 
 Encryption currently grants all document permissions. The optional owner
 password also unlocks the file; it does not enable printing/copying restrictions.
+Pass passwords as typed: they are encoded as each revision requires
+(PDFDocEncoding for RC4/AES-128, UTF-8 after SASLprep for AES-256), with the
+raw UTF-8 bytes as a fallback.
 
 ## Building the native core
 

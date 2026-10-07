@@ -1,5 +1,19 @@
 ## Unreleased
 
+* Pin parsed documents: `pdf_document_open`/`pdf_document_close`
+  (`PdfCore.openDocument`/`closeDocument`) keep one parse in memory, and
+  read-only calls on the same path and password share it while the file is
+  unchanged, instead of each reading and parsing the whole file. Viewers that
+  make many calls at once no longer multiply memory use by their concurrency.
+* Read common writer quirks as intact files instead of recovering them as
+  damaged: index entries in use at offset 0 are free, `endobj` may be omitted
+  before the next object, the index or the end of the file, integers too large
+  for 64 bits saturate, and references to impossible object numbers read as
+  null (they still never wrap onto a real object).
+* Encode passwords as each revision requires: PDFDocEncoding for RC4/AES-128
+  (revisions 2–4), UTF-8 after SASLprep for AES-256, with the raw UTF-8 bytes
+  as a fallback. AES-256 encryption applies SASLprep; files encrypted by
+  earlier versions still open. Adds the `stringprep` dependency.
 * Enforce render pixel budgets for extreme page sizes and aspect ratios;
   honour tiny fit boxes and reject invalid scales or zero pixel budgets.
 * Resolve indirect page rotations consistently in rendering and size queries.
@@ -22,8 +36,10 @@
   them with `--locked`.
 * Export `PdfRenderedPng` from the package library.
 
-These changes preserve the C ABI; the Dart API only gains the
-`PdfRenderedPng` export. The checked-in Android and iOS binaries have been
+These changes extend the C ABI with the two document-pinning functions; the
+Dart API gains `openDocument`, `closeDocument` and the `PdfRenderedPng` export.
+Bindings treat the pinning functions as optional, so older native libraries
+keep working. The checked-in Android, iOS and macOS binaries have been
 regenerated from this source.
 
 ## 0.1.0
