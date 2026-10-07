@@ -242,16 +242,18 @@ impl Decryptor {
                     Cipher::Rc4
                 };
                 let key_len = if cipher == Cipher::Aes128 { 16 } else { key_len };
-                let file_key = authenticate_legacy(
-                    password,
-                    &o,
-                    &u,
-                    p,
-                    &id0,
-                    r,
-                    key_len,
-                    encrypt_metadata,
-                )?;
+                let file_key = authenticate_any(password, r, |candidate| {
+                    authenticate_legacy(
+                        candidate,
+                        &o,
+                        &u,
+                        p,
+                        &id0,
+                        r,
+                        key_len,
+                        encrypt_metadata,
+                    )
+                })?;
                 Ok(Self {
                     cipher,
                     file_key,
@@ -268,7 +270,9 @@ impl Decryptor {
                     .get("UE")
                     .and_then(string_bytes)
                     .ok_or_else(|| PdfError::crypt("missing /UE"))?;
-                let file_key = authenticate_v5(password, &o, &u, &oe, &ue, r)?;
+                let file_key = authenticate_any(password, r, |candidate| {
+                    authenticate_v5(candidate, &o, &u, &oe, &ue, r)
+                })?;
                 Ok(Self {
                     cipher: Cipher::Aes256,
                     file_key,
@@ -408,6 +412,123 @@ fn compute_user_check(key: &[u8], id0: &[u8], r: i64) -> Vec<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Password encodings
+// ---------------------------------------------------------------------------
+
+/// Try each encoding of `password` (UTF-8, as callers pass it) in turn. The
+/// first that opens the file wins; when none does, the error is the one the
+/// last attempt gave, `ENCRYPTED` or `WRONG_PASSWORD` as before.
+fn authenticate_any(
+    password: &[u8],
+    revision: i64,
+    attempt: impl Fn(&[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut failure = PdfError::WrongPassword;
+    for candidate in password_candidates(password, revision) {
+        match attempt(&candidate) {
+            Ok(key) => return Ok(key),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// The byte strings a password may have been encrypted with, most likely
+/// first.
+///
+/// RC4 and AES-128 files (revisions 2–4) take the password in
+/// PDFDocEncoding, and AES-256 ones (revisions 5–6) take it as UTF-8 after
+/// SASLprep. A password with non-ASCII characters therefore has to be
+/// converted to open correctly written files. The UTF-8 bytes as given come
+/// last: some writers use them regardless, and so did this engine before it
+/// applied SASLprep.
+fn password_candidates(password: &[u8], revision: i64) -> Vec<Vec<u8>> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Ok(text) = std::str::from_utf8(password) {
+        let converted = if revision >= 5 {
+            stringprep::saslprep(text)
+                .ok()
+                .map(|prepared| prepared.as_bytes().to_vec())
+        } else {
+            pdf_doc_encode(text)
+        };
+        candidates.extend(converted);
+    }
+    if !candidates.iter().any(|candidate| candidate == password) {
+        candidates.push(password.to_vec());
+    }
+    candidates
+}
+
+/// `password` after SASLprep, as AES-256 encryption requires, or unchanged
+/// when SASLprep rejects it (authentication tries the raw bytes too).
+fn sasl_prepared(password: &str) -> std::borrow::Cow<'_, str> {
+    stringprep::saslprep(password).unwrap_or(std::borrow::Cow::Borrowed(password))
+}
+
+/// `text` in PDFDocEncoding, or `None` if a character has no code there.
+fn pdf_doc_encode(text: &str) -> Option<Vec<u8>> {
+    text.chars().map(pdf_doc_byte).collect()
+}
+
+fn pdf_doc_byte(c: char) -> Option<u8> {
+    let code = u32::from(c);
+    match code {
+        // Shared with ASCII and Latin-1; the gaps hold the characters below.
+        0x00..=0x17 | 0x20..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => Some(code as u8),
+        _ => PDF_DOC_DIFFERENCES
+            .iter()
+            .find(|(_, character)| *character == c)
+            .map(|(byte, _)| *byte),
+    }
+}
+
+/// PDFDocEncoding codes whose characters differ from Latin-1
+/// (ISO 32000-1, Annex D). 0x7F, 0x9F and 0xAD are undefined.
+const PDF_DOC_DIFFERENCES: [(u8, char); 40] = [
+    (0x18, '\u{02D8}'), // breve
+    (0x19, '\u{02C7}'), // caron
+    (0x1A, '\u{02C6}'), // circumflex
+    (0x1B, '\u{02D9}'), // dot above
+    (0x1C, '\u{02DD}'), // double acute
+    (0x1D, '\u{02DB}'), // ogonek
+    (0x1E, '\u{02DA}'), // ring
+    (0x1F, '\u{02DC}'), // small tilde
+    (0x80, '\u{2022}'), // bullet
+    (0x81, '\u{2020}'), // dagger
+    (0x82, '\u{2021}'), // double dagger
+    (0x83, '\u{2026}'), // ellipsis
+    (0x84, '\u{2014}'), // em dash
+    (0x85, '\u{2013}'), // en dash
+    (0x86, '\u{0192}'), // florin
+    (0x87, '\u{2044}'), // fraction slash
+    (0x88, '\u{2039}'), // single left angle quote
+    (0x89, '\u{203A}'), // single right angle quote
+    (0x8A, '\u{2212}'), // minus
+    (0x8B, '\u{2030}'), // per mille
+    (0x8C, '\u{201E}'), // double low-9 quote
+    (0x8D, '\u{201C}'), // left double quote
+    (0x8E, '\u{201D}'), // right double quote
+    (0x8F, '\u{2018}'), // left single quote
+    (0x90, '\u{2019}'), // right single quote
+    (0x91, '\u{201A}'), // single low-9 quote
+    (0x92, '\u{2122}'), // trade mark
+    (0x93, '\u{FB01}'), // fi ligature
+    (0x94, '\u{FB02}'), // fl ligature
+    (0x95, '\u{0141}'), // L with stroke
+    (0x96, '\u{0152}'), // OE ligature
+    (0x97, '\u{0160}'), // S with caron
+    (0x98, '\u{0178}'), // Y with diaeresis
+    (0x99, '\u{017D}'), // Z with caron
+    (0x9A, '\u{0131}'), // dotless i
+    (0x9B, '\u{0142}'), // l with stroke
+    (0x9C, '\u{0153}'), // oe ligature
+    (0x9D, '\u{0161}'), // s with caron
+    (0x9E, '\u{017E}'), // z with caron
+    (0xA0, '\u{20AC}'), // euro
+];
+
 #[allow(clippy::too_many_arguments)]
 fn authenticate_legacy(
     password: &[u8],
@@ -537,8 +658,20 @@ pub fn encrypt_document(
     } else {
         owner_password
     };
-    let upw = &user_password.as_bytes()[..user_password.len().min(127)];
-    let opw = &owner_password.as_bytes()[..owner_password.len().min(127)];
+    // AES-256 takes passwords as UTF-8 after SASLprep, so that equivalent
+    // ways of typing the same characters open the file in any reader.
+    let (user, owner) = (sasl_prepared(user_password), sasl_prepared(owner_password));
+    encrypt_with_password_bytes(doc, user.as_bytes(), owner.as_bytes())
+}
+
+/// [`encrypt_document`] with the passwords already encoded.
+fn encrypt_with_password_bytes(
+    doc: &PdfDocument,
+    user_password: &[u8],
+    owner_password: &[u8],
+) -> Result<PdfDocument> {
+    let upw = &user_password[..user_password.len().min(127)];
+    let opw = &owner_password[..owner_password.len().min(127)];
 
     let file_key: [u8; 32] = random_bytes()?;
 
@@ -677,6 +810,73 @@ fn write_with_encrypt(doc: &PdfDocument) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::document::PdfDocument;
+
+    // Fixtures written by pypdf 6.19, an independent implementation of the
+    // standard security handler, so these check interoperability rather than
+    // agreement with this engine's own writer.
+    const LATIN1_PASSWORD: &str = "P\u{E4}ssw\u{F6}rd1";
+
+    #[test]
+    fn opens_legacy_files_whose_password_is_in_pdf_doc_encoding() {
+        for (name, bytes) in [
+            ("RC4-128", &include_bytes!("../../../fixtures/rc4_128_latin1_password.pdf")[..]),
+            ("AES-128", &include_bytes!("../../../fixtures/aes128_latin1_password.pdf")[..]),
+        ] {
+            let doc = PdfDocument::from_bytes_with_password(bytes, LATIN1_PASSWORD)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(doc.page_count(), Some(1), "{name}");
+            assert!(matches!(
+                PdfDocument::from_bytes_with_password(bytes, "Passwort1"),
+                Err(PdfError::WrongPassword)
+            ));
+            assert!(matches!(PdfDocument::from_bytes(bytes), Err(PdfError::Encrypted)));
+        }
+    }
+
+    #[test]
+    fn opens_aes256_files_whose_password_went_through_saslprep() {
+        let bytes = include_bytes!("../../../fixtures/aes256_saslprep_password.pdf");
+        // Written with a no-break space, which SASLprep turns into a space,
+        // so either way of typing it opens the file.
+        for typed in ["P\u{E4}ss w\u{F6}rd1", "P\u{E4}ss\u{A0}w\u{F6}rd1"] {
+            let doc = PdfDocument::from_bytes_with_password(bytes, typed).unwrap();
+            assert_eq!(doc.page_count(), Some(1));
+        }
+    }
+
+    #[test]
+    fn encryption_applies_saslprep_and_older_raw_passwords_still_open() {
+        let doc = PdfDocument::from_bytes(include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        let typed = "P\u{E4}ss\u{A0}w\u{F6}rd1";
+
+        let bytes = encrypt_to_bytes(&doc, typed, "").unwrap();
+        for attempt in [typed, "P\u{E4}ss w\u{F6}rd1"] {
+            assert!(PdfDocument::from_bytes_with_password(&bytes, attempt).is_ok(), "{attempt:?}");
+        }
+
+        // Files this engine encrypted before SASLprep hashed the raw bytes.
+        let raw = encrypt_with_password_bytes(&doc, typed.as_bytes(), typed.as_bytes()).unwrap();
+        let raw_bytes = write_with_encrypt(&raw).unwrap();
+        assert!(PdfDocument::from_bytes_with_password(&raw_bytes, typed).is_ok());
+    }
+
+    #[test]
+    fn pdf_doc_encoding_covers_latin1_and_its_own_characters() {
+        assert_eq!(pdf_doc_encode("abc").unwrap(), b"abc");
+        assert_eq!(pdf_doc_encode("\u{E4}\u{FF}").unwrap(), [0xE4, 0xFF]);
+        assert_eq!(pdf_doc_encode("\u{20AC}\u{2022}\u{FB01}").unwrap(), [0xA0, 0x80, 0x93]);
+        assert_eq!(pdf_doc_encode("\u{3A9}"), None, "Greek is not in PDFDocEncoding");
+        assert_eq!(pdf_doc_encode("\u{AD}"), None, "0xAD is undefined");
+        // ASCII needs no second attempt.
+        assert_eq!(password_candidates(b"secret", 4), vec![b"secret".to_vec()]);
+        assert_eq!(
+            password_candidates(LATIN1_PASSWORD.as_bytes(), 4),
+            vec![
+                b"P\xE4ssw\xF6rd1".to_vec(),
+                LATIN1_PASSWORD.as_bytes().to_vec()
+            ]
+        );
+    }
 
     #[test]
     fn rc4_known_vector() {
