@@ -12,8 +12,12 @@
 //!   string means "all pages".
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::SystemTime;
 
 use pdf_ai::chunker::ChunkOptions;
 use pdf_core::crypt::encrypt_to_bytes;
@@ -111,7 +115,86 @@ fn run_int(f: impl FnOnce() -> Result<i64, PdfError>) -> c_int {
 }
 
 fn open(path: &str, password: &str) -> Result<PdfDocument, PdfError> {
+    #[cfg(test)]
+    tests::record_parse(path);
     PdfDocument::from_path_with_password(path, password)
+}
+
+// ---------------------------------------------------------------------------
+// Pinned documents
+// ---------------------------------------------------------------------------
+//
+// Every call reads and parses its file from scratch, which costs memory in
+// proportion to the file: roughly twice its size while parsing. A viewer
+// makes many calls on one document at once (page renders, page sizes, text
+// layout, search), so a large scan multiplied that cost until Android killed
+// the app. A caller that will keep using a document pins it with
+// `pdf_document_open`; read-only calls on the same path and password then
+// share that one parse for as long as the file on disk is unchanged. Files
+// that nobody pinned keep the per-call behaviour.
+
+/// What a file looked like when it was parsed. A different length or
+/// modification time means a pinned parse no longer describes the file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn file_stamp(path: &str) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+struct PinnedDocument {
+    stamp: FileStamp,
+    doc: Arc<PdfDocument>,
+    /// Outstanding `pdf_document_open` calls; the parse is freed at zero.
+    holders: usize,
+}
+
+/// Path and password, exactly as the caller passed them.
+type PinKey = (String, String);
+
+fn pinned_documents() -> MutexGuard<'static, HashMap<PinKey, PinnedDocument>> {
+    static PINNED: OnceLock<Mutex<HashMap<PinKey, PinnedDocument>>> = OnceLock::new();
+    PINNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A document for a read-only call: the pinned parse when it still matches
+/// the file on disk, otherwise a fresh parse that is dropped afterwards.
+enum ReadDocument {
+    Pinned(Arc<PdfDocument>),
+    Fresh(PdfDocument),
+}
+
+impl Deref for ReadDocument {
+    type Target = PdfDocument;
+
+    fn deref(&self) -> &PdfDocument {
+        match self {
+            Self::Pinned(doc) => doc,
+            Self::Fresh(doc) => doc,
+        }
+    }
+}
+
+fn open_for_reading(path: &str, password: &str) -> Result<ReadDocument, PdfError> {
+    if let Some(stamp) = file_stamp(path) {
+        let pinned = pinned_documents();
+        if let Some(entry) = pinned.get(&(path.to_owned(), password.to_owned())) {
+            if entry.stamp == stamp {
+                return Ok(ReadDocument::Pinned(Arc::clone(&entry.doc)));
+            }
+        }
+    }
+    open(path, password).map(ReadDocument::Fresh)
 }
 
 /// Parse a 1-based range string ("1-3,5"; empty = all) into 0-based indices.
@@ -190,6 +273,100 @@ pub unsafe extern "C" fn pdf_free_string(ptr: *mut c_char) {
     }
 }
 
+/// Pin a document: parse it once, and let read-only calls on the same path
+/// and password (page count, inspection, text, text layout, rendering, page
+/// size, page extraction, encryption) reuse that parse while the file is
+/// unchanged. Returns the page count, or -1 with `pdf_last_error` (for
+/// example `ENCRYPTED`) when the document cannot be opened. Every successful
+/// call needs a matching `pdf_document_close`.
+///
+/// # Safety
+/// `path` and `password` must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_document_open(
+    path: *const c_char,
+    password: *const c_char,
+) -> c_int {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return -1;
+    };
+    run_int(|| {
+        let key = (path.to_owned(), password.to_owned());
+        let stamp = file_stamp(path);
+        if let Some(stamp) = stamp {
+            if let Some(entry) = pinned_documents().get_mut(&key) {
+                if entry.stamp == stamp {
+                    entry.holders += 1;
+                    return Ok(entry.doc.page_count().unwrap_or(0) as i64);
+                }
+            }
+        }
+        // Parse without holding the lock, so other documents stay usable.
+        let doc = Arc::new(open(path, password)?);
+        let pages = doc.page_count().unwrap_or(0) as i64;
+        let Some(stamp) = stamp else {
+            // Readable but not statable: nothing reliable to pin against.
+            return Ok(pages);
+        };
+        let replaced = {
+            let mut pinned = pinned_documents();
+            match pinned.get_mut(&key) {
+                // Another caller pinned the same file meanwhile; share theirs.
+                Some(entry) if entry.stamp == stamp => {
+                    entry.holders += 1;
+                    None
+                }
+                // The file changed since it was pinned. Every holder moves to
+                // the new parse, and the stale one is freed below.
+                Some(entry) => {
+                    entry.holders += 1;
+                    entry.stamp = stamp;
+                    Some(std::mem::replace(&mut entry.doc, doc))
+                }
+                None => {
+                    pinned.insert(key, PinnedDocument { stamp, doc, holders: 1 });
+                    None
+                }
+            }
+        };
+        // Freeing a large document takes a moment; never hold the lock for it.
+        drop(replaced);
+        Ok(pages)
+    })
+}
+
+/// Release one `pdf_document_open`. The parse is freed when its last holder
+/// closes it; calls already using it finish first. Closing a document that
+/// is not pinned does nothing.
+///
+/// # Safety
+/// `path` and `password` must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_document_close(
+    path: *const c_char,
+    password: *const c_char,
+) -> c_int {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return -1;
+    };
+    run_int(|| {
+        let key = (path.to_owned(), password.to_owned());
+        let released = {
+            let mut pinned = pinned_documents();
+            match pinned.get_mut(&key) {
+                Some(entry) if entry.holders > 1 => {
+                    entry.holders -= 1;
+                    None
+                }
+                Some(_) => pinned.remove(&key),
+                None => None,
+            }
+        };
+        drop(released);
+        Ok(0)
+    })
+}
+
 /// Number of pages, or -1 on error.
 ///
 /// # Safety
@@ -203,7 +380,7 @@ pub unsafe extern "C" fn pdf_page_count(
         return -1;
     };
     run_int(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         Ok(doc.page_count().unwrap_or(0) as i64)
     })
 }
@@ -221,7 +398,7 @@ pub unsafe extern "C" fn pdf_inspect_json(
         return std::ptr::null_mut();
     };
     run_str(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let inspect = doc.inspect();
         let metadata = pdf_ops::metadata::read_metadata(&doc);
         let value = serde_json::json!({
@@ -248,7 +425,7 @@ pub unsafe extern "C" fn pdf_get_metadata_json(
         return std::ptr::null_mut();
     };
     run_str(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         serde_json::to_string(&pdf_ops::metadata::read_metadata(&doc))
             .map_err(|e| PdfError::Structure(e.to_string()))
     })
@@ -298,7 +475,7 @@ pub unsafe extern "C" fn pdf_extract_pages(
         return -1;
     };
     run_int(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let count = doc.page_count().unwrap_or(0) as usize;
         let indices = parse_ranges(pages, count)?;
         let extracted = pdf_ops::split::extract_pages(&doc, &indices)?;
@@ -469,7 +646,7 @@ pub unsafe extern "C" fn pdf_extract_text(
         return std::ptr::null_mut();
     };
     run_str(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         if page == 0 {
             Ok(pdf_text::extractor::extract_all_pages(&doc)?.join("\u{0C}"))
         } else {
@@ -515,7 +692,7 @@ pub unsafe extern "C" fn pdf_page_text_layout_json(
         return std::ptr::null_mut();
     };
     run_str(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let layout = pdf_text::layout::extract_page_layout_with_metrics(
             &doc,
             (page - 1) as usize,
@@ -541,7 +718,7 @@ pub unsafe extern "C" fn pdf_export_ai(
         return std::ptr::null_mut();
     };
     run_str(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let mut options = ChunkOptions::default();
         if max_chars > 0 {
             options.max_chars = max_chars as usize;
@@ -579,7 +756,7 @@ pub unsafe extern "C" fn pdf_encrypt(
         return -1;
     };
     run_int(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let bytes = encrypt_to_bytes(&doc, user_pw, owner_pw)?;
         pdf_core::writer::PdfWriter::write_bytes_atomic(&bytes, out)?;
         Ok(0)
@@ -600,7 +777,7 @@ pub unsafe extern "C" fn pdf_decrypt(
         return -1;
     };
     run_int(|| {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         doc.save_as(out)?; // the standard writer always writes decrypted
         Ok(0)
     })
@@ -689,7 +866,7 @@ pub unsafe extern "C" fn pdf_render_page_png(
         return std::ptr::null_mut();
     };
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, PdfError> {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         let rendered =
             pdf_render::render_page(&doc, page, render_options(target_width, target_height))?;
         set_warnings(&rendered.warnings);
@@ -747,7 +924,7 @@ pub unsafe extern "C" fn pdf_render_page_rgba(
         return std::ptr::null_mut();
     };
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<_, PdfError> {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         pdf_render::render_page(&doc, page, render_options(target_width, target_height))
     }));
     match result {
@@ -800,7 +977,7 @@ pub unsafe extern "C" fn pdf_page_size(
         return -1;
     };
     let (w, h) = match catch_unwind(AssertUnwindSafe(|| -> Result<(f64, f64), PdfError> {
-        let doc = open(path, password)?;
+        let doc = open_for_reading(path, password)?;
         pdf_render::page_size_points(&doc, page)
     })) {
         Ok(Ok(size)) => size,
@@ -884,6 +1061,171 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../fixtures/simple.pdf"
         ))
+    }
+
+    /// Full parses per path, so tests can tell a pinned document from a
+    /// fresh read. Keyed by path because tests run in parallel.
+    fn parse_counts() -> MutexGuard<'static, HashMap<String, usize>> {
+        static PARSES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        PARSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn record_parse(path: &str) {
+        *parse_counts().entry(path.to_owned()).or_default() += 1;
+    }
+
+    fn parses(path: &str) -> usize {
+        parse_counts().get(path).copied().unwrap_or(0)
+    }
+
+    /// A fresh directory per test, so parallel tests never share files.
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdf_ffi_{}_{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pinned_documents_share_one_parse_until_the_last_close() {
+        let dir = scratch_dir("pin_share");
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        let path_str = path.to_str().unwrap();
+        let (p, empty) = (c(path_str), c(""));
+        unsafe {
+            assert_eq!(pdf_document_open(p.as_ptr(), empty.as_ptr()), 1);
+            assert_eq!(parses(path_str), 1);
+
+            // Every read-only call reuses the pinned parse.
+            assert_eq!(pdf_page_count(p.as_ptr(), empty.as_ptr()), 1);
+            let mut len = 0;
+            let png = pdf_render_page_png(p.as_ptr(), empty.as_ptr(), 0, 64, 64, &mut len);
+            assert!(!png.is_null());
+            pdf_free_buffer(png, len);
+            let (mut w, mut h) = (0.0, 0.0);
+            assert_eq!(pdf_page_size(p.as_ptr(), empty.as_ptr(), 0, &mut w, &mut h), 0);
+            let layout = pdf_page_text_layout_json(p.as_ptr(), empty.as_ptr(), 1);
+            assert!(!layout.is_null());
+            pdf_free_string(layout);
+            let text = pdf_extract_text(p.as_ptr(), empty.as_ptr(), 0);
+            assert!(!text.is_null());
+            pdf_free_string(text);
+            assert_eq!(parses(path_str), 1);
+
+            // A second holder shares the same parse.
+            assert_eq!(pdf_document_open(p.as_ptr(), empty.as_ptr()), 1);
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+            assert_eq!(pdf_page_count(p.as_ptr(), empty.as_ptr()), 1);
+            assert_eq!(parses(path_str), 1);
+
+            // After the last close, calls read the file again.
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+            assert_eq!(pdf_page_count(p.as_ptr(), empty.as_ptr()), 1);
+            assert_eq!(parses(path_str), 2);
+
+            // Closing an unpinned document is harmless.
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_changed_file_is_read_afresh_instead_of_its_stale_pin() {
+        let dir = scratch_dir("pin_stale");
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        let (p, empty) = (c(path.to_str().unwrap()), c(""));
+        unsafe {
+            assert_eq!(pdf_document_open(p.as_ptr(), empty.as_ptr()), 1);
+            std::fs::write(&path, include_bytes!("../../../fixtures/two_pages.pdf")).unwrap();
+            assert_eq!(pdf_page_count(p.as_ptr(), empty.as_ptr()), 2);
+
+            // Pinning again replaces the stale parse for both holders.
+            assert_eq!(pdf_document_open(p.as_ptr(), empty.as_ptr()), 2);
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+            assert_eq!(pdf_page_count(p.as_ptr(), empty.as_ptr()), 2);
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_open_pins_nothing_and_keeps_the_error_code() {
+        let dir = scratch_dir("pin_locked");
+        let plain = dir.join("plain.pdf");
+        std::fs::write(&plain, include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        let locked = dir.join("locked.pdf");
+        let locked_str = locked.to_str().unwrap();
+        let (plain_c, locked_c, empty, pw) =
+            (c(plain.to_str().unwrap()), c(locked_str), c(""), c("secret"));
+        unsafe {
+            assert_eq!(
+                pdf_encrypt(plain_c.as_ptr(), empty.as_ptr(), pw.as_ptr(), empty.as_ptr(), locked_c.as_ptr()),
+                0
+            );
+            assert_eq!(pdf_document_open(locked_c.as_ptr(), empty.as_ptr()), -1);
+            assert!(last_error().starts_with("ENCRYPTED"), "got: {}", last_error());
+            let wrong = c("wrong");
+            assert_eq!(pdf_document_open(locked_c.as_ptr(), wrong.as_ptr()), -1);
+            assert!(last_error().starts_with("WRONG_PASSWORD"), "got: {}", last_error());
+
+            let before = parses(locked_str);
+            assert_eq!(pdf_page_count(locked_c.as_ptr(), empty.as_ptr()), -1);
+            assert_eq!(parses(locked_str), before + 1, "nothing was pinned");
+
+            assert_eq!(pdf_document_open(locked_c.as_ptr(), pw.as_ptr()), 1);
+            let pinned_at = parses(locked_str);
+            assert_eq!(pdf_page_count(locked_c.as_ptr(), pw.as_ptr()), 1);
+            assert_eq!(parses(locked_str), pinned_at);
+            // The pin is per password: other passwords still read the file.
+            assert_eq!(pdf_page_count(locked_c.as_ptr(), empty.as_ptr()), -1);
+            assert_eq!(pdf_document_close(locked_c.as_ptr(), pw.as_ptr()), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_calls_share_a_pinned_document_safely() {
+        let dir = scratch_dir("pin_threads");
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, include_bytes!("../../../fixtures/two_pages.pdf")).unwrap();
+        let path_str = path.to_str().unwrap().to_owned();
+        let (p, empty) = (c(&path_str), c(""));
+        unsafe {
+            assert_eq!(pdf_document_open(p.as_ptr(), empty.as_ptr()), 2);
+        }
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = path_str.clone();
+                std::thread::spawn(move || {
+                    let (p, empty) = (c(&path), c(""));
+                    for round in 0..5 {
+                        let page = (worker + round) % 2;
+                        unsafe {
+                            let mut len = 0;
+                            let png = pdf_render_page_png(p.as_ptr(), empty.as_ptr(), page, 48, 48, &mut len);
+                            assert!(!png.is_null(), "render failed: {}", last_error());
+                            pdf_free_buffer(png, len);
+                            let layout = pdf_page_text_layout_json(p.as_ptr(), empty.as_ptr(), page + 1);
+                            assert!(!layout.is_null(), "layout failed: {}", last_error());
+                            pdf_free_string(layout);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(parses(&path_str), 1);
+        unsafe {
+            assert_eq!(pdf_document_close(p.as_ptr(), empty.as_ptr()), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -161,6 +161,21 @@ class PdfBindings {
     }
   }
 
+  /// Optional for the same reason as [pageTextLayoutJson]: pinning a parsed
+  /// document arrived after the first native releases.
+  late final int Function(Pointer<Utf8>, Pointer<Utf8>)? documentOpen =
+      _lookupDocumentPin('pdf_document_open');
+  late final int Function(Pointer<Utf8>, Pointer<Utf8>)? documentClose =
+      _lookupDocumentPin('pdf_document_close');
+
+  _PageCountDart? _lookupDocumentPin(String symbol) {
+    try {
+      return _library.lookupFunction<_PageCountC, _PageCountDart>(symbol);
+    } on ArgumentError {
+      return null;
+    }
+  }
+
   static PdfBindings? _instance;
 
   /// Resolve the bindings, loading the dynamic library for this platform.

@@ -533,6 +533,33 @@ class PdfCore {
     }));
   }
 
+  // -- pinned documents ------------------------------------------------------
+
+  /// Parse [path] once and keep it in memory, so that later read-only calls
+  /// on the same path and password (renders, page sizes, text, text layout)
+  /// reuse it instead of reading and parsing the whole file again. Returns
+  /// the page count; throws [PdfException] (for example `ENCRYPTED`) like
+  /// [pageCount].
+  ///
+  /// Pair every successful call with [closeDocument]. Calls made while the
+  /// file on disk has changed read it afresh. With an older native library
+  /// this only counts the pages.
+  static Future<int> openDocument(String path, {String password = ''}) =>
+      Isolate.run(() {
+        final open = _b.documentOpen;
+        if (open == null) return pageCount(path, password: password);
+        return _int2(open, path, password);
+      });
+
+  /// Release one [openDocument]. The parse is freed when its last holder
+  /// closes it, off the calling isolate.
+  static Future<void> closeDocument(String path, {String password = ''}) =>
+      Isolate.run(() {
+        final close = _b.documentClose;
+        if (close == null) return;
+        _check(_withUtf8([path, password], (args) => close(args[0], args[1])));
+      });
+
   // -- async variants ----------------------------------------------------------
 
   static Future<int> pageCountAsync(String path, {String password = ''}) =>
