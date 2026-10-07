@@ -385,8 +385,14 @@ mod tests {
         damaged.extend_from_slice(payload);
         damaged.extend_from_slice(b"\nendstream\n78 0 obj (survives) endobj\n");
         let recovered = PdfDocument::from_bytes(&damaged).unwrap();
+        // Nothing inside the stream's bytes is mistaken for an object.
         assert!(recovered.resolve(ObjectId::new(999, 0)).is_none());
-        assert!(recovered.resolve(ObjectId::new(77, 0)).is_none());
+        // The stream ends exactly at its /Length and the next object follows,
+        // so it is complete even without `endobj`, as some writers emit it.
+        match recovered.resolve(ObjectId::new(77, 0)) {
+            Some(PdfObject::Stream(stream)) => assert_eq!(stream.data, payload),
+            other => panic!("expected the complete stream, got {other:?}"),
+        }
         assert_eq!(
             recovered.resolve(ObjectId::new(78, 0)),
             Some(&PdfObject::LiteralString(b"survives".to_vec()))

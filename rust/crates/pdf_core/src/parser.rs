@@ -61,11 +61,15 @@ impl<'a> Parser<'a> {
         }, ..] = self.lookahead.as_slice()
         {
             if r == "R" {
-                let id = checked_object_id(*obj, *gen, self.position())?;
+                // Numbers outside the object-id range cannot name any object.
+                // A reference to a missing object is null in PDF, so read it
+                // as null: never wrapped onto a real object, and never fatal
+                // to the object that contains it.
+                let id = checked_object_id(*obj, *gen, self.position()).ok();
                 self.take()?;
                 self.take()?;
                 self.take()?;
-                return Ok(PdfObject::Reference(id));
+                return Ok(id.map_or(PdfObject::Null, PdfObject::Reference));
             }
         }
 
@@ -119,8 +123,45 @@ impl<'a> Parser<'a> {
                 .read_stream_data_with_length(stream_token.offset, length_hint)?;
             value = PdfObject::Stream(PdfStream::new(dictionary, data));
         }
-        self.expect_keyword("endobj")?;
+        self.fill(1)?;
+        if matches!(
+            self.lookahead.first().map(|token| &token.token),
+            Some(Token::Keyword(keyword)) if keyword == "endobj"
+        ) {
+            self.take()?;
+        } else if !self.at_structural_boundary() {
+            return Err(PdfError::parse(self.position(), "expected endobj"));
+        }
         Ok(IndirectObject { id, value })
+    }
+
+    /// `endobj` is required, but some writers omit it (Apple's does after
+    /// `endstream`). An object followed directly by the next object, the
+    /// index or the end of the file is complete, so it is accepted as other
+    /// readers accept it. Anything else after it, such as stream bytes past a
+    /// wrong `/Length`, still means the object did not end where it seemed to.
+    fn at_structural_boundary(&mut self) -> bool {
+        if self.fill(3).is_err() {
+            return false;
+        }
+        match self.lookahead.as_slice() {
+            [] => true,
+            [SpannedToken {
+                token: Token::Keyword(keyword),
+                ..
+            }, ..] => matches!(keyword.as_str(), "xref" | "trailer" | "startxref"),
+            [SpannedToken {
+                token: Token::Integer(_),
+                ..
+            }, SpannedToken {
+                token: Token::Integer(_),
+                ..
+            }, SpannedToken {
+                token: Token::Keyword(keyword),
+                ..
+            }, ..] => keyword == "obj",
+            _ => false,
+        }
     }
 
     fn parse_array(&mut self, start: usize) -> Result<PdfObject> {
@@ -225,9 +266,12 @@ mod tests {
     #[test]
     fn rejects_object_ids_that_would_wrap() {
         for (number, generation) in [(4_294_967_297i64, 0), (1, 65_536), (-1, 0), (1, -1)] {
+            // A reference can never wrap onto a real object; it names nothing,
+            // which PDF reads as null.
             let reference = format!("{number} {generation} R");
-            assert!(
-                Parser::new(reference.as_bytes()).parse_object().is_err(),
+            assert_eq!(
+                Parser::new(reference.as_bytes()).parse_object().unwrap(),
+                PdfObject::Null,
                 "{reference}"
             );
             let indirect = format!("{number} {generation} obj null endobj");
@@ -237,6 +281,36 @@ mod tests {
                     .is_err(),
                 "{indirect}"
             );
+        }
+    }
+
+    #[test]
+    fn accepts_objects_whose_writer_left_out_endobj() {
+        let mut parser =
+            Parser::new(b"7 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\n8 0 obj null endobj");
+        let stream = parser.parse_indirect_object().unwrap();
+        assert_eq!(stream.id, ObjectId::new(7, 0));
+        assert!(matches!(stream.value, PdfObject::Stream(_)));
+        // Parsing carries on with the object that follows.
+        assert_eq!(parser.parse_indirect_object().unwrap().id, ObjectId::new(8, 0));
+
+        let last = Parser::new(b"9 0 obj (text)").parse_indirect_object().unwrap();
+        assert_eq!(last.id, ObjectId::new(9, 0));
+        let before_index = Parser::new(b"10 0 obj [1 2]\nxref\n0 1")
+            .parse_indirect_object()
+            .unwrap();
+        assert_eq!(before_index.id, ObjectId::new(10, 0));
+    }
+
+    #[test]
+    fn still_rejects_objects_followed_by_stray_data() {
+        // Stream bytes past a wrong /Length are not a clean end of object.
+        for input in [
+            &b"7 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nq 1 0 0 1 cm"[..],
+            &b"8 0 obj (text) 42 /Name"[..],
+        ] {
+            let error = Parser::new(input).parse_indirect_object().unwrap_err();
+            assert!(error.to_string().contains("endobj"), "{error}");
         }
     }
 

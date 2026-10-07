@@ -53,7 +53,7 @@ impl PdfDocument {
         // Normal files retain the indexed fast path. Recovery only reconstructs
         // structural damage; password errors never trigger a plaintext retry.
         let (mut xref, mut objects) = match parse_xref(data) {
-            Ok(xref) => match load_indexed_objects(data, &xref) {
+            Ok(mut xref) => match load_indexed_objects(data, free_unwritten_entries(&mut xref)) {
                 Ok(objects) => (xref, objects),
                 Err(error) => {
                     recovered = true;
@@ -350,6 +350,19 @@ impl PdfDocument {
     }
 }
 
+/// Some writers (Apple's among them) list objects they never wrote as in use
+/// at offset 0, where the file header is, so no object can be there. Treat
+/// those entries as free, as other readers do, rather than reading the whole
+/// index as damaged.
+fn free_unwritten_entries(xref: &mut XrefTable) -> &XrefTable {
+    for entry in xref.entries.values_mut() {
+        if matches!(entry.location, XrefLocation::InFile { offset: 0 }) {
+            entry.location = XrefLocation::Free;
+        }
+    }
+    xref
+}
+
 fn load_indexed_objects(
     data: &[u8],
     xref: &XrefTable,
@@ -608,6 +621,62 @@ mod tests {
         let two_pages =
             PdfDocument::from_bytes(include_bytes!("../../../fixtures/two_pages.pdf")).unwrap();
         assert_eq!(two_pages.inspect().page_count, Some(2));
+    }
+
+    /// A classic-xref PDF whose objects are numbered from 1. Each body ends
+    /// however the test wants it to. `None` is listed as in use at offset 0,
+    /// the way Apple's writer lists objects it never wrote.
+    fn pdf_with_bodies(bodies: &[Option<&str>]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in bodies.iter().enumerate() {
+            match body {
+                Some(body) => {
+                    offsets.push(out.len());
+                    out.extend_from_slice(format!("{} 0 obj\n{body}\n", index + 1).as_bytes());
+                }
+                None => offsets.push(0),
+            }
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                bodies.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn apple_writer_quirks_are_read_as_an_intact_index() {
+        let content = "BT ET";
+        let stream_without_endobj =
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len());
+        let pdf = pdf_with_bodies(&[
+            Some("<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>\nendobj"),
+            Some("<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj"),
+            Some("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj"),
+            Some(&stream_without_endobj),
+            Some("<< /Type /StructElem /Pg 18446744073386459286 0 R /Lang (en-US) >>\nendobj"),
+            None,
+        ]);
+
+        let doc = PdfDocument::from_bytes(&pdf).unwrap();
+        assert!(doc.recovery_warnings.is_empty(), "{:?}", doc.recovery_warnings);
+        assert_eq!(doc.page_count(), Some(1));
+        assert!(matches!(doc.resolve(ObjectId::new(4, 0)), Some(PdfObject::Stream(_))));
+        let element = doc.resolve(ObjectId::new(5, 0)).and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(element.get("Pg"), Some(&PdfObject::Null));
+        assert!(element.get("Lang").is_some());
+        assert!(doc.resolve(ObjectId::new(6, 0)).is_none());
     }
 
     #[test]

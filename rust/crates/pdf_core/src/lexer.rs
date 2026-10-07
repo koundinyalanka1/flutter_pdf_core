@@ -313,10 +313,19 @@ impl<'a> Lexer<'a> {
                     .map_err(|_| PdfError::parse(start, "invalid real"))?,
             ))
         } else {
-            Ok(Token::Integer(
-                s.parse()
-                    .map_err(|_| PdfError::parse(start, "invalid integer"))?,
-            ))
+            let digits = s.trim_start_matches(['+', '-']);
+            if digits.is_empty() {
+                return Err(PdfError::parse(start, "invalid integer"));
+            }
+            // Only digits remain, so a parse failure means overflow. Valid
+            // PDFs never need such values, but some writers emit garbage
+            // ones (Apple's writes 20-digit object numbers in references).
+            // Saturate rather than reject the whole object around it.
+            Ok(Token::Integer(s.parse().unwrap_or(if s.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            })))
         }
     }
 
@@ -362,6 +371,17 @@ fn hex_value(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturates_integers_too_large_for_64_bits() {
+        let mut lexer = Lexer::new(b"18446744073386459286 -99999999999999999999 +5");
+        let mut next = || lexer.next_token().unwrap().unwrap().token;
+        assert_eq!(next(), Token::Integer(i64::MAX));
+        assert_eq!(next(), Token::Integer(i64::MIN));
+        assert_eq!(next(), Token::Integer(5));
+        // A sign with no digits is still not a number.
+        assert!(Lexer::new(b"- ").next_token().is_err());
+    }
 
     #[test]
     fn lexes_basic_tokens() {
