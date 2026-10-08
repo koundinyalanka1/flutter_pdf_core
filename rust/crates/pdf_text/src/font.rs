@@ -494,8 +494,10 @@ const WIN_ANSI_HIGH: [(u8, char); 27] = [
     (0x9F, '\u{0178}'),
 ];
 
-/// MacRoman high range (common subset).
-const MAC_ROMAN_HIGH: [(u8, char); 32] = [
+/// MacRoman high range: Mac OS Roman, with 0xDB as the PDF spec's
+/// `currency` sign (¤) rather than the later Euro. 0xF0, the Apple logo,
+/// has no Unicode meaning and stays unmapped.
+const MAC_ROMAN_HIGH: [(u8, char); 127] = [
     (0x80, '\u{00C4}'),
     (0x81, '\u{00C5}'),
     (0x82, '\u{00C7}'),
@@ -507,6 +509,7 @@ const MAC_ROMAN_HIGH: [(u8, char); 32] = [
     (0x88, '\u{00E0}'),
     (0x89, '\u{00E2}'),
     (0x8A, '\u{00E4}'),
+    (0x8B, '\u{00E3}'),
     (0x8C, '\u{00E5}'),
     (0x8D, '\u{00E7}'),
     (0x8E, '\u{00E9}'),
@@ -514,20 +517,114 @@ const MAC_ROMAN_HIGH: [(u8, char); 32] = [
     (0x90, '\u{00EA}'),
     (0x91, '\u{00EB}'),
     (0x92, '\u{00ED}'),
+    (0x93, '\u{00EC}'),
+    (0x94, '\u{00EE}'),
+    (0x95, '\u{00EF}'),
     (0x96, '\u{00F1}'),
     (0x97, '\u{00F3}'),
+    (0x98, '\u{00F2}'),
+    (0x99, '\u{00F4}'),
     (0x9A, '\u{00F6}'),
+    (0x9B, '\u{00F5}'),
+    (0x9C, '\u{00FA}'),
+    (0x9D, '\u{00F9}'),
+    (0x9E, '\u{00FB}'),
     (0x9F, '\u{00FC}'),
     (0xA0, '\u{2020}'),
     (0xA1, '\u{00B0}'),
+    (0xA2, '\u{00A2}'),
+    (0xA3, '\u{00A3}'),
+    (0xA4, '\u{00A7}'),
     (0xA5, '\u{2022}'),
+    (0xA6, '\u{00B6}'),
+    (0xA7, '\u{00DF}'),
+    (0xA8, '\u{00AE}'),
+    (0xA9, '\u{00A9}'),
+    (0xAA, '\u{2122}'),
+    (0xAB, '\u{00B4}'),
+    (0xAC, '\u{00A8}'),
+    (0xAD, '\u{2260}'),
+    (0xAE, '\u{00C6}'),
+    (0xAF, '\u{00D8}'),
+    (0xB0, '\u{221E}'),
+    (0xB1, '\u{00B1}'),
+    (0xB2, '\u{2264}'),
+    (0xB3, '\u{2265}'),
+    (0xB4, '\u{00A5}'),
+    (0xB5, '\u{00B5}'),
+    (0xB6, '\u{2202}'),
+    (0xB7, '\u{2211}'),
+    (0xB8, '\u{220F}'),
+    (0xB9, '\u{03C0}'),
+    (0xBA, '\u{222B}'),
+    (0xBB, '\u{00AA}'),
+    (0xBC, '\u{00BA}'),
+    (0xBD, '\u{03A9}'),
+    (0xBE, '\u{00E6}'),
+    (0xBF, '\u{00F8}'),
+    (0xC0, '\u{00BF}'),
+    (0xC1, '\u{00A1}'),
+    (0xC2, '\u{00AC}'),
+    (0xC3, '\u{221A}'),
+    (0xC4, '\u{0192}'),
+    (0xC5, '\u{2248}'),
+    (0xC6, '\u{2206}'),
     (0xC7, '\u{00AB}'),
     (0xC8, '\u{00BB}'),
     (0xC9, '\u{2026}'),
+    (0xCA, '\u{00A0}'),
+    (0xCB, '\u{00C0}'),
+    (0xCC, '\u{00C3}'),
+    (0xCD, '\u{00D5}'),
+    (0xCE, '\u{0152}'),
+    (0xCF, '\u{0153}'),
     (0xD0, '\u{2013}'),
     (0xD1, '\u{2014}'),
     (0xD2, '\u{201C}'),
     (0xD3, '\u{201D}'),
+    (0xD4, '\u{2018}'),
+    (0xD5, '\u{2019}'),
+    (0xD6, '\u{00F7}'),
+    (0xD7, '\u{25CA}'),
+    (0xD8, '\u{00FF}'),
+    (0xD9, '\u{0178}'),
+    (0xDA, '\u{2044}'),
+    (0xDB, '\u{00A4}'),
+    (0xDC, '\u{2039}'),
+    (0xDD, '\u{203A}'),
+    (0xDE, '\u{FB01}'),
+    (0xDF, '\u{FB02}'),
+    (0xE0, '\u{2021}'),
+    (0xE1, '\u{00B7}'),
+    (0xE2, '\u{201A}'),
+    (0xE3, '\u{201E}'),
+    (0xE4, '\u{2030}'),
+    (0xE5, '\u{00C2}'),
+    (0xE6, '\u{00CA}'),
+    (0xE7, '\u{00C1}'),
+    (0xE8, '\u{00CB}'),
+    (0xE9, '\u{00C8}'),
+    (0xEA, '\u{00CD}'),
+    (0xEB, '\u{00CE}'),
+    (0xEC, '\u{00CF}'),
+    (0xED, '\u{00CC}'),
+    (0xEE, '\u{00D3}'),
+    (0xEF, '\u{00D4}'),
+    (0xF1, '\u{00D2}'),
+    (0xF2, '\u{00DA}'),
+    (0xF3, '\u{00DB}'),
+    (0xF4, '\u{00D9}'),
+    (0xF5, '\u{0131}'),
+    (0xF6, '\u{02C6}'),
+    (0xF7, '\u{02DC}'),
+    (0xF8, '\u{00AF}'),
+    (0xF9, '\u{02D8}'),
+    (0xFA, '\u{02D9}'),
+    (0xFB, '\u{02DA}'),
+    (0xFC, '\u{00B8}'),
+    (0xFD, '\u{02DD}'),
+    (0xFE, '\u{02DB}'),
+    (0xFF, '\u{02C7}'),
 ];
 
 /// Adobe StandardEncoding high range (common subset).
@@ -556,6 +653,18 @@ mod tests {
         apply_base_encoding("WinAnsiEncoding", &mut enc);
         assert_eq!(enc.get(&0x93), Some(&'\u{201C}'));
         assert_eq!(enc.get(&0x41), Some(&'A'));
+    }
+
+    #[test]
+    fn mac_roman_covers_ligatures_and_the_full_high_range() {
+        let mut enc = HashMap::new();
+        apply_base_encoding("MacRomanEncoding", &mut enc);
+        // Core Text writes "fi" and "fl" as MacRoman ligature codes.
+        assert_eq!(enc.get(&0xDE), Some(&'\u{FB01}'));
+        assert_eq!(enc.get(&0xDF), Some(&'\u{FB02}'));
+        assert_eq!(enc.get(&0x8B), Some(&'ã'));
+        assert_eq!(enc.get(&0xF5), Some(&'ı'));
+        assert_eq!((0x80..=0xFFu8).filter(|c| enc.contains_key(c)).count(), 127);
     }
 
     #[test]

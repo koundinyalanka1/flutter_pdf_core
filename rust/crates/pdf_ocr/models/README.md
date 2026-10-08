@@ -8,7 +8,7 @@
 | Weights | 498,033, stored as float16 (997,744 bytes) |
 | Training | `tools/ocr_train`, 32,000 of a planned 80,000 steps × 64 synthetic lines (checkpoint `best.pt`) |
 | Training data | renders of ~330 OFL/Apache font faces; public-domain Gutenberg text; synthetic document strings |
-| Held-out CER | 2.34% degraded / 0.99% clean synthetic lines; 1.45% on 72 real PDF pages in 24 unseen macOS fonts |
+| Held-out CER | 2.34% degraded / 0.99% clean synthetic lines; 1.08% on 72 real PDF pages in 24 unseen macOS fonts |
 
 Known weaknesses:
 

@@ -137,12 +137,10 @@ fonts and public-domain text.
 * Reads printed Latin-script text: English and Western European languages,
   digits, and common document punctuation (208 characters). Handwriting and
   other scripts are not supported.
-* Accuracy: 1.45% character error rate (8.8% word error rate) on 72 pages
+* Accuracy: 1.08% character error rate (7.6% word error rate) on 72 pages
   typeset in 24 macOS fonts the model never trained on, rendered at 300 dpi.
-  Results ranged from 0.5% (Times New Roman, Trebuchet) to 4% (American
-  Typewriter). Some reported errors come from the reference text itself. A
-  page takes about 0.1–0.3 s on an Apple M4 Pro (all cores) and about 1.7 s on
-  one core.
+  A page takes about 0.1–0.3 s on an Apple M4 Pro (all cores) and about
+  1.7 s on one core.
 * Pages that already carry text, born-digital or from earlier OCR, are left
   alone unless `force` is set. The layer renders invisibly, and its word boxes
   match the scanned words, also on pages with `/Rotate`.

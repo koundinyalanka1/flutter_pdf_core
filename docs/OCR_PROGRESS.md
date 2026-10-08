@@ -1,6 +1,7 @@
 # OCR: progress and next steps
 
-Status on 2026-10-08. The work is uncommitted on `main`.
+Status on 2026-10-08, evening. The first part of the work is committed
+("ocr progress"). Changes since then are not committed yet.
 
 ## Done
 
@@ -20,12 +21,11 @@ The engine, its tests and its API are complete. The model works but was trained 
 
 ## Measured
 
-* **Accuracy:** 1.45% CER and 8.8% WER on 72 pages typeset in 24 macOS fonts
-  the model never saw, at 300 dpi. Results ranged from 0.5% (Times New Roman,
-  Trebuchet) to 4% (American Typewriter).
-* **Reference-text errors:** about 20% of the counted errors are not OCR
-  mistakes. OCR correctly reads "fi" and "fl" where the PDFs' own extracted
-  text has "Þ" and "ß" (see the bugs below).
+* **Accuracy:** the bundled step-32,000 model scores 1.08% CER and 7.6% WER
+  on 72 pages typeset in 24 macOS fonts it never saw, at 300 dpi.
+* **Earlier figure:** this was first reported as 1.45%. About a quarter of
+  those errors were in the reference text, from the MacRoman ligature bug, now
+  fixed.
 * **Speed:** about 0.1–0.3 s per page on an Apple M4 Pro using all cores, and
   about 1.7 s on one core.
 * **Size:** the Android arm64 `libpdf_ffi.so` grows from 2.83 MB to 4.23 MB
@@ -36,31 +36,42 @@ The engine, its tests and its API are complete. The model works but was trained 
 
 ## Not done yet, in order
 
-1. **Finish training.**
-   * The bundled model is the step-32,000 checkpoint of an 80,000-step run.
-   * The run's files were in a temporary session directory and may be gone.
-     If so, rerun `tools/ocr_train/prepare_data.sh` and `train.py` from
-     scratch (about 2 hours on an M4 Pro). Otherwise use
-     `train.py --resume <run>/last.pt`.
-   * Then run `export.py --golden …`, which rewrites the model and the golden
-     fixtures, followed by `cargo test -p pdf_ocr` and `pdf_cli ocr-eval`.
-   * Update the accuracy line in the README and in `models/README.md`.
+1. **Finish training (in progress).**
+   * The first run was lost when `/tmp` was cleared, so a full 80,000-step
+     retrain is running.
+   * The new run adds code-style tokens to the training text: snake_case,
+     CamelCase, paths and slash-joined words. These target the underscore,
+     `I`/`l` and `/` errors.
+   * Everything lives in `~/Library/Caches/flutter_pdf_core_ocr`, which
+     survives restarts. The log is `runs/v2.log`; checkpoints are written to
+     `runs/v2/` every 4,000 steps.
+   * If the run stops, resume it with `./train_v2.sh --resume runs/v2/last.pt`.
+   * When it finishes:
+     * run `export.py --checkpoint runs/v2/best.pt --golden …`;
+     * run `cargo test -p pdf_ocr`;
+     * score it with `eval/run_eval.sh eval/pdfs 300`. The baseline to beat is
+       `eval/baseline_32k_fixed_truth.txt`: 1.08% CER.
 2. **Rebuild the checked-in native binaries** (`scripts/build_android.sh`,
    `build_ios.sh`, `build_macos.sh`). They do not contain OCR yet, so the
    Dart calls throw `OCR_UNAVAILABLE`. Cross-compiling for Android arm64 and
    iOS has been checked and works.
 3. **Run clippy.** It is not installed locally; CI runs it.
-4. **Run the on-device integration tests** for OCR (not run).
-5. **Model improvements.** The fixes below need retraining.
-   * Underscores: `textgen.py` strips `_` from the corpus, so `pdf_ops` reads
-     as `pdf ops`.
-   * More `I`/`l`/`1` context.
-   * More typewriter faces.
+4. **Run the on-device integration tests.** An OCR test is now in
+   `example/integration_test`, with the scan embedded as base64.
+   * It can't run yet: the example's macOS build fails before any test starts.
+   * The committed Xcode project uses Swift Package Manager, and the plugin's
+     `macos/flutter_pdf_core/Package.swift` depends on `../FlutterFramework`,
+     which does not exist. That is a pre-existing setup issue, not an OCR one.
+   * The macOS dylib has been rebuilt with OCR (step-32k model).
+5. **Model improvements.**
+   * The running retrain covers underscores, `I`/`l` and `/`, through the new
+     code-style tokens.
+   * Still open: more typewriter faces in the training fonts.
 
-## Bugs found along the way (pre-existing, not fixed)
+## Bugs found along the way (pre-existing)
 
-* `pdf_text/src/font.rs`: the MacRoman table lacks 0xDE→ﬁ and 0xDF→ﬂ (and
-  other entries), so "file" extracts as "Þle" (see `test/sample.pdf`).
+* ~~`pdf_text/src/font.rs`: the MacRoman table lacked 0xDE→ﬁ and 0xDF→ﬂ.~~
+  Fixed: the table now covers the full range (127 codes).
 * `PdfWriter` atomic saves create files with `0600` permissions (inherited
   from `tempfile`).
 

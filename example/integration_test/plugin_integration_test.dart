@@ -4,6 +4,7 @@
 //
 // Run with: flutter test integration_test
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -11,6 +12,8 @@ import 'package:integration_test/integration_test.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'package:flutter_pdf_core/flutter_pdf_core.dart';
+
+import 'scanned_pdf.dart';
 
 // A minimal but complete one-page PDF (no compression).
 const String _tinyPdf = '''%PDF-1.4
@@ -84,6 +87,28 @@ void main() {
     final decrypted = '${dir.path}/dec.pdf';
     PdfCore.decrypt(encrypted, 'pw-123', decrypted);
     expect(PdfCore.pageCount(decrypted), 2);
+  });
+
+  testWidgets('OCR reads a scan and makes it searchable', (tester) async {
+    final scan = '${dir.path}/scan.pdf';
+    File(scan).writeAsBytesSync(base64Decode(scannedPdfBase64));
+    expect(PdfCore.extractText(scan).trim(), isEmpty, reason: 'image only');
+
+    final page = await PdfCore.ocrPage(scan, page: 1);
+    expect(page.status, PdfOcrStatus.recognized);
+    expect(page.text, contains('invoice'));
+    expect(page.text, contains('1,234.56'));
+    expect(page.layout!.hasText, true);
+
+    final searchable = '${dir.path}/searchable.pdf';
+    final report = await PdfCore.makeSearchableAsync(scan, searchable);
+    expect(report.recognized, 1);
+    expect(PdfCore.extractText(searchable), contains('invoice'));
+    final layout = await PdfCore.pageTextLayout(searchable, page: 1);
+    expect(layout.text, page.layout!.text);
+
+    final again = await PdfCore.ocrPage(searchable, page: 1);
+    expect(again.status, PdfOcrStatus.hasOcrLayer);
   });
 
   testWidgets('split and AI export', (tester) async {

@@ -19,29 +19,47 @@ developer machine. Nothing here ships.
 | `prepare_data.sh` | Downloads the fonts and the corpus. |
 | `eval/make_eval_pdfs.swift` | Builds evaluation PDFs in fonts the model never saw (macOS). |
 
-## Reproducing the bundled model
+## Training on an NVIDIA GPU
+
+Recommended: Linux with CUDA. On CUDA the LSTM uses packed sequences (exact
+and fast with cuDNN), CTC loss runs on the GPU, and TF32 is enabled.
 
 ```bash
-DATA=/tmp/ocr-data
+# Ubuntu with an NVIDIA driver. The two font packages are held-out
+# evaluation fonts: none of them is in the training set.
+sudo apt install git curl python3-venv fonts-dejavu-core fonts-urw-base35
+DATA=~/ocr-data RUN=~/ocr-run
 tools/ocr_train/prepare_data.sh "$DATA"
-python3 -m venv /tmp/ocr-venv && /tmp/ocr-venv/bin/pip install torch numpy pillow fonttools
+python3 -m venv ~/ocr-venv && ~/ocr-venv/bin/pip install torch numpy pillow fonttools
 
-# Held-out evaluation fonts: macOS system fonts, none of them in the training set.
-/tmp/ocr-venv/bin/python -I tools/ocr_train/train.py \
-  --fonts-dir "$DATA/google-fonts" --corpus-dir "$DATA/corpus" --out /tmp/ocr-run \
-  --steps 80000 --eval-fonts /System/Library/Fonts/Supplemental/{Arial,Georgia,Verdana}.ttf
+~/ocr-venv/bin/python -I tools/ocr_train/train.py \
+  --fonts-dir "$DATA/google-fonts" --corpus-dir "$DATA/corpus" --out "$RUN" --steps 80000 \
+  --eval-fonts /usr/share/fonts/truetype/dejavu/DejaVu{Sans,Serif,SansMono}.ttf \
+               /usr/share/fonts/opentype/urw-base35/*.otf
+```
 
-/tmp/ocr-venv/bin/python -I tools/ocr_train/export.py --checkpoint /tmp/ocr-run/best.pt \
+* **CPU cores:** drawing training lines is CPU work done by `--workers`
+  processes (default: all cores but two). On a fast GPU the data is the
+  bottleneck, so use a machine with at least 16 vCPUs. Larger `--batch`
+  sizes also help a big GPU.
+* **Checkpoints:** written to `$RUN` at every evaluation (`last.pt`, and
+  `best.pt` for the lowest held-out error). Add `--resume "$RUN/last.pt"` to
+  continue an interrupted run, on the same kind of device.
+* **Export:** works on any machine and needs only the CPU:
+
+```bash
+~/ocr-venv/bin/python -I tools/ocr_train/export.py --checkpoint "$RUN/best.pt" \
   --fonts-dir "$DATA/google-fonts" \
   --out rust/crates/pdf_ocr/models/latin.ocrm \
   --golden rust/crates/pdf_ocr/tests/fixtures
 cd rust && cargo test -p pdf_ocr   # the golden tests hold Rust to PyTorch
 ```
 
-On an Apple M4 Pro (Metal backend), training runs at about 650 lines a second,
-so the full 80,000 steps of 64 lines take a little over two hours. The bundled
-model is the step-32,000 checkpoint of that run, interrupted at 40%. Finishing
-the run (`--resume RUN/last.pt`) should lower its error rate further.
+On a Mac, the same commands train on the Apple GPU at about 650 lines a
+second, a little over two hours for 80,000 steps of 64 lines. There, pass
+macOS system fonts to `--eval-fonts`, for example
+`/System/Library/Fonts/Supplemental/{Arial,Georgia,Verdana}.ttf`. The
+bundled model is the step-32,000 checkpoint of such a run.
 
 ## Data and licences
 
@@ -63,14 +81,14 @@ the run (`--resume RUN/last.pt`) should lower its error rate further.
 on the files `export.py` writes. The model file records its architecture, and
 the engine rejects any file whose shapes do not match it.
 
-Two details look odd but are deliberate:
-
-* The engine appends `TRAILING_PAPER` columns of blank paper after each line.
-  Training batches pad short lines with paper, and the backward LSTM reads
-  through that padding before it reaches the text. Packing sequences would
-  avoid the padding, but it trains three times slower on the Metal backend.
-* CTC loss is computed on the CPU, because the Metal backend does not
-  implement it.
+One detail looks odd but is deliberate. Models trained without packed
+sequences (Apple GPU or CPU) see paper padding after short lines in every
+batch, and their backward LSTM reads through that padding before it reaches
+the text. The engine therefore appends `TRAILING_PAPER` columns of blank paper
+to each line for such models. Packing would avoid the padding, but it trains
+three times slower on Apple's Metal backend. CUDA runs pack, and their models
+need no padding. `export.py` records which applies in the model file, and the
+engine follows it.
 
 ## Measuring accuracy on real documents
 

@@ -58,7 +58,7 @@ def folded(model: Recognizer):
     return [(name, t.detach().cpu().double().numpy()) for name, t in tensors]
 
 
-def write_model(path: Path, tensors, info: dict):
+def write_model(path: Path, tensors, info: dict, trailing_paper: int):
     entries, blob = [], bytearray()
     for name, array in tensors:
         data = array.astype("<f2").tobytes()
@@ -67,7 +67,7 @@ def write_model(path: Path, tensors, info: dict):
         blob += bytes(-len(blob) % 16)
     header = {
         "format": 1, "arch": ARCH, "height": HEIGHT, "stride": STRIDE,
-        "trailing_paper": TRAILING_PAPER, "charset": CHARSET,
+        "trailing_paper": trailing_paper, "charset": CHARSET,
         "convs": CONVS, "pools": POOLS, "hidden": HIDDEN, "tensors": entries, **info,
     }
     encoded = json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -104,16 +104,16 @@ def reference_logits(weights: dict, image: np.ndarray) -> np.ndarray:
     return (features @ weights["head.weight"].T + weights["head.bias"]).numpy()
 
 
-def network_input(line: np.ndarray) -> np.ndarray:
+def network_input(line: np.ndarray, trailing_paper: int) -> np.ndarray:
     """The normalized line as the engine feeds it: width rounded up to the
     stride, then trailing paper."""
-    width = -(-line.shape[1] // STRIDE) * STRIDE + TRAILING_PAPER
+    width = -(-line.shape[1] // STRIDE) * STRIDE + trailing_paper
     padded = np.zeros((HEIGHT, width), dtype=np.float32)
     padded[:, :line.shape[1]] = line
     return padded
 
 
-def write_golden(directory: Path, tensors, fonts_dir: Path):
+def write_golden(directory: Path, tensors, fonts_dir: Path, trailing_paper: int):
     from PIL import Image, ImageDraw, ImageFont
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -127,7 +127,7 @@ def write_golden(directory: Path, tensors, fonts_dir: Path):
     ys, xs = np.nonzero(pixels < 128)
     ink = (float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1))
     line = normalize(pixels, crop_rect(ink, pixels.shape[1], pixels.shape[0]))
-    image = network_input(line)
+    image = network_input(line, trailing_paper)
     logits = reference_logits(weights, image)
     text = decode_greedy(logits[: -(-line.shape[1] // STRIDE)].argmax(1))
     with (directory / "golden_net.bin").open("wb") as out:
@@ -174,10 +174,12 @@ def main():
     tensors = folded(model)
     info = {"name": args.name, "steps": state.get("step"),
             "cer": {k: round(float(v), 5) for k, v in state.get("scores", {}).items()}}
-    size = write_model(args.out, tensors, info)
+    # Models trained with packed sequences (CUDA) never saw padding.
+    trailing_paper = 0 if state.get("packed", False) else TRAILING_PAPER
+    size = write_model(args.out, tensors, info, trailing_paper)
     print(f"wrote {args.out} ({size:,} bytes, {sum(a.size for _, a in tensors):,} weights)")
     if args.golden:
-        text = write_golden(args.golden, tensors, args.fonts_dir)
+        text = write_golden(args.golden, tensors, args.fonts_dir, trailing_paper)
         print(f"golden line decodes as {text!r}")
 
 

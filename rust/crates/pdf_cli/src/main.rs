@@ -319,10 +319,22 @@ fn parse_ranges(spec: &str, page_count: usize) -> Result<Vec<usize>> {
     Ok(out)
 }
 
-/// Whitespace collapsed to single spaces: line breaks are layout, not text,
-/// when scoring recognition.
+/// Text as recognition is scored: ligatures spelled out (the recognizer
+/// reads "ﬁ" as "fi") and whitespace collapsed to single spaces, since line
+/// breaks are layout rather than text.
 fn single_spaced(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let spelled: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{FB00}' => "ff".to_owned(),
+            '\u{FB01}' => "fi".to_owned(),
+            '\u{FB02}' => "fl".to_owned(),
+            '\u{FB03}' => "ffi".to_owned(),
+            '\u{FB04}' => "ffl".to_owned(),
+            other => other.to_string(),
+        })
+        .collect();
+    spelled.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn edit_distance<T: PartialEq>(a: &[T], b: &[T]) -> usize {

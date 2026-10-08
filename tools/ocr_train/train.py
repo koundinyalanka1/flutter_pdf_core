@@ -10,6 +10,7 @@ character error rate it reports is then a fair estimate for unseen fonts.
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -118,14 +119,24 @@ def main():
     parser.add_argument("--steps", type=int, default=60_000)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2),
+                        help="data processes; drawing lines is CPU work, so give it most cores")
     parser.add_argument("--eval-every", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        # TF32 matmuls and convolutions: much faster on Ampere and later, and
+        # far more precise than this model needs.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     torch.manual_seed(args.seed)
     faces = scan_faces(sorted(args.fonts_dir.rglob("*.tt[fc]")))
     eval_faces = scan_faces(args.eval_fonts)
@@ -135,7 +146,9 @@ def main():
         "clean": fixed_set(eval_faces, args.corpus_dir, 500, 0.0, 4321),
     }
 
-    model = Recognizer(CLASSES).to(device)
+    # Packed sequences are exact and fast with cuDNN; elsewhere the model pads
+    # (see TRAILING_PAPER in model.py).
+    model = Recognizer(CLASSES, packed=device.type == "cuda").to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     schedule = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.steps,
                                                    pct_start=0.04, div_factor=20, final_div_factor=200)
@@ -146,12 +159,14 @@ def main():
         optimizer.load_state_dict(state["optimizer"])
         schedule.load_state_dict(state["schedule"])
         step, best = state["step"], state.get("best", best)
+        if state.get("packed", False) != model.packed:
+            raise SystemExit("resume on the same kind of device the run started on")
     print(f"{sum(p.numel() for p in model.parameters()):,} parameters", flush=True)
 
     ctc = torch.nn.CTCLoss(blank=0, zero_infinity=True)
     loader = DataLoader(Lines(faces, args.corpus_dir, args.batch, args.seed + step),
                         batch_size=None, num_workers=args.workers, prefetch_factor=4,
-                        persistent_workers=True)
+                        persistent_workers=True, pin_memory=device.type == "cuda")
     log = (args.out / "log.jsonl").open("a")
     started, seen, running = time.time(), 0, []
     model.train()
@@ -159,8 +174,7 @@ def main():
         if step >= args.steps:
             break
         logits, lengths = model(images.to(device, non_blocking=True), widths)
-        # CTC runs on the CPU: the Metal backend does not implement it.
-        loss = ctc(logits.log_softmax(2).cpu(), targets, lengths, target_lengths)
+        loss = ctc(logits.log_softmax(2), targets.to(device), lengths.to(device), target_lengths.to(device))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -185,7 +199,8 @@ def main():
             log.write(json.dumps({"step": step, **{f"cer_{k}": v for k, v in scores.items()}}) + "\n")
             log.flush()
             state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                     "schedule": schedule.state_dict(), "step": step, "best": best, "scores": scores}
+                     "schedule": schedule.state_dict(), "step": step, "best": best, "scores": scores,
+                     "packed": model.packed}
             torch.save(state, args.out / "last.pt")
             if scores["degraded"] < best:
                 best = state["best"] = scores["degraded"]

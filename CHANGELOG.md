@@ -18,6 +18,8 @@
   size and a scaled text matrix no longer gain spaces at kerning gaps.
 * Text extraction tracks the text rendering mode; `page_text_stats` counts a
   page's visible, invisible and unmapped text.
+* `MacRomanEncoding` decodes the whole high range. Before, the fi and fl
+  ligatures that macOS writes for "file" or "flat" came out as "Þ" and "ß".
 * Pin parsed documents: `pdf_document_open`/`pdf_document_close`
   (`PdfCore.openDocument`/`closeDocument`) keep one parse in memory, and
   read-only calls on the same path and password share it while the file is

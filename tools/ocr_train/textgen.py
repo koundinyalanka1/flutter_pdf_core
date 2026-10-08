@@ -235,8 +235,46 @@ def _formula(source, rng):
     ]))
 
 
+NAME_PARTS = ["pdf", "ops", "page", "tree", "max", "chars", "file", "name", "user", "id", "data",
+              "text", "layout", "glyph", "font", "render", "core", "doc", "path", "out", "len",
+              "index", "count", "size", "width", "image", "stream", "object", "ref", "cache",
+              "config", "value", "key", "list", "map", "item", "indirect", "last", "error", "io"]
+
+
+def _name(rng) -> str:
+    """An identifier as code and technical writing spell them."""
+    parts = [NAME_PARTS[int(rng.integers(len(NAME_PARTS)))] for _ in range(int(rng.integers(2, 4)))]
+    style = rng.random()
+    if style < 0.35:
+        return "_".join(parts)
+    if style < 0.6:
+        return "".join(p.capitalize() for p in parts)  # ObjectId, IndirectObject
+    if style < 0.7:
+        return parts[0] + "".join(p.capitalize() for p in parts[1:])
+    if style < 0.8:
+        return "_".join(parts).upper()
+    if style < 0.85:
+        return f"__{parts[0]}__"
+    return "_".join(parts) + str(rng.choice([".rs", ".py", ".dart", ".txt", ".pdf", ".json", ".md"]))
+
+
+def _code(source, rng):
+    """Identifiers, paths and calls: underscores, CamelCase (where I and l
+    must be told apart by context) and slash-joined words."""
+    n = lambda: _name(rng)  # noqa: E731
+    words = source.word_salad(rng).split(" ")
+    return str(rng.choice([
+        f"{n()}::{n()}", f"{n()}({n()}, {n()})", f"let {n()} = {n()}.{n()}();",
+        "/".join(n() for _ in range(int(rng.integers(2, 5)))), f"{n()}<{n()}, {n()}>",
+        f"--{n().replace('_', '-')}", f"{n()}[{rng.integers(0, 100)}] = {n()};",
+        f"C:\\Users\\{n()}\\{n()}.pdf", "/".join(words[:3]),
+        f"{source.prose(rng, 30)} {n()} {source.prose(rng, 20)}",
+    ]))
+
+
 DOCUMENT_TEMPLATES = [
     lambda s, r: _amount(r), lambda s, r: _date(r), lambda s, r: _identifier(r),
     lambda s, r: _contact(r), _heading, _list_item, _table_row, _form_field, _formula,
     lambda s, r: f"{s.prose(r, 40)} {_amount(r)}", lambda s, r: f"{_date(r)} {s.prose(r, 40)}",
+    _code, _code,
 ]
