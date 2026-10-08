@@ -54,6 +54,28 @@ impl Matrix {
             self.b * x + self.d * y + self.f,
         )
     }
+
+    /// The linear part only: where a direction vector goes.
+    pub fn transform_vector(&self, x: f64, y: f64) -> (f64, f64) {
+        (self.a * x + self.c * y, self.b * x + self.d * y)
+    }
+
+    /// The inverse transform, when the matrix is invertible.
+    pub fn invert(&self) -> Option<Matrix> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-12 || !det.is_finite() {
+            return None;
+        }
+        let (a, b, c, d) = (self.d / det, -self.b / det, -self.c / det, self.a / det);
+        Some(Matrix {
+            a,
+            b,
+            c,
+            d,
+            e: -(self.e * a + self.f * c),
+            f: -(self.e * b + self.f * d),
+        })
+    }
 }
 
 /// Text state parameters (PDF 9.3).
@@ -65,6 +87,7 @@ pub struct TextState {
     pub leading: f64,      // TL
     pub font_size: f64,    // Tf size
     pub rise: f64,         // Ts
+    pub render_mode: i64,  // Tr
     pub font_key: Option<String>,
 }
 
@@ -77,8 +100,17 @@ impl Default for TextState {
             leading: 0.0,
             font_size: 0.0,
             rise: 0.0,
+            render_mode: 0,
             font_key: None,
         }
+    }
+}
+
+impl TextState {
+    /// Modes 3 (neither fill nor stroke) and 7 (clip only) paint nothing:
+    /// typically an OCR layer over a scanned image.
+    pub fn is_invisible(&self) -> bool {
+        matches!(self.render_mode, 3 | 7)
     }
 }
 

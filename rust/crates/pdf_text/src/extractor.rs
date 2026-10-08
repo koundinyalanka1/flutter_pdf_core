@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use pdf_core::document::PdfDocument;
 use pdf_core::error::{PdfError, Result};
 use pdf_core::object::{Dictionary, ObjectId, PdfObject};
+use serde::Serialize;
 
 use crate::content_stream::{parse_content, Operation};
 use crate::font::{load_font, Font};
@@ -17,6 +18,43 @@ use crate::layout::{
     PageGeometry, PageTextLayout, TextGlyph,
 };
 use crate::text_state::{Matrix, TextObject, TextState};
+
+/// What kind of text a page carries: enough to tell a born-digital page from
+/// a scan, and a scan from one that already has an OCR layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TextStats {
+    /// Non-blank characters drawn visibly.
+    pub visible_chars: usize,
+    /// Non-blank characters drawn invisibly (text rendering modes 3 and 7),
+    /// as OCR layers are.
+    pub invisible_chars: usize,
+    /// Glyphs with no Unicode meaning: text that is on the page but cannot be
+    /// extracted (a font without a ToUnicode map, for instance).
+    pub unmapped_glyphs: usize,
+}
+
+/// Count the text on one page (0-based).
+pub fn page_text_stats(doc: &PdfDocument, page_index: usize) -> Result<TextStats> {
+    let page_ids = doc
+        .collect_page_ids()
+        .ok_or_else(|| PdfError::Structure("document has no page tree".into()))?;
+    let &page_id = page_ids
+        .get(page_index)
+        .ok_or(PdfError::PageIndex(page_index))?;
+    let content = page_content(doc, page_id)?;
+    let resources = inherited_attribute(doc, page_id, "Resources")
+        .and_then(|o| o.as_dict().cloned())
+        .unwrap_or_default();
+    let mut extractor = Extractor::new(doc);
+    extractor.run(
+        &content,
+        &resources,
+        Matrix::IDENTITY,
+        0,
+        TextState::default(),
+    )?;
+    Ok(extractor.stats)
+}
 
 /// Extract text from every page.
 pub fn extract_all_pages(doc: &PdfDocument) -> Result<Vec<String>> {
@@ -149,9 +187,7 @@ struct Extractor<'a> {
     utf16_len: usize,
     last_baseline: Option<Baseline>,
     out: String,
-    last_y: Option<f64>,
-    last_x_end: f64,
-    last_size: f64,
+    stats: TextStats,
 }
 
 struct LoadedFont {
@@ -179,9 +215,7 @@ impl<'a> Extractor<'a> {
             utf16_len: 0,
             last_baseline: None,
             out: String::new(),
-            last_y: None,
-            last_x_end: 0.0,
-            last_size: 12.0,
+            stats: TextStats::default(),
         }
     }
 
@@ -255,6 +289,9 @@ impl<'a> Extractor<'a> {
                 "Tz" => state.horiz_scale = num(&operands, 0) / 100.0,
                 "TL" => state.leading = num(&operands, 0),
                 "Ts" => state.rise = num(&operands, 0),
+                "Tr" => {
+                    state.render_mode = operands.first().and_then(PdfObject::as_i64).unwrap_or(0)
+                }
                 "Tf" => {
                     state.font_key = operands.first().and_then(|o| o.as_name()).map(|name| {
                         let key = format!("{scope}:{name}");
@@ -466,14 +503,21 @@ impl<'a> Extractor<'a> {
         };
 
         let has_text = glyphs.iter().any(|g| !g.0.is_empty());
+        for (decoded, _, _) in &glyphs {
+            if decoded.is_empty() {
+                self.stats.unmapped_glyphs += 1;
+                continue;
+            }
+            let chars = decoded.chars().filter(|c| !c.is_whitespace()).count();
+            if state.is_invisible() {
+                self.stats.invisible_chars += chars;
+            } else {
+                self.stats.visible_chars += chars;
+            }
+        }
         let user_matrix = text.text_matrix.multiply(ctm);
         if has_text {
-            if self.geometry.is_some() {
-                self.layout_position_break(user_matrix, state);
-            } else {
-                let (x, y) = text.position(ctm);
-                self.position_break(x, y, state.font_size.max(1.0));
-            }
+            self.position_break(user_matrix, state);
         }
         for (decoded, advance, rect) in glyphs {
             let start = self.utf16_len;
@@ -508,10 +552,7 @@ impl<'a> Extractor<'a> {
                 text.advance(advance);
             }
         }
-        let (x_end, _) = text.position(ctm);
-        self.last_x_end = x_end;
-        self.last_size = state.font_size.max(1.0);
-        if self.geometry.is_some() && has_text {
+        if has_text {
             let scale = user_matrix.a.hypot(user_matrix.b).max(1e-8);
             let sign = (state.font_size * state.horiz_scale).signum();
             self.last_baseline = Some(Baseline {
@@ -522,9 +563,11 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Project gaps onto the previous baseline instead of assuming all text
-    /// runs horizontally. This preserves words split across TJ on rotated text.
-    fn layout_position_break(&mut self, matrix: Matrix, state: &TextState) {
+    /// Insert spaces and newlines from the gap to the previous run, measured
+    /// along and across the previous baseline instead of assuming all text
+    /// runs horizontally. This keeps words split across TJ together on
+    /// rotated text, such as an OCR layer on a page with /Rotate.
+    fn position_break(&mut self, matrix: Matrix, state: &TextState) {
         let Some(last) = &self.last_baseline else {
             return;
         };
@@ -542,31 +585,6 @@ impl<'a> Extractor<'a> {
         } else if along > 0.25 * size && !self.out.ends_with([' ', '\n']) && !self.out.is_empty() {
             self.append(" ");
         }
-    }
-
-    /// Insert spaces / newlines based on position deltas.
-    fn position_break(&mut self, x: f64, y: f64, size: f64) {
-        match self.last_y {
-            None => {}
-            Some(last_y) => {
-                let dy = (last_y - y).abs();
-                if dy > 0.5 * size.min(self.last_size) {
-                    // Larger vertical gaps become paragraph breaks.
-                    if dy > 1.8 * self.last_size {
-                        self.append("\n\n");
-                    } else {
-                        self.append("\n");
-                    }
-                } else {
-                    let gap = x - self.last_x_end;
-                    if gap > 0.25 * size && !self.out.ends_with([' ', '\n']) && !self.out.is_empty()
-                    {
-                        self.append(" ");
-                    }
-                }
-            }
-        }
-        self.last_y = Some(y);
     }
 }
 
@@ -697,6 +715,50 @@ mod tests {
             PdfObject::Stream(pdf_core::stream::PdfStream::new(dict, compressed)),
         );
         assert_eq!(extract_page_text(&doc, 0).unwrap(), "Compressed!");
+    }
+
+    #[test]
+    fn rotated_word_runs_stay_on_one_line() {
+        // An OCR layer on a /Rotate 90 page: each word positioned on its own,
+        // advancing up the page.
+        let doc = doc_with_content(
+            b"BT /F1 12 Tf 0 1 -1 0 100 50 Tm (Rotated) Tj 0 1 -1 0 100 102 Tm (scan) Tj \
+              0 1 -1 0 116 50 Tm (page) Tj ET",
+        );
+        assert_eq!(extract_page_text(&doc, 0).unwrap(), "Rotated scan\npage");
+    }
+
+    #[test]
+    fn gaps_are_judged_against_the_scaled_font_size() {
+        // A word split into two runs by a half-point kerning gap, set with a
+        // unit font size scaled up by the text matrix.
+        let doc = doc_with_content(
+            b"BT /F1 1 Tf 12 0 0 12 72 720 Tm (Hel) Tj 12 0 0 12 90.5 720 Tm (lo) Tj \
+              12 0 0 12 130 720 Tm (world) Tj ET",
+        );
+        assert_eq!(extract_page_text(&doc, 0).unwrap(), "Hello world");
+    }
+
+    #[test]
+    fn text_stats_separate_visible_invisible_and_unmapped_text() {
+        let doc = doc_with_content(b"BT /F1 12 Tf 72 720 Td (Seen it) Tj 3 Tr (OCR) Tj 0 Tr ET");
+        let stats = page_text_stats(&doc, 0).unwrap();
+        assert_eq!(
+            stats,
+            TextStats {
+                visible_chars: 6,
+                invisible_chars: 3,
+                unmapped_glyphs: 0
+            }
+        );
+        // Two-byte codes with no ToUnicode map decode to nothing.
+        let mut doc = doc_with_content(b"BT /F1 12 Tf 72 720 Td <00010002> Tj ET");
+        let font_id = ObjectId::new(1, 0);
+        let mut font = doc.resolve(font_id).unwrap().as_dict().unwrap().clone();
+        font.insert("Subtype".into(), PdfObject::Name("Type0".into()));
+        font.insert("Encoding".into(), PdfObject::Name("Identity-H".into()));
+        doc.set_object(font_id, PdfObject::Dictionary(font));
+        assert_eq!(page_text_stats(&doc, 0).unwrap().unmapped_glyphs, 2);
     }
 
     #[test]

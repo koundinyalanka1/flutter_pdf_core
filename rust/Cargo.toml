@@ -6,6 +6,7 @@ members = [
   "crates/pdf_render",
   "crates/pdf_text",
   "crates/pdf_ai",
+  "crates/pdf_ocr",
   "crates/pdf_ffi",
   "crates/pdf_cli"
 ]

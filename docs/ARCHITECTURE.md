@@ -15,6 +15,8 @@
 │  pdf_ffi   extern "C" surface, panic guards, range parsing │
 │  pdf_cli   developer CLI (same ops, for manual testing)    │
 │     │                                                      │
+│  pdf_ocr   page analysis, recognizer, text layers (M14)    │
+│  pdf_render CPU rasterizer, fonts, images      (M13)       │
 │  pdf_ai    chunker + JSON/NDJSON export        (M9)        │
 │  pdf_text  content streams, fonts, extraction  (M8)        │
 │  pdf_ops   page tree, split/merge/rotate/meta  (M3–M6)     │
@@ -33,6 +35,19 @@
 **Decrypt at load, encrypt at save.** Encrypted input is decrypted into plain objects during `from_bytes_with_password` (strings + streams, object streams handled before expansion). The writer always emits decrypted output; `crypt::encrypt_to_bytes` produces an AES-256 (R6) protected file as an explicit step.
 
 **Errors are typed.** `PdfError` covers parse/xref/filter/crypt/structure cases; the FFI maps them to stable codes (`ENCRYPTED`, `WRONG_PASSWORD`, `NOT_A_PDF`, `PAGE_OUT_OF_RANGE`, `ERROR`, `PANIC`) surfaced in Dart as `PdfException`.
+
+**OCR from scratch.** `pdf_ocr` finds text with classical image analysis.
+That covers Sauvola binarization, run-based connected components, skew and
+orientation detection, a line sweep, and XY-cut reading order. It reads each
+line with a small CNN + bidirectional LSTM network decoded by CTC. Inference is
+plain Rust (im2col + blocked matmul over float16 weights expanded at load).
+The weights come from `tools/ocr_train`, which runs offline in PyTorch on
+synthetic text lines rendered from OFL/Apache fonts and degraded like scans.
+Golden tests hold the Rust line normalization and network to their Python
+originals. Recognized words go back into the page as an invisible text layer:
+a Type0 font over an embedded glyphless TrueType, a ToUnicode map, and
+rendering mode 3. Every existing text feature reads that layer unchanged:
+extraction, selection geometry, AI export, and other viewers.
 
 **Stateless FFI.** Every native call opens the file, operates, saves, and returns. No cross-call handles, no lifetime bugs, trivially thread-safe; the OS page cache keeps repeat opens fast. If profiling ever shows this matters for huge documents, a handle-based API can be added without breaking the current one.
 

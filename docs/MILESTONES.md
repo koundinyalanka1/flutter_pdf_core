@@ -84,6 +84,46 @@ Chosen approach: **hand-written C ABI + `dart:ffi`** (zero codegen, zero runtime
 
 **Next steps:** prebuilt-binary releases (GitHub Releases) so plugin consumers don't need a Rust toolchain; Windows/Linux desktop packaging.
 
+## M14 — OCR, from scratch ✅
+
+`pdf_ocr` finds and reads printed text with no OCR or machine-learning
+dependency.
+
+**Finding the text.** Sauvola binarization in O(row) memory, 8-connected
+components labelled run by run, and skew measured from how glyph bottoms line
+up. Pages scanned sideways are detected from how glyph centres cluster;
+upside-down pages, from the network reading sample lines both ways round.
+Lines are built by a sweep that splits at column gutters and attaches dots,
+accents and dashes, and they are ordered by XY-cut, columns first.
+
+**Reading it.** A 5-layer CNN with a bidirectional LSTM (128), decoded with
+CTC: 208 characters, about 500k weights, a 1 MB float16 model compiled into
+the library. `tools/ocr_train` trains it on synthetic lines and exports
+golden data. The Rust normalization matches Python to 1e-5, and the network
+matches PyTorch's logits to 2e-3.
+
+**Writing it back.** An invisible text layer with exact word boxes:
+* level lines are set as per-word `Tz` runs;
+* rotated lines are set as one kerned `TJ` each, so Apple PDFKit keeps them
+  together;
+* the original content is isolated in `q`/`Q`.
+
+`pdf_page_text_layout_json` reports the layer exactly as `pdf_ocr_page_json`
+predicted it, and rendering is pixel-identical. Pages with text, or with an
+earlier OCR layer, are skipped unless forced.
+
+Alongside it, `pdf_text` plain-text extraction now judges spaces and line
+breaks along each run's baseline, as the layout path already did. Rotated
+text, and text set with a unit font size scaled by the text matrix, extracts
+correctly. It also tracks the text rendering mode, which `page_text_stats`
+reports.
+
+**Known limitations:** Latin script only, printed text only; tables read
+column by column; no text inside photographs or white-on-black areas.
+
+**Next steps:** models for other scripts (Devanagari, CJK, Cyrillic) from the
+same pipeline; table structure; a dictionary-guided beam search for CTC.
+
 ---
 
 ## Roadmap (beyond M12)

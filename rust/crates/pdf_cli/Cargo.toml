@@ -8,5 +8,6 @@ pdf_core = { path = "../pdf_core" }
 pdf_ops = { path = "../pdf_ops" }
 pdf_text = { path = "../pdf_text" }
 pdf_ai = { path = "../pdf_ai" }
+pdf_ocr = { path = "../pdf_ocr" }
 anyhow.workspace = true
 serde_json.workspace = true

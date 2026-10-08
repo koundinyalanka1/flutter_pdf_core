@@ -272,6 +272,7 @@ dependencies = [
  "anyhow",
  "pdf_ai",
  "pdf_core",
+ "pdf_ocr",
  "pdf_ops",
  "pdf_text",
  "serde_json",
@@ -298,6 +299,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pdf_ai",
+ "pdf_core",
+ "pdf_ocr",
+ "pdf_ops",
+ "pdf_render",
+ "pdf_text",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pdf_ocr"
+version = "0.1.0"
+dependencies = [
  "pdf_core",
  "pdf_ops",
  "pdf_render",

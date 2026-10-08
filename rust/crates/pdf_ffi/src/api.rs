@@ -1047,6 +1047,195 @@ pub unsafe extern "C" fn pdf_images_to_pdf(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 14: OCR
+// ---------------------------------------------------------------------------
+
+/// OCR options as JSON; every field is optional and an empty string means
+/// all defaults: `{"dpi":300,"force":false,"minConfidence":0.5,"deskew":true,
+/// "detectOrientation":true,"threads":0}`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct OcrOptionsJson {
+    dpi: Option<f64>,
+    force: bool,
+    min_confidence: Option<f32>,
+    deskew: Option<bool>,
+    detect_orientation: Option<bool>,
+    threads: Option<usize>,
+}
+
+fn ocr_options(json: &str) -> Result<pdf_ocr::PdfOcrOptions, PdfError> {
+    let parsed: OcrOptionsJson = if json.trim().is_empty() {
+        OcrOptionsJson::default()
+    } else {
+        serde_json::from_str(json).map_err(|e| PdfError::Structure(format!("OCR options: {e}")))?
+    };
+    let mut options = pdf_ocr::PdfOcrOptions::default();
+    if let Some(dpi) = parsed.dpi {
+        options.dpi = dpi;
+    }
+    options.force = parsed.force;
+    if let Some(confidence) = parsed.min_confidence {
+        options.engine.min_confidence = confidence.clamp(0.0, 1.0);
+    }
+    if let Some(deskew) = parsed.deskew {
+        options.engine.deskew = deskew;
+    }
+    if let Some(detect) = parsed.detect_orientation {
+        options.engine.detect_orientation = detect;
+    }
+    if let Some(threads) = parsed.threads {
+        options.engine.threads = threads.min(64);
+    }
+    Ok(options)
+}
+
+/// Recognize the text on one page (1-based) with the built-in engine.
+///
+/// Returns JSON `{page,status,width,height,dpi,skewDegrees,orientationDegrees,confidence,text,
+/// lines:[{text,confidence,bounds,words:[{text,confidence,quad,bounds}]}],
+/// layout}`. Coordinates are displayed page points with a top-left origin,
+/// like `pdf_page_text_layout_json`, and `layout` is exactly what that
+/// function will report once the page carries this text (see
+/// `pdf_make_searchable_json`). `status` is `recognized` or `noText`; pages
+/// that already have text report `hasText` or `hasOcrLayer` with no lines
+/// and a null layout, unless `force` is set. Options: see `OcrOptionsJson`.
+/// Free the result with `pdf_free_string`; NULL means `pdf_last_error`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_ocr_page_json(
+    path: *const c_char,
+    password: *const c_char,
+    page: c_int,
+    options_json: *const c_char,
+) -> *mut c_char {
+    if page < 1 {
+        set_error(format!(
+            "PAGE_OUT_OF_RANGE: page index {page} must be 1-based"
+        ));
+        return std::ptr::null_mut();
+    }
+    let (Ok(path), Ok(password), Ok(options)) = (cstr(path), cstr(password), cstr(options_json))
+    else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let options = ocr_options(options)?;
+        let doc = open_for_reading(path, password)?;
+        let index = (page - 1) as usize;
+        if index >= doc.page_count().unwrap_or(0) as usize {
+            return Err(PdfError::PageIndex(index));
+        }
+        if !options.force {
+            if let Some(status) = pdf_ocr::pdf::existing_text(&doc, index)? {
+                let value = serde_json::json!({
+                    "page": page, "status": status, "text": "", "confidence": 0.0,
+                    "lines": [], "layout": null,
+                });
+                return Ok(value.to_string());
+            }
+        }
+        let ocr =
+            pdf_ocr::pdf::recognize_page(&doc, index, pdf_ocr::OcrEngine::embedded(), &options)?;
+        let layout = pdf_ocr::pdf::ocr_layout(&doc, &ocr)?;
+        let status = if ocr.lines.is_empty() {
+            pdf_ocr::PageStatus::NoText
+        } else {
+            pdf_ocr::PageStatus::Recognized
+        };
+        let value = serde_json::json!({
+            "page": page, "status": status, "width": ocr.width, "height": ocr.height,
+            "dpi": ocr.dpi, "skewDegrees": ocr.skew_degrees,
+            "orientationDegrees": ocr.orientation_degrees, "confidence": ocr.mean_confidence(),
+            "text": ocr.text(), "lines": ocr.lines, "layout": layout,
+        });
+        Ok(value.to_string())
+    })
+}
+
+/// Recognize the selected pages ("1-3,5"; empty = all) and save a copy with
+/// invisible text layers to `out_path`, so their text can be searched,
+/// selected and extracted. Pages that already have text are left alone
+/// unless `force` is set. Like the other writing operations, the copy is
+/// saved without encryption.
+///
+/// Returns a JSON report `{recognized, pages:[{page,status,words,confidence}]}`.
+/// Free it with `pdf_free_string`; NULL means `pdf_last_error`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_make_searchable_json(
+    path: *const c_char,
+    password: *const c_char,
+    pages: *const c_char,
+    options_json: *const c_char,
+    out_path: *const c_char,
+) -> *mut c_char {
+    let (Ok(path), Ok(password), Ok(pages), Ok(options), Ok(out)) = (
+        cstr(path),
+        cstr(password),
+        cstr(pages),
+        cstr(options_json),
+        cstr(out_path),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let options = ocr_options(options)?;
+        let mut doc = open(path, password)?;
+        let indices = parse_ranges(pages, doc.page_count().unwrap_or(0) as usize)?;
+        let reports = pdf_ocr::pdf::make_searchable(
+            &mut doc,
+            &indices,
+            pdf_ocr::OcrEngine::embedded(),
+            &options,
+        )?;
+        doc.save_as(out)?;
+        let recognized = reports
+            .iter()
+            .filter(|r| r.status == pdf_ocr::PageStatus::Recognized)
+            .count();
+        Ok(serde_json::json!({ "recognized": recognized, "pages": reports }).to_string())
+    })
+}
+
+/// Save a copy of the document with invisible text layers built from OCR
+/// results computed elsewhere: by another engine, or by `pdf_ocr_page_json`
+/// on each page in turn (which lets a caller show progress page by page and
+/// still write the file once).
+///
+/// `ocr_json` is an array of `{page, lines:[{words:[{text, quad|bounds}]}]}`
+/// in displayed page points; pages are 1-based. Returns the number of pages
+/// that received text, or -1 with `pdf_last_error`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_apply_ocr_json(
+    path: *const c_char,
+    password: *const c_char,
+    ocr_json: *const c_char,
+    out_path: *const c_char,
+) -> c_int {
+    let (Ok(path), Ok(password), Ok(json), Ok(out)) =
+        (cstr(path), cstr(password), cstr(ocr_json), cstr(out_path))
+    else {
+        return -1;
+    };
+    run_int(|| {
+        let pages: Vec<pdf_ocr::pdf::ExternalPage> = serde_json::from_str(json)
+            .map_err(|e| PdfError::Structure(format!("OCR results: {e}")))?;
+        let mut doc = open(path, password)?;
+        let written = pdf_ocr::pdf::apply_ocr(&mut doc, &pages)?;
+        doc.save_as(out)?;
+        Ok(written as i64)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,6 +1616,103 @@ mod tests {
             .is_null());
             assert_eq!((width, height), (0, 0));
         }
+    }
+
+    #[test]
+    fn ocr_reads_a_scan_and_its_text_then_comes_out_of_the_text_apis() {
+        let dir = scratch_dir("ocr");
+        let scan = dir.join("scan.pdf");
+        std::fs::write(&scan, include_bytes!("../../../fixtures/scanned.pdf")).unwrap();
+        let (scan_c, empty) = (c(scan.to_str().unwrap()), c(""));
+        let json_at = |ptr: *mut c_char| -> serde_json::Value {
+            assert!(!ptr.is_null(), "{}", unsafe { last_error() });
+            let value =
+                serde_json::from_str(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()).unwrap();
+            unsafe { pdf_free_string(ptr) };
+            value
+        };
+        unsafe {
+            let page = json_at(pdf_ocr_page_json(
+                scan_c.as_ptr(),
+                empty.as_ptr(),
+                1,
+                empty.as_ptr(),
+            ));
+            assert_eq!(page["status"], "recognized");
+            let text = page["text"].as_str().unwrap();
+            assert!(
+                text.contains("invoice") && text.contains("1,234.56"),
+                "{text}"
+            );
+
+            // Writing what was read gives exactly the layout promised.
+            let applied = dir.join("applied.pdf");
+            let applied_c = c(applied.to_str().unwrap());
+            let results =
+                c(&serde_json::json!([{ "page": 1, "lines": page["lines"] }]).to_string());
+            assert_eq!(
+                pdf_apply_ocr_json(
+                    scan_c.as_ptr(),
+                    empty.as_ptr(),
+                    results.as_ptr(),
+                    applied_c.as_ptr()
+                ),
+                1
+            );
+            let layout = json_at(pdf_page_text_layout_json(
+                applied_c.as_ptr(),
+                empty.as_ptr(),
+                1,
+            ));
+            assert_eq!(layout, page["layout"]);
+
+            // Or in one step; a second pass then leaves the page alone.
+            let searchable = c(dir.join("searchable.pdf").to_str().unwrap());
+            let report = json_at(pdf_make_searchable_json(
+                scan_c.as_ptr(),
+                empty.as_ptr(),
+                empty.as_ptr(),
+                empty.as_ptr(),
+                searchable.as_ptr(),
+            ));
+            assert_eq!(report["recognized"], 1);
+            assert_eq!(report["pages"][0]["status"], "recognized");
+            let extracted = pdf_extract_text(searchable.as_ptr(), empty.as_ptr(), 1);
+            assert!(CStr::from_ptr(extracted)
+                .to_str()
+                .unwrap()
+                .contains("invoice"));
+            pdf_free_string(extracted);
+            let again = json_at(pdf_ocr_page_json(
+                searchable.as_ptr(),
+                empty.as_ptr(),
+                1,
+                empty.as_ptr(),
+            ));
+            assert_eq!(
+                (again["status"].as_str(), again["layout"].is_null()),
+                (Some("hasOcrLayer"), true)
+            );
+
+            for (page, options, code) in [
+                (2, "", "PAGE_OUT_OF_RANGE"),
+                (0, "", "PAGE_OUT_OF_RANGE"),
+                (1, r#"{"dpi": 5}"#, "ERROR"),
+                (1, r#"{"colour": true}"#, "ERROR"),
+            ] {
+                let options = c(options);
+                assert!(
+                    pdf_ocr_page_json(scan_c.as_ptr(), empty.as_ptr(), page, options.as_ptr())
+                        .is_null()
+                );
+                assert!(
+                    last_error().starts_with(code),
+                    "{page} {options:?}: {}",
+                    last_error()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,18 +1,17 @@
 [package]
-name = "pdf_ffi"
+name = "pdf_ocr"
 version.workspace = true
 edition.workspace = true
-
-[lib]
-crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 pdf_core = { path = "../pdf_core" }
 pdf_ops = { path = "../pdf_ops" }
 pdf_text = { path = "../pdf_text" }
 pdf_render = { path = "../pdf_render" }
-pdf_ai = { path = "../pdf_ai" }
-pdf_ocr = { path = "../pdf_ocr" }
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
+
+[features]
+default = ["embedded-model"]
+# Compile the trained Latin-script model into the library (about 1 MB).
+embedded-model = []

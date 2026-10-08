@@ -1,0 +1,32 @@
+I built an OCR engine from scratch in Rust and wired it into the library, the C ABI, Dart and the CLI. Progress and next steps are recorded in docs/OCR_PROGRESS.md. Everything is uncommitted on main.
+
+The engine works and its tests pass, but two gaps block shipping:
+
+Training stopped at 40%. The bundled model is the step-32,000 checkpoint of an 80,000-step run, ended early by the session limit.
+The checked-in Android/iOS/macOS binaries don't include OCR yet. I checked that Android arm64 and iOS compile, but didn't run scripts/build_*.sh. Until you do, the Dart OCR calls throw OCR_UNAVAILABLE.
+What it does:
+
+Finds and reads printed text with no third-party OCR or ML code at runtime. Training happens offline in tools/ocr_train (PyTorch); nothing Python ships.
+Handles skewed, sideways and upside-down scans.
+ocrPage returns a page's text and a selectable layout, makeSearchable saves a copy with an invisible text layer, and applyOcr writes results from page-by-page OCR or another engine.
+Pages that already have text are skipped unless forced.
+Results (measured on 72 pages set in 24 macOS fonts the model never saw):
+
+Accuracy: 1.45% character error rate and 8.8% word error rate, from 0.5% for Times New Roman to 4% for American Typewriter. About a fifth of the counted errors are actually wrong reference text, not OCR mistakes.
+Speed: about 0.1–0.3 s per page on your M4 Pro using all cores.
+Size: the Android library grows by 1.4 MB, of which 1 MB is the model.
+Searchable PDFs: rendering is unchanged and word boxes match the scan exactly. Search also works in Apple Preview, including on rotated pages.
+Tests: all Rust tests for the new and touched crates pass, including golden tests showing the Rust code computes the same results as the PyTorch training code. The Dart tests pass, and flutter analyze reports no new issues. Clippy isn't installed locally, so I didn't run it; CI does. On-device integration tests weren't run.
+
+Other changes:
+
+Plain-text extraction is now rotation-aware; rotated text used to break into one line per word.
+Weakest spot in the model: underscores (pdf_ops reads as pdf ops), because the training-text cleaner stripped them. That needs a retrain.
+Two existing bugs I found but didn't fix:
+
+MacRoman fi/fl ligatures extract as "Þ"/"ß" ("file" comes out as "Þle").
+Saved PDFs get owner-only (0600) file permissions.
+Next steps:
+
+Finish the training run and re-export the model; the commands are in the progress doc. The run's files were in this session's temporary directory and may be gone, so tools/ocr_train/prepare_data.sh re-downloads the data. A full run takes about 2 hours.
+Rebuild the native binaries with scripts/build_*.sh.

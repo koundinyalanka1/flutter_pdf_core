@@ -9,6 +9,9 @@ A lightweight PDF toolkit for Flutter, **built from scratch in Rust** — no thi
 * Rotate, crop, edit document metadata
 * Text extraction (encodings, ToUnicode CMaps, CID fonts)
 * Positioned text and glyph geometry for selection/search
+* OCR for scanned pages, also built from scratch: reads printed Latin-script text,
+  makes scans searchable with an invisible text layer, and gives scans the same
+  selection/search geometry as born-digital pages
 * CPU raster rendering to PNG or RGBA, with warnings for approximate/skipped content
 * JPEG-to-PDF composition with page-size, fit and margin controls
 * AI-ready JSON/NDJSON export (paragraph-aware chunks with overlap) for feeding local models
@@ -36,6 +39,10 @@ final rendered = await PdfCore.renderPagePngWithWarningsAsync(
 );
 // Display rendered.bytes and surface rendered.warnings to the reader.
 final layout = await PdfCore.pageTextLayout('/final.pdf', page: 1);
+
+// Scanned pages: read one for a viewer, or make a whole file searchable.
+final ocr = await PdfCore.ocrPage('/scan.pdf', page: 1);  // ocr.text, ocr.layout
+await PdfCore.makeSearchableAsync('/scan.pdf', '/scan-searchable.pdf');
 
 await PdfCore.imagesToPdfAsync(
   ['/photo1.jpg', '/photo2.jpg'], '/photos.pdf',
@@ -96,6 +103,54 @@ Pass passwords as typed: they are encoded as each revision requires
 (PDFDocEncoding for RC4/AES-128, UTF-8 after SASLprep for AES-256), with the
 raw UTF-8 bytes as a fallback.
 
+## OCR
+
+A scanned page holds a picture of text, not text. `ocrPage` reads a page.
+`makeSearchable` saves a copy in which each scanned page carries its
+recognized words as invisible text over the glyphs, so selection, search,
+`extractText` and `exportForAi` work on it, here and in other viewers.
+`ocrPage` also returns the page's selectable layout, the same shape
+`pageTextLayout` gives, so a viewer can select and search a scan right away.
+To show progress on a long document, recognize pages one at a time and write
+them with `applyOcr`. Results from another engine can be written the same way.
+
+```dart
+final page = await PdfCore.ocrPage('/scan.pdf', page: 1);
+print('${page.text} (confidence ${page.confidence})');
+final report = await PdfCore.makeSearchableAsync('/scan.pdf', '/out.pdf');
+```
+
+The engine is part of this library, written from scratch in Rust like the
+rest of it:
+
+* **Finding the text:** adaptive binarization, connected components, skew
+  correction, sideways and upside-down page detection, line finding and
+  reading order (columns before rows).
+* **Reading it:** a small neural network trained for this library, a CNN and a
+  bidirectional LSTM decoded with CTC. It has about half a million weights,
+  is compiled in, and adds about 1 MB.
+
+No OCR or machine-learning library runs on the device.
+[`tools/ocr_train`](tools/ocr_train) reproduces the model from open-licensed
+fonts and public-domain text.
+
+* Reads printed Latin-script text: English and Western European languages,
+  digits, and common document punctuation (208 characters). Handwriting and
+  other scripts are not supported.
+* Accuracy: 1.45% character error rate (8.8% word error rate) on 72 pages
+  typeset in 24 macOS fonts the model never trained on, rendered at 300 dpi.
+  Results ranged from 0.5% (Times New Roman, Trebuchet) to 4% (American
+  Typewriter). Some reported errors come from the reference text itself. A
+  page takes about 0.1–0.3 s on an Apple M4 Pro (all cores) and about 1.7 s on
+  one core.
+* Pages that already carry text, born-digital or from earlier OCR, are left
+  alone unless `force` is set. The layer renders invisibly, and its word boxes
+  match the scanned words, also on pages with `/Rotate`.
+* Saving rewrites the file, like the other writing operations. The copy is not
+  encrypted, and digital signatures on the original no longer verify.
+* Not yet handled: text inside photographs, white-on-black text, and tables,
+  which read column by column.
+
 ## Building the native core
 
 ```bash
@@ -114,6 +169,9 @@ There is also a developer CLI for poking at real files:
 cargo run -p pdf_cli -- inspect some.pdf
 cargo run -p pdf_cli -- text some.pdf
 cargo run -p pdf_cli -- encrypt some.pdf user-pw owner-pw locked.pdf
+cargo run --release -p pdf_cli -- ocr scan.pdf                  # recognized text
+cargo run --release -p pdf_cli -- searchable scan.pdf out.pdf   # invisible text layer
+cargo run --release -p pdf_cli -- ocr-eval text.pdf             # accuracy vs. real text
 ```
 
 ## Project layout
@@ -125,8 +183,10 @@ cargo run -p pdf_cli -- encrypt some.pdf user-pw owner-pw locked.pdf
 | `rust/crates/pdf_text` | content streams, fonts, text extraction |
 | `rust/crates/pdf_render` | CPU rasterizer, fonts, images, paints, annotations |
 | `rust/crates/pdf_ai` | chunking + JSON/NDJSON export for local AI models |
+| `rust/crates/pdf_ocr` | OCR: page analysis, recognizer inference, invisible text layers |
 | `rust/crates/pdf_ffi` | the C ABI consumed by `dart:ffi` |
 | `rust/crates/pdf_cli` | developer CLI |
+| `tools/ocr_train` | offline training of the OCR model (Python, not shipped) |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design notes and
 [docs/MILESTONES.md](docs/MILESTONES.md) for the milestone-by-milestone log,

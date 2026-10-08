@@ -1,5 +1,5 @@
 name: flutter_pdf_core
-description: "A lightweight PDF toolkit built from scratch in Rust: split, merge, rotate, crop, metadata, text extraction, AI-ready export and AES-256 passwords."
+description: "A lightweight PDF toolkit built from scratch in Rust: split, merge, rotate, crop, metadata, text extraction, OCR, AI-ready export and AES-256 passwords."
 version: 0.1.0
 homepage:
 

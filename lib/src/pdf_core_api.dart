@@ -240,6 +240,337 @@ double _textLayoutNumber(Object? value, String field) {
   return value.toDouble();
 }
 
+double _ocrNumber(Object? value, String field) {
+  if (value is! num || !value.isFinite) {
+    throw FormatException('Invalid OCR $field.');
+  }
+  return value.toDouble();
+}
+
+List<double> _ocrBounds(Object? value) {
+  if (value is! List || value.length != 4) {
+    throw const FormatException('Invalid OCR bounds.');
+  }
+  final bounds = [for (final v in value) _ocrNumber(v, 'bounds')];
+  if (bounds[2] < bounds[0] || bounds[3] < bounds[1]) {
+    throw const FormatException('Invalid OCR bounds.');
+  }
+  return bounds;
+}
+
+int _ocrOrientation(Object? value) {
+  if (value is! int || value % 90 != 0 || value < 0 || value > 270) {
+    throw const FormatException('Invalid OCR orientation.');
+  }
+  return value;
+}
+
+/// What OCR did with a page.
+enum PdfOcrStatus {
+  /// Recognized; whatever was legible is in [PdfOcrPage.lines].
+  recognized,
+
+  /// Recognized, but nothing legible was found.
+  noText,
+
+  /// Left alone: the page already has born-digital text.
+  hasText,
+
+  /// Left alone: the page already has an invisible OCR text layer.
+  hasOcrLayer;
+
+  static PdfOcrStatus _parse(Object? value) => PdfOcrStatus.values.firstWhere(
+        (status) => status.name == value,
+        orElse: () => throw const FormatException('Invalid OCR page status.'),
+      );
+}
+
+/// Settings for [PdfCore.ocrPage] and [PdfCore.makeSearchable].
+class PdfOcrOptions {
+  const PdfOcrOptions({
+    this.dpi = 300,
+    this.force = false,
+    this.minConfidence = 0.5,
+    this.deskew = true,
+    this.detectOrientation = true,
+    this.threads = 0,
+  });
+
+  /// Resolution pages are recognized at (36–1200). 300 reads 6-point text;
+  /// very large pages are recognized at less to bound memory.
+  final double dpi;
+
+  /// Also recognize pages that already have text.
+  final bool force;
+
+  /// Lines recognized with less confidence (0–1) are dropped: mostly
+  /// pictures, rules and specks rather than text.
+  final double minConfidence;
+
+  /// Measure and correct the tilt of skewed scans.
+  final bool deskew;
+
+  /// Read pages scanned sideways or upside down.
+  final bool detectOrientation;
+
+  /// Threads recognizing lines; 0 uses every core.
+  final int threads;
+
+  Map<String, dynamic> toJson() => {
+        'dpi': dpi,
+        'force': force,
+        'minConfidence': minConfidence,
+        'deskew': deskew,
+        'detectOrientation': detectOrientation,
+        'threads': threads,
+      };
+}
+
+/// A recognized word. Coordinates are page points from the top left of the
+/// displayed page, like [PdfPageTextLayout].
+class PdfOcrWord {
+  const PdfOcrWord({
+    required this.text,
+    required this.confidence,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+    required this.quad,
+  });
+
+  factory PdfOcrWord.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final rawQuad = json['quad'];
+    if (text is! String || rawQuad is! List || rawQuad.length != 4) {
+      throw const FormatException('Invalid OCR word.');
+    }
+    final quad = <double>[];
+    for (final corner in rawQuad) {
+      if (corner is! List || corner.length != 2) {
+        throw const FormatException('Invalid OCR word corners.');
+      }
+      quad
+        ..add(_ocrNumber(corner[0], 'word corner'))
+        ..add(_ocrNumber(corner[1], 'word corner'));
+    }
+    final bounds = _ocrBounds(json['bounds']);
+    return PdfOcrWord(
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      left: bounds[0],
+      top: bounds[1],
+      right: bounds[2],
+      bottom: bounds[3],
+      quad: List.unmodifiable(quad),
+    );
+  }
+
+  final String text;
+
+  /// How sure the engine is of this word, 0–1.
+  final double confidence;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+
+  /// Corners as x, y pairs: top-left, top-right, bottom-right, bottom-left.
+  /// A rotated rectangle when the scan was skewed.
+  final List<double> quad;
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'confidence': confidence,
+        'bounds': [left, top, right, bottom],
+        'quad': [
+          for (var i = 0; i < 8; i += 2) [quad[i], quad[i + 1]],
+        ],
+      };
+}
+
+/// A recognized line of text, words in reading order.
+class PdfOcrLine {
+  const PdfOcrLine({
+    required this.text,
+    required this.confidence,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+    required this.words,
+  });
+
+  factory PdfOcrLine.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final words = json['words'];
+    if (text is! String || words is! List) {
+      throw const FormatException('Invalid OCR line.');
+    }
+    final bounds = _ocrBounds(json['bounds']);
+    return PdfOcrLine(
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      left: bounds[0],
+      top: bounds[1],
+      right: bounds[2],
+      bottom: bounds[3],
+      words: List.unmodifiable([
+        for (final word in words) PdfOcrWord.fromJson((word as Map).cast<String, dynamic>()),
+      ]),
+    );
+  }
+
+  final String text;
+  final double confidence;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+  final List<PdfOcrWord> words;
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'confidence': confidence,
+        'bounds': [left, top, right, bottom],
+        'words': [for (final word in words) word.toJson()],
+      };
+}
+
+/// What [PdfCore.ocrPage] read on one page.
+class PdfOcrPage {
+  const PdfOcrPage({
+    required this.page,
+    required this.status,
+    required this.text,
+    required this.confidence,
+    required this.lines,
+    this.layout,
+    this.width = 0,
+    this.height = 0,
+    this.dpi = 0,
+    this.skewDegrees = 0,
+    this.orientationDegrees = 0,
+  });
+
+  factory PdfOcrPage.fromJson(Map<String, dynamic> json) {
+    final page = json['page'];
+    final text = json['text'];
+    final lines = json['lines'];
+    final layout = json['layout'];
+    if (page is! int || page < 1 || text is! String || lines is! List) {
+      throw const FormatException('Invalid OCR page.');
+    }
+    final status = PdfOcrStatus._parse(json['status']);
+    final recognized = status == PdfOcrStatus.recognized || status == PdfOcrStatus.noText;
+    return PdfOcrPage(
+      page: page,
+      status: status,
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      lines: List.unmodifiable([
+        for (final line in lines) PdfOcrLine.fromJson((line as Map).cast<String, dynamic>()),
+      ]),
+      layout: layout is Map ? PdfPageTextLayout.fromJson(layout.cast<String, dynamic>()) : null,
+      width: recognized ? _ocrNumber(json['width'], 'width') : 0,
+      height: recognized ? _ocrNumber(json['height'], 'height') : 0,
+      dpi: recognized ? _ocrNumber(json['dpi'], 'dpi') : 0,
+      skewDegrees: recognized ? _ocrNumber(json['skewDegrees'], 'skew') : 0,
+      orientationDegrees: recognized ? _ocrOrientation(json['orientationDegrees']) : 0,
+    );
+  }
+
+  /// 1-based, like [PdfCore.pageTextLayout].
+  final int page;
+  final PdfOcrStatus status;
+
+  /// The recognized text, one line per line.
+  final String text;
+
+  /// Mean word confidence, 0–1.
+  final double confidence;
+  final List<PdfOcrLine> lines;
+
+  /// The page's selectable text exactly as [PdfCore.pageTextLayout] reports
+  /// it once [PdfCore.makeSearchable] or [PdfCore.applyOcr] has written it,
+  /// so a viewer can select and search a scanned page straight away. Null
+  /// when the page was not recognized.
+  final PdfPageTextLayout? layout;
+
+  /// Displayed page size in points, when recognized.
+  final double width;
+  final double height;
+
+  /// Resolution the page was recognized at.
+  final double dpi;
+
+  /// Tilt corrected before recognition.
+  final double skewDegrees;
+
+  /// Clockwise turn (0, 90, 180 or 270) that brought the page's text
+  /// upright: 180 means it was scanned upside down. Boxes are always in the
+  /// page's own coordinates.
+  final int orientationDegrees;
+
+  /// The words, as [PdfCore.applyOcr] takes them.
+  Map<String, dynamic> toJson() => {
+        'page': page,
+        'lines': [for (final line in lines) line.toJson()],
+      };
+}
+
+/// What [PdfCore.makeSearchable] did with one page.
+class PdfOcrPageReport {
+  const PdfOcrPageReport({
+    required this.page,
+    required this.status,
+    required this.words,
+    required this.confidence,
+  });
+
+  factory PdfOcrPageReport.fromJson(Map<String, dynamic> json) {
+    final page = json['page'];
+    final words = json['words'];
+    if (page is! int || words is! int) {
+      throw const FormatException('Invalid OCR page report.');
+    }
+    return PdfOcrPageReport(
+      page: page,
+      status: PdfOcrStatus._parse(json['status']),
+      words: words,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+    );
+  }
+
+  final int page;
+  final PdfOcrStatus status;
+  final int words;
+  final double confidence;
+}
+
+/// The outcome of [PdfCore.makeSearchable].
+class PdfSearchableReport {
+  const PdfSearchableReport({required this.recognized, required this.pages});
+
+  factory PdfSearchableReport.fromJson(Map<String, dynamic> json) {
+    final recognized = json['recognized'];
+    final pages = json['pages'];
+    if (recognized is! int || pages is! List) {
+      throw const FormatException('Invalid searchable-PDF report.');
+    }
+    return PdfSearchableReport(
+      recognized: recognized,
+      pages: List.unmodifiable([
+        for (final page in pages) PdfOcrPageReport.fromJson((page as Map).cast<String, dynamic>()),
+      ]),
+    );
+  }
+
+  /// Pages that received recognized text.
+  final int recognized;
+  final List<PdfOcrPageReport> pages;
+}
+
 /// How an image is placed on its page by [PdfCore.imagesToPdf].
 enum PdfImageFit {
   /// Fixed page size; the image is scaled to fit and centred (letterboxed).
@@ -291,7 +622,8 @@ class PdfCore {
 
   /// Extract selectable text and its displayed geometry on a background
   /// isolate. [page] is 1-based, unlike the raster API's 0-based page index.
-  /// Empty/scanned pages return an empty text layout; they do not run OCR.
+  /// Empty/scanned pages return an empty text layout; recognize their text with
+  /// [ocrPage], which reports the same geometry.
   /// Throws `TEXT_SELECTION_UNAVAILABLE` with older native binaries.
   static Future<PdfPageTextLayout> pageTextLayout(
     String path, {
@@ -533,6 +865,87 @@ class PdfCore {
     }));
   }
 
+  // -- OCR -------------------------------------------------------------------
+
+  /// Recognize the text on [page] (1-based) with the built-in OCR engine, on
+  /// a background isolate. Pages that already have text are reported as
+  /// [PdfOcrStatus.hasText] or [PdfOcrStatus.hasOcrLayer] and not recognized
+  /// unless [PdfOcrOptions.force].
+  ///
+  /// [PdfOcrPage.layout] holds the page's selectable text exactly as
+  /// [pageTextLayout] reports it after [makeSearchable] or [applyOcr] writes
+  /// it, so a viewer can select and search a scanned page right away. The
+  /// built-in engine reads printed Latin-script text. Throws
+  /// `OCR_UNAVAILABLE` with older native binaries.
+  static Future<PdfOcrPage> ocrPage(
+    String path, {
+    required int page,
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) async {
+    if (page < 1) {
+      throw RangeError.range(page, 1, null, 'page');
+    }
+    final optionsJson = jsonEncode(options.toJson());
+    return Isolate.run(() {
+      final ocr = _b.ocrPageJson;
+      if (ocr == null) throw _ocrUnavailable();
+      return _withUtf8([path, password, optionsJson], (args) {
+        final json = _takeString(ocr(args[0], args[1], page, args[2]));
+        return PdfOcrPage.fromJson(jsonDecode(json) as Map<String, dynamic>);
+      });
+    });
+  }
+
+  /// Save a copy of [path] to [outPath] with invisible text over its scanned
+  /// [pages] (`'1-3,5'`; empty = all), so their text can be selected,
+  /// searched, extracted and exported. Pages that already have text are left
+  /// as they are unless [PdfOcrOptions.force]. Like the other writing
+  /// operations, the copy is saved without encryption.
+  ///
+  /// This recognizes every page in one call; to show progress, recognize
+  /// pages one at a time with [ocrPage] and write them with [applyOcr].
+  static PdfSearchableReport makeSearchable(
+    String path,
+    String outPath, {
+    String pages = '',
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) {
+    final searchable = _b.makeSearchableJson;
+    if (searchable == null) throw _ocrUnavailable();
+    final optionsJson = jsonEncode(options.toJson());
+    return _withUtf8([path, password, pages, optionsJson, outPath], (args) {
+      final json = _takeString(searchable(args[0], args[1], args[2], args[3], args[4]));
+      return PdfSearchableReport.fromJson(jsonDecode(json) as Map<String, dynamic>);
+    });
+  }
+
+  /// Save a copy of [path] to [outPath] with invisible text layers built from
+  /// [results]: pages recognized with [ocrPage], or by another OCR engine
+  /// with coordinates in displayed page points. Returns the number of pages
+  /// that received text.
+  static int applyOcr(
+    String path,
+    List<PdfOcrPage> results,
+    String outPath, {
+    String password = '',
+  }) {
+    final apply = _b.applyOcrJson;
+    if (apply == null) throw _ocrUnavailable();
+    final json = jsonEncode([for (final page in results) page.toJson()]);
+    final written = _withUtf8([path, password, json, outPath], (args) {
+      return apply(args[0], args[1], args[2], args[3]);
+    });
+    if (written < 0) throw _lastError();
+    return written;
+  }
+
+  static PdfException _ocrUnavailable() => PdfException(
+        'OCR_UNAVAILABLE',
+        'OCR is unavailable in this version of the PDF engine.',
+      );
+
   // -- pinned documents ------------------------------------------------------
 
   /// Parse [path] once and keep it in memory, so that later read-only calls
@@ -650,6 +1063,24 @@ class PdfCore {
   static Future<PdfPageSize> pageSizeAsync(String path, int page,
           {String password = ''}) =>
       Isolate.run(() => pageSize(path, page, password: password));
+
+  static Future<PdfSearchableReport> makeSearchableAsync(
+    String path,
+    String outPath, {
+    String pages = '',
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) =>
+      Isolate.run(() => makeSearchable(path, outPath,
+          pages: pages, password: password, options: options));
+
+  static Future<int> applyOcrAsync(
+    String path,
+    List<PdfOcrPage> results,
+    String outPath, {
+    String password = '',
+  }) =>
+      Isolate.run(() => applyOcr(path, results, outPath, password: password));
 
   static Future<void> imagesToPdfAsync(
     List<String> jpegPaths,

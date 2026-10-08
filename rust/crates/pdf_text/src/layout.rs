@@ -56,14 +56,16 @@ pub fn extract_page_layout_with_metrics<'a>(
     extract_layout(doc, page_index, Some(loader))
 }
 
-pub(crate) struct PageGeometry {
+/// A page as displayed: its size in points after CropBox and /Rotate, and the
+/// transform from PDF user space to top-left displayed points.
+pub struct PageGeometry {
     pub width: f64,
     pub height: f64,
     pub transform: Matrix,
 }
 
 /// Matches pdf_render::page's CropBox/MediaBox and flip-then-rotate transform.
-pub(crate) fn page_geometry(doc: &PdfDocument, page_id: ObjectId) -> Result<PageGeometry> {
+pub fn page_geometry(doc: &PdfDocument, page_id: ObjectId) -> Result<PageGeometry> {
     let rect = page_rect(doc, page_id, "CropBox")
         .or_else(|| page_rect(doc, page_id, "MediaBox"))
         .unwrap_or([0.0, 0.0, 612.0, 792.0]);

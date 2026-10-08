@@ -80,6 +80,16 @@ typedef _ImagesToPdfC = Int32 Function(
 typedef _ImagesToPdfDart = int Function(
     Pointer<Utf8>, Pointer<Utf8>, double, double, int, double);
 
+// Milestone 14: OCR.
+
+typedef _OcrPageC = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<Utf8>);
+typedef _OcrPageDart = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+
+typedef _Str5C = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+
 /// Lazily-resolved bindings to the native library.
 class PdfBindings {
   PdfBindings._(DynamicLibrary lib)
@@ -171,6 +181,29 @@ class PdfBindings {
   _PageCountDart? _lookupDocumentPin(String symbol) {
     try {
       return _library.lookupFunction<_PageCountC, _PageCountDart>(symbol);
+    } on ArgumentError {
+      return null;
+    }
+  }
+
+  /// Optional for the same reason as [pageTextLayoutJson]: OCR arrived with
+  /// milestone 14.
+  late final Pointer<Utf8> Function(
+          Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>)? ocrPageJson =
+      _optional(() => _library
+          .lookupFunction<_OcrPageC, _OcrPageDart>('pdf_ocr_page_json'));
+  late final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>,
+          Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>)? makeSearchableJson =
+      _optional(() =>
+          _library.lookupFunction<_Str5C, _Str5C>('pdf_make_searchable_json'));
+  late final int Function(
+          Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>)?
+      applyOcrJson = _optional(
+          () => _library.lookupFunction<_Op4C, _Op4Dart>('pdf_apply_ocr_json'));
+
+  static T? _optional<T>(T Function() lookup) {
+    try {
+      return lookup();
     } on ArgumentError {
       return null;
     }

@@ -1,5 +1,23 @@
 ## Unreleased
 
+* OCR, written from scratch (new `pdf_ocr` crate). Recognizes printed
+  Latin-script text on scanned pages. Pages scanned skewed, sideways or upside
+  down are handled. `pdf_ocr_page_json` (`PdfCore.ocrPage`) reads a page and
+  returns its lines, word boxes and selectable layout.
+  `pdf_make_searchable_json` (`PdfCore.makeSearchable`) saves a copy with an
+  invisible text layer over every scanned page, and `pdf_apply_ocr_json`
+  (`PdfCore.applyOcr`) writes results recognized page by page or by another
+  engine. Pages that already carry text are left alone unless forced. The
+  layer renders invisibly, its word boxes match the scan, and text
+  extraction, selection, search and AI export read it like any other text.
+  The recognizer's model (about 1 MB) is compiled in; `tools/ocr_train`
+  reproduces it.
+* Plain-text extraction (`pdf_extract_text`, AI export) now places spaces and
+  line breaks along each run's baseline, as text layout already did. Rotated
+  text no longer breaks into one line per run. Words set with a unit font
+  size and a scaled text matrix no longer gain spaces at kerning gaps.
+* Text extraction tracks the text rendering mode; `page_text_stats` counts a
+  page's visible, invisible and unmapped text.
 * Pin parsed documents: `pdf_document_open`/`pdf_document_close`
   (`PdfCore.openDocument`/`closeDocument`) keep one parse in memory, and
   read-only calls on the same path and password share it while the file is
@@ -36,11 +54,14 @@
   them with `--locked`.
 * Export `PdfRenderedPng` from the package library.
 
-These changes extend the C ABI with the two document-pinning functions; the
-Dart API gains `openDocument`, `closeDocument` and the `PdfRenderedPng` export.
-Bindings treat the pinning functions as optional, so older native libraries
-keep working. The checked-in Android, iOS and macOS binaries have been
-regenerated from this source.
+These changes extend the C ABI with the two document-pinning functions and
+the three OCR functions. The Dart API gains `openDocument`, `closeDocument`,
+the `PdfRenderedPng` export, and `ocrPage`, `makeSearchable(Async)` and
+`applyOcr(Async)` with their `PdfOcr…` types. Bindings treat the new functions
+as optional, so older native libraries keep working; OCR calls then throw
+`OCR_UNAVAILABLE`. The checked-in Android, iOS and macOS binaries were
+regenerated for the document-pinning changes. They do not yet include OCR:
+rebuild them with `scripts/build_*.sh`.
 
 ## 0.1.0
 
