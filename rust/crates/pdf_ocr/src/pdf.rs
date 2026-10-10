@@ -64,11 +64,18 @@ pub enum PageStatus {
 }
 
 /// Whether a page already carries text, so recognizing it would duplicate it.
+///
+/// A little text over a page-sized image is a scan with a stamp or a page
+/// number added, and is still recognized. The same little text with no scan
+/// behind it is a born-digital cover or divider page: OCR could only read
+/// that text a second time.
 pub fn existing_text(doc: &PdfDocument, page_index: usize) -> Result<Option<PageStatus>> {
     let stats = page_text_stats(doc, page_index)?;
+    let extractable = stats.visible_chars > 0 && stats.unmapped_glyphs <= stats.visible_chars;
+    let scanned = stats.image_coverage >= 0.5;
     Ok(if stats.invisible_chars >= 20 {
         Some(PageStatus::HasOcrLayer)
-    } else if stats.visible_chars >= 50 && stats.unmapped_glyphs <= stats.visible_chars {
+    } else if extractable && (stats.visible_chars >= 50 || !scanned) {
         Some(PageStatus::HasText)
     } else {
         None

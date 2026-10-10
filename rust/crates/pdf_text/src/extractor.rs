@@ -2,7 +2,8 @@
 //!
 //! Walks each page's content stream(s) with a faithful text-positioning
 //! model and heuristics for word spacing and line breaks. Form XObjects are
-//! followed (with a depth limit); inline images are skipped.
+//! followed (with a depth limit); images are skipped, apart from measuring
+//! how much of the page they cover for [`page_text_stats`].
 
 use std::collections::HashMap;
 
@@ -14,14 +15,14 @@ use serde::Serialize;
 use crate::content_stream::{parse_content, Operation};
 use crate::font::{load_font, Font};
 use crate::layout::{
-    font_vertical_metrics, page_geometry, transformed_bounds, LayoutFontLoader, LayoutFontMetrics,
-    PageGeometry, PageTextLayout, TextGlyph,
+    font_vertical_metrics, page_box, page_geometry, transformed_bounds, LayoutFontLoader,
+    LayoutFontMetrics, PageGeometry, PageTextLayout, TextGlyph,
 };
 use crate::text_state::{Matrix, TextObject, TextState};
 
 /// What kind of text a page carries: enough to tell a born-digital page from
 /// a scan, and a scan from one that already has an OCR layer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct TextStats {
     /// Non-blank characters drawn visibly.
     pub visible_chars: usize,
@@ -31,6 +32,9 @@ pub struct TextStats {
     /// Glyphs with no Unicode meaning: text that is on the page but cannot be
     /// extracted (a font without a ToUnicode map, for instance).
     pub unmapped_glyphs: usize,
+    /// Share of the page, 0–1, that images cover: close to 1 on a scan.
+    /// Images drawn over one another count twice, up to the cap of 1.
+    pub image_coverage: f64,
 }
 
 /// Count the text on one page (0-based).
@@ -45,7 +49,9 @@ pub fn page_text_stats(doc: &PdfDocument, page_index: usize) -> Result<TextStats
     let resources = inherited_attribute(doc, page_id, "Resources")
         .and_then(|o| o.as_dict().cloned())
         .unwrap_or_default();
+    let page = page_box(doc, page_id);
     let mut extractor = Extractor::new(doc);
+    extractor.image_clip = Some(page);
     extractor.run(
         &content,
         &resources,
@@ -53,7 +59,12 @@ pub fn page_text_stats(doc: &PdfDocument, page_index: usize) -> Result<TextStats
         0,
         TextState::default(),
     )?;
-    Ok(extractor.stats)
+    let area = (page[2] - page[0]) * (page[3] - page[1]);
+    let mut stats = extractor.stats;
+    if area > 0.0 {
+        stats.image_coverage = (extractor.image_area / area).min(1.0);
+    }
+    Ok(stats)
 }
 
 /// Extract text from every page.
@@ -188,6 +199,10 @@ struct Extractor<'a> {
     last_baseline: Option<Baseline>,
     out: String,
     stats: TextStats,
+    /// The page box, in user space, when image coverage is being measured.
+    image_clip: Option<[f64; 4]>,
+    /// Area of the page box that images cover, summed over every image.
+    image_area: f64,
 }
 
 struct LoadedFont {
@@ -216,6 +231,8 @@ impl<'a> Extractor<'a> {
             last_baseline: None,
             out: String::new(),
             stats: TextStats::default(),
+            image_clip: None,
+            image_area: 0.0,
         }
     }
 
@@ -378,16 +395,18 @@ impl<'a> Extractor<'a> {
                 }
                 "Do" => {
                     if let Some(name) = operands.first().and_then(PdfObject::as_name) {
-                        self.run_form_xobject(name, resources, ctm, depth, state.clone())?;
+                        self.run_xobject(name, resources, ctm, depth, state.clone())?;
                     }
                 }
+                "BI" => self.note_image(ctm),
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn run_form_xobject(
+    /// Follow a form XObject's content; note where an image XObject lands.
+    fn run_xobject(
         &mut self,
         name: &str,
         resources: &Dictionary,
@@ -406,13 +425,17 @@ impl<'a> Extractor<'a> {
         else {
             return Ok(());
         };
-        if stream
+        match stream
             .dictionary
             .get("Subtype")
             .and_then(PdfObject::as_name)
-            != Some("Form")
         {
-            return Ok(());
+            Some("Form") => {}
+            Some("Image") => {
+                self.note_image(ctm);
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
         let inner_ctm = stream
             .dictionary
@@ -432,6 +455,22 @@ impl<'a> Extractor<'a> {
             .unwrap_or_else(|| resources.clone());
         let data = self.doc.stream_data(&stream)?;
         self.run(&data, &inner_resources, inner_ctm, depth + 1, state)
+    }
+
+    /// Add the part of the page that an image drawn under `ctm` covers. An
+    /// image fills the unit square of its own space.
+    fn note_image(&mut self, ctm: Matrix) {
+        let Some(page) = self.image_clip else {
+            return;
+        };
+        let Some(image) = transformed_bounds([0.0, 0.0, 1.0, 1.0], ctm) else {
+            return;
+        };
+        let width = image[2].min(page[2]) - image[0].max(page[0]);
+        let height = image[3].min(page[3]) - image[1].max(page[1]);
+        if width > 0.0 && height > 0.0 {
+            self.image_area += width * height;
+        }
     }
 
     fn ensure_font(&mut self, key: &str, name: &str, resources: &Dictionary) {
@@ -729,6 +768,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::doc_with_content;
     use super::*;
+    use pdf_core::stream::PdfStream;
 
     #[test]
     fn extracts_simple_text_with_spacing() {
@@ -800,7 +840,8 @@ mod tests {
             TextStats {
                 visible_chars: 6,
                 invisible_chars: 3,
-                unmapped_glyphs: 0
+                unmapped_glyphs: 0,
+                image_coverage: 0.0,
             }
         );
         // Two-byte codes with no ToUnicode map decode to nothing.
@@ -811,6 +852,67 @@ mod tests {
         font.insert("Encoding".into(), PdfObject::Name("Identity-H".into()));
         doc.set_object(font_id, PdfObject::Dictionary(font));
         assert_eq!(page_text_stats(&doc, 0).unwrap().unmapped_glyphs, 2);
+    }
+
+    #[test]
+    fn text_stats_measure_how_much_of_the_page_images_cover() {
+        let coverage = |content: &[u8]| {
+            page_text_stats(&doc_with_content(content), 0)
+                .unwrap()
+                .image_coverage
+        };
+        assert_eq!(coverage(b"BT /F1 12 Tf 72 720 Td (Title) Tj ET"), 0.0);
+        // Inline images: the left half of the page, then the whole of it
+        // with a margin hanging off every edge.
+        let half = coverage(b"q 306 0 0 792 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI Q");
+        assert!((half - 0.5).abs() < 1e-9, "{half}");
+        let all = coverage(b"q 700 0 0 900 -40 -50 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI Q");
+        assert_eq!(all, 1.0);
+    }
+
+    #[test]
+    fn image_xobjects_count_toward_coverage_and_forms_are_followed() {
+        let mut doc = doc_with_content(b"q 612 0 0 396 0 0 cm /Im0 Do Q /Fm0 Do");
+        let image = doc.add_object(PdfObject::Stream(PdfStream::new(
+            Dictionary::from([
+                ("Subtype".into(), PdfObject::Name("Image".into())),
+                ("Width".into(), PdfObject::Integer(1)),
+                ("Height".into(), PdfObject::Integer(1)),
+                ("ColorSpace".into(), PdfObject::Name("DeviceGray".into())),
+                ("BitsPerComponent".into(), PdfObject::Integer(8)),
+            ]),
+            vec![0],
+        )));
+        // The same image again, drawn by a form over the top quarter.
+        let form = doc.add_object(PdfObject::Stream(PdfStream::new(
+            Dictionary::from([
+                ("Subtype".into(), PdfObject::Name("Form".into())),
+                (
+                    "BBox".into(),
+                    PdfObject::Array(vec![
+                        PdfObject::Integer(0),
+                        PdfObject::Integer(0),
+                        PdfObject::Integer(612),
+                        PdfObject::Integer(792),
+                    ]),
+                ),
+            ]),
+            b"q 612 0 0 198 0 594 cm /Im0 Do Q".to_vec(),
+        )));
+        let page_id = doc.collect_page_ids().unwrap()[0];
+        let mut page = doc.resolve(page_id).unwrap().as_dict().unwrap().clone();
+        let mut resources = page.get("Resources").unwrap().as_dict().unwrap().clone();
+        resources.insert(
+            "XObject".into(),
+            PdfObject::Dictionary(Dictionary::from([
+                ("Im0".into(), PdfObject::Reference(image)),
+                ("Fm0".into(), PdfObject::Reference(form)),
+            ])),
+        );
+        page.insert("Resources".into(), PdfObject::Dictionary(resources));
+        doc.set_object(page_id, PdfObject::Dictionary(page));
+        let coverage = page_text_stats(&doc, 0).unwrap().image_coverage;
+        assert!((coverage - 0.75).abs() < 1e-9, "{coverage}");
     }
 
     #[test]

@@ -66,9 +66,7 @@ pub struct PageGeometry {
 
 /// Matches pdf_render::page's CropBox/MediaBox and flip-then-rotate transform.
 pub fn page_geometry(doc: &PdfDocument, page_id: ObjectId) -> Result<PageGeometry> {
-    let rect = page_rect(doc, page_id, "CropBox")
-        .or_else(|| page_rect(doc, page_id, "MediaBox"))
-        .unwrap_or([0.0, 0.0, 612.0, 792.0]);
+    let rect = page_box(doc, page_id);
     let width = (rect[2] - rect[0]).abs();
     let height = (rect[3] - rect[1]).abs();
     if !width.is_finite() || !height.is_finite() {
@@ -96,6 +94,14 @@ pub fn page_geometry(doc: &PdfDocument, page_id: ObjectId) -> Result<PageGeometr
         height,
         transform: flip.multiply(&rotation),
     })
+}
+
+/// The page's visible area in user space: its CropBox, else its MediaBox,
+/// else US Letter.
+pub(crate) fn page_box(doc: &PdfDocument, page_id: ObjectId) -> [f64; 4] {
+    page_rect(doc, page_id, "CropBox")
+        .or_else(|| page_rect(doc, page_id, "MediaBox"))
+        .unwrap_or([0.0, 0.0, 612.0, 792.0])
 }
 
 fn page_rect(doc: &PdfDocument, page_id: ObjectId, key: &str) -> Option<[f64; 4]> {

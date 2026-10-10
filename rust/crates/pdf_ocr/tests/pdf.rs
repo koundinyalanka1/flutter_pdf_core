@@ -5,6 +5,8 @@ mod common;
 
 use common::{character_error_rate, scanned, single_spaced, typeset, LINES};
 use pdf_core::document::PdfDocument;
+use pdf_core::object::{Dictionary, PdfObject};
+use pdf_core::stream::PdfStream;
 use pdf_ocr::pdf::{
     apply_ocr, existing_text, make_searchable, ocr_layout, recognize_page, ExternalPage,
 };
@@ -77,6 +79,54 @@ fn pages_with_text_are_left_alone_unless_forced() {
     };
     let reports = make_searchable(&mut doc, &[0], engine, &forced).unwrap();
     assert_eq!(reports[0].status, PageStatus::Recognized);
+}
+
+#[test]
+fn a_little_text_is_born_digital_unless_a_scan_lies_behind_it() {
+    let engine = OcrEngine::embedded();
+    // A cover page: a title and nothing else. Recognizing it could only
+    // write the title a second time.
+    let mut cover = with_content(typeset(), b"BT /F1 24 Tf 72 700 Td (Annual report) Tj ET");
+    assert_eq!(existing_text(&cover, 0).unwrap(), Some(PageStatus::HasText));
+    let reports = make_searchable(&mut cover, &[0], engine, &PdfOcrOptions::default()).unwrap();
+    assert_eq!(reports[0].status, PageStatus::HasText);
+    assert_eq!(extract_page_text(&cover, 0).unwrap(), "Annual report");
+
+    // A scan with a page number stamped on afterwards still needs reading.
+    let stamped = with_content(
+        scanned(),
+        b"q 612 0 0 792 0 0 cm /Im0 Do Q BT /F1 9 Tf 540 20 Td (Page 1) Tj ET",
+    );
+    assert_eq!(existing_text(&stamped, 0).unwrap(), None);
+}
+
+/// Replace the page's content, adding Helvetica as /F1 if it has no fonts.
+fn with_content(mut doc: PdfDocument, content: &[u8]) -> PdfDocument {
+    let page_id = doc.collect_page_ids().unwrap()[0];
+    let mut page = doc.resolve(page_id).unwrap().as_dict().unwrap().clone();
+    let mut resources = page.get("Resources").unwrap().as_dict().unwrap().clone();
+    if resources.get("Font").is_none() {
+        let font = doc.add_object(PdfObject::Dictionary(Dictionary::from([
+            ("Type".into(), PdfObject::Name("Font".into())),
+            ("Subtype".into(), PdfObject::Name("Type1".into())),
+            ("BaseFont".into(), PdfObject::Name("Helvetica".into())),
+        ])));
+        resources.insert(
+            "Font".into(),
+            PdfObject::Dictionary(Dictionary::from([(
+                "F1".into(),
+                PdfObject::Reference(font),
+            )])),
+        );
+    }
+    let contents = doc.add_object(PdfObject::Stream(PdfStream::new(
+        Dictionary::new(),
+        content.to_vec(),
+    )));
+    page.insert("Resources".into(), PdfObject::Dictionary(resources));
+    page.insert("Contents".into(), PdfObject::Reference(contents));
+    doc.set_object(page_id, PdfObject::Dictionary(page));
+    doc
 }
 
 #[test]

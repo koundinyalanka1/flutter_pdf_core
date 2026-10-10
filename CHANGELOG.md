@@ -12,6 +12,13 @@
   extraction, selection, search and AI export read it like any other text.
   The recognizer's model (about 1 MB) is compiled in; `tools/ocr_train`
   reproduces it.
+* OCR leaves born-digital pages with only a little text alone, such as a
+  cover or divider page. Before, any page with fewer than 50 characters was
+  recognized, and its text was written a second time ("Chapter One" extracted
+  as "Chapter OneChapter One"). A few characters over a page-sized image, as
+  on a scan with a page number stamped on, are still recognized.
+  `page_text_stats` reports the share of the page images cover
+  (`image_coverage`) to tell the two apart.
 * Plain-text extraction (`pdf_extract_text`, AI export) now places spaces and
   line breaks along each run's baseline, as text layout already did. Rotated
   text no longer breaks into one line per run. Words set with a unit font
