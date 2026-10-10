@@ -59,7 +59,7 @@ On a Mac, the same commands train on the Apple GPU at about 650 lines a
 second, a little over two hours for 80,000 steps of 64 lines. There, pass
 macOS system fonts to `--eval-fonts`, for example
 `/System/Library/Fonts/Supplemental/{Arial,Georgia,Verdana}.ttf`. The
-bundled model is the step-32,000 checkpoint of such a run.
+bundled model is the best checkpoint (step 76,000) of such a run.
 
 ## Data and licences
 

@@ -16,6 +16,11 @@
   line breaks along each run's baseline, as text layout already did. Rotated
   text no longer breaks into one line per run. Words set with a unit font
   size and a scaled text matrix no longer gain spaces at kerning gaps.
+* `test/pdf_ocr_native_test.dart` runs OCR from Dart against a real native
+  library when `PDF_CORE_LIB_PATH` is set.
+* OCR reads a page in reading order even when its lines are long: long lines
+  of small print are split only after lines are ordered, and only beyond 150
+  line heights.
 * Text extraction tracks the text rendering mode; `page_text_stats` counts a
   page's visible, invisible and unmapped text.
 * `MacRomanEncoding` decodes the whole high range. Before, the fi and fl
@@ -61,9 +66,8 @@ the three OCR functions. The Dart API gains `openDocument`, `closeDocument`,
 the `PdfRenderedPng` export, and `ocrPage`, `makeSearchable(Async)` and
 `applyOcr(Async)` with their `PdfOcr…` types. Bindings treat the new functions
 as optional, so older native libraries keep working; OCR calls then throw
-`OCR_UNAVAILABLE`. The checked-in Android, iOS and macOS binaries were
-regenerated for the document-pinning changes. They do not yet include OCR:
-rebuild them with `scripts/build_*.sh`.
+`OCR_UNAVAILABLE`. The checked-in Android, iOS and macOS binaries have been
+regenerated from this source, OCR model included.
 
 ## 0.1.0
 

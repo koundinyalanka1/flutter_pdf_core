@@ -278,14 +278,16 @@ pub fn find_lines(components: &[Component], typical: f64) -> Vec<TextLine> {
     }
     lines.retain(|line| line.height() >= 4.0);
 
-    let lines: Vec<TextLine> = lines
-        .into_iter()
-        .flat_map(|line| split_long(components, line))
-        .collect();
+    // Order whole lines first: pieces of a split line must stay together, not
+    // pass for columns.
     let mut order = Vec::with_capacity(lines.len());
     xy_cut(&lines, (0..lines.len()).collect(), &mut order, 0);
     let mut slots: Vec<Option<TextLine>> = lines.into_iter().map(Some).collect();
-    order.into_iter().filter_map(|i| slots[i].take()).collect()
+    order
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .flat_map(|line| split_long(components, line))
+        .collect()
 }
 
 /// Fold "lines" of a few marks that sit inside a real line's box (an opening
@@ -348,10 +350,10 @@ fn bounds_of(components: &[Component], members: &[usize]) -> [f64; 4] {
     b
 }
 
-/// Lines wider than the recognizer comfortably reads in one pass (about 60
-/// line heights) are split at their widest inner gap.
+/// Lines wider than 150 line heights (far beyond any page of prose, which
+/// small print reaches at about 70) are split at their widest inner gap.
 fn split_long(components: &[Component], line: TextLine) -> Vec<TextLine> {
-    let too_long = (line.bounds[2] - line.bounds[0]) > 60.0 * line.height().max(1.0);
+    let too_long = (line.bounds[2] - line.bounds[0]) > 150.0 * line.height().max(1.0);
     if !too_long || line.members.len() < 2 {
         return vec![line];
     }

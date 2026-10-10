@@ -137,8 +137,9 @@ fonts and public-domain text.
 * Reads printed Latin-script text: English and Western European languages,
   digits, and common document punctuation (208 characters). Handwriting and
   other scripts are not supported.
-* Accuracy: 1.08% character error rate (7.6% word error rate) on 72 pages
+* Accuracy: 0.30% character error rate (1.8% word error rate) on 72 pages
   typeset in 24 macOS fonts the model never trained on, rendered at 300 dpi.
+  Most fonts score 0.1–0.3%, and none is worse than 0.9%.
   A page takes about 0.1–0.3 s on an Apple M4 Pro (all cores) and about
   1.7 s on one core.
 * Pages that already carry text, born-digital or from earlier OCR, are left
