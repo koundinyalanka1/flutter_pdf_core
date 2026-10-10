@@ -14,6 +14,9 @@ const USAGE: &str = "usage: pdf_cli <command> ...
   rewrite   <in> <out> [password]              parse + clean rewrite
   roundtrip <in> [password]                    parse, write, re-parse check
   text      <in> [page-1-based] [password]     extract text
+  render    <in> <page-1-based> <out.png> [scale] [password]
+                                               rasterize one page, report warnings
+  fonts     <in> <page-1-based> [password]     list a page's fonts and how they load
   split     <in> <ranges> <out> [password]     e.g. ranges \"1-3,5\"
   delete    <in> <ranges> <out> [password]
   reorder   <in> <order> <out> [password]      e.g. order \"3,1,2\"
@@ -72,6 +75,39 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        "render" => {
+            let doc = open(&rest, 0, 4)?;
+            let page: usize = arg(&rest, 1)?.parse().context("bad page number")?;
+            let scale = match rest.get(3) {
+                Some(scale) => scale.parse().context("bad scale")?,
+                None => 2.0,
+            };
+            let options = pdf_render::RenderOptions {
+                size: pdf_render::RenderSize::Scale(scale),
+                ..Default::default()
+            };
+            let started = Instant::now();
+            let rendered = pdf_render::render_page(&doc, page.saturating_sub(1), options)?;
+            let png =
+                pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
+                    .context("failed to encode PNG")?;
+            std::fs::write(arg(&rest, 2)?, png)?;
+            eprintln!(
+                "{}x{} in {:.2}s, {} warning(s)",
+                rendered.width,
+                rendered.height,
+                started.elapsed().as_secs_f64(),
+                rendered.warnings.len()
+            );
+            for warning in &rendered.warnings {
+                eprintln!("  {warning}");
+            }
+        }
+        "fonts" => {
+            let doc = open(&rest, 0, 2)?;
+            let page: usize = arg(&rest, 1)?.parse().context("bad page number")?;
+            print_fonts(&doc, page.saturating_sub(1))?;
         }
         "split" => {
             let doc = open(&rest, 0, 3)?;
@@ -276,6 +312,75 @@ fn engine() -> &'static OcrEngine {
         }
         None => OcrEngine::embedded(),
     })
+}
+
+/// Report every font a page's resources name, and how the renderer loads it.
+/// The quickest way to tell a jumbled page caused by a missing font program
+/// from one caused by a mis-read encoding.
+fn print_fonts(doc: &PdfDocument, index: usize) -> Result<()> {
+    use pdf_core::object::PdfObject;
+
+    let page_ids = doc
+        .collect_page_ids()
+        .context("document has no page tree")?;
+    let &page_id = page_ids.get(index).context("page out of range")?;
+    let page = pdf_ops::page_tree::effective_page_dict(doc, page_id)?;
+    let resources = page
+        .get("Resources")
+        .map(|o| doc.resolve_value(o))
+        .and_then(|o| doc.resolve_dict(&o).cloned())
+        .unwrap_or_default();
+    let Some(fonts) = resources
+        .get("Font")
+        .map(|o| doc.resolve_value(o))
+        .and_then(|o| doc.resolve_dict(&o).cloned())
+    else {
+        println!("page {} names no fonts", index + 1);
+        return Ok(());
+    };
+
+    let mut names: Vec<&String> = fonts.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(dict) = fonts
+            .get(name)
+            .map(|o| doc.resolve_value(o))
+            .and_then(|o| doc.resolve_dict(&o).cloned())
+        else {
+            continue;
+        };
+        let font = pdf_render::font::RenderFont::load(doc, &dict);
+        let string = |key: &str| {
+            dict.get(key)
+                .map(|o| doc.resolve_value(o))
+                .as_ref()
+                .map(|o| match o {
+                    PdfObject::Name(n) => n.clone(),
+                    PdfObject::Dictionary(_) => "<dictionary>".to_owned(),
+                    other => format!("{other:?}"),
+                })
+                .unwrap_or_else(|| "-".to_owned())
+        };
+        println!(
+            "/{name}  {}  base={}  encoding={}  program={:?}{}",
+            string("Subtype"),
+            string("BaseFont"),
+            string("Encoding"),
+            font.source,
+            if font.is_substituted() {
+                "  SUBSTITUTED"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "      widths={}  to_unicode={}  encoding_map={}",
+            font.text.widths.len(),
+            font.text.to_unicode.len(),
+            font.text.encoding.len()
+        );
+    }
+    Ok(())
 }
 
 fn arg<'a>(rest: &[&'a str], index: usize) -> Result<&'a str> {

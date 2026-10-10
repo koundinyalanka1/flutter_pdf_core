@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct ColorFunction {
+pub(in crate::page) struct ColorFunction {
     domain: Vec<f64>,
     range: Vec<f64>,
     outputs: usize,
@@ -33,7 +33,7 @@ enum Kind {
 }
 
 impl ColorFunction {
-    pub(super) fn load(
+    pub(in crate::page) fn load(
         doc: &PdfDocument,
         object: &PdfObject,
         depth: usize,
@@ -252,7 +252,7 @@ impl ColorFunction {
     pub(super) fn evaluate(&self, t: f64) -> Option<Vec<f64>> {
         self.evaluate_inputs(&[t])
     }
-    pub(super) fn evaluate_inputs(&self, values: &[f64]) -> Option<Vec<f64>> {
+    pub(in crate::page) fn evaluate_inputs(&self, values: &[f64]) -> Option<Vec<f64>> {
         self.evaluate_inputs_bounded(values, &mut 16_384)
     }
     pub(super) fn evaluate_inputs_bounded(

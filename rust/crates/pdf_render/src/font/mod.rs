@@ -1,22 +1,30 @@
 //! Bridges a PDF font dictionary to drawable glyph outlines.
 //!
 //! Text rendering needs two things the text *extractor* never did: the
-//! embedded font program, and a code → glyph-id mapping. This module resolves
-//! `/FontFile2` (TrueType) programs and layers the PDF's own encoding rules
-//! on top of the font's internal `cmap`.
+//! embedded font program, and a code → glyph mapping. This module resolves
+//! `/FontFile` (Type 1), `/FontFile2` (TrueType) and `/FontFile3` (CFF,
+//! OpenType) programs and layers the PDF's own encoding rules on top of each
+//! program's internal addressing — names for Type 1 and CFF, a `cmap` for
+//! TrueType.
 
 pub mod cff;
 pub mod fallback;
+pub mod system;
 pub mod truetype;
+pub mod type1;
+
+use std::collections::HashMap;
 
 use pdf_core::document::PdfDocument;
 use pdf_core::object::{Dictionary, PdfObject};
+use pdf_core::stream::PdfStream;
 use pdf_text::font::{load_font, Font as TextFont};
 
-use crate::geom::Path;
+use crate::geom::{Matrix, Path};
 use cff::CffFont;
-use fallback::{FallbackFont, FallbackStyle};
+use fallback::{CjkRegion, FallbackFont, FallbackStyle};
 use truetype::TrueTypeFont;
+use type1::Type1Font;
 
 /// Why a font cannot be drawn, when it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,18 +33,87 @@ pub enum GlyphSource {
     TrueType,
     /// Embedded CFF / Type1C outlines are available.
     Cff,
-    /// The font program is in a format this renderer does not interpret
-    /// (bare Type1, for instance), so a substitute face is drawn instead.
+    /// An embedded Type 1 (PostScript) program is available.
+    Type1,
+    /// The font program is in a format this renderer cannot read, or is
+    /// damaged, so a substitute face is drawn instead.
     UnsupportedProgram,
     /// No font program embedded at all — one of the standard 14, or an
     /// external reference. A substitute face is drawn instead.
     NotEmbedded,
+    /// A Type3 font: each glyph is a small content stream in `/CharProcs`,
+    /// drawn by running it, not by filling an outline.
+    Type3,
+}
+
+/// A Type3 font's glyph procedures and the space they are written in.
+pub struct Type3Glyphs {
+    /// Glyph space → text space. Unlike every other font type this is not a
+    /// fixed 1/1000 scale; TeX bitmap fonts in particular use odd values.
+    pub font_matrix: Matrix,
+    /// Glyph name → its content stream.
+    char_procs: HashMap<String, PdfStream>,
+    /// The font's own `/Resources`, for procedures that name images, fonts
+    /// or colour spaces. Absent means "use the page's", as PDF 1.1 allowed.
+    pub resources: Option<Dictionary>,
+}
+
+impl Type3Glyphs {
+    fn load(doc: &PdfDocument, dict: &Dictionary) -> Option<Type3Glyphs> {
+        let numbers: Vec<f64> = match dict.get("FontMatrix").map(|o| doc.resolve_value(o)) {
+            Some(PdfObject::Array(items)) => items
+                .iter()
+                .filter_map(|item| match doc.resolve_value(item) {
+                    PdfObject::Integer(n) => Some(n as f64),
+                    PdfObject::Real(n) => Some(n),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Required by the spec; 0.001 scaling is the conventional default
+        // for the rare writer that leaves it out.
+        let font_matrix = match numbers.as_slice() {
+            &[a, b, c, d, e, f] if numbers.iter().all(|n| n.is_finite()) => {
+                Matrix::new(a, b, c, d, e, f)
+            }
+            _ => Matrix::scale(0.001, 0.001),
+        };
+        let procs = dict
+            .get("CharProcs")
+            .map(|o| doc.resolve_value(o))
+            .and_then(|o| doc.resolve_dict(&o).cloned())?;
+        let char_procs = procs
+            .iter()
+            .filter_map(|(name, value)| match doc.resolve_value(value) {
+                PdfObject::Stream(stream) => Some((name.clone(), stream)),
+                _ => None,
+            })
+            .collect();
+        let resources = dict
+            .get("Resources")
+            .map(|o| doc.resolve_value(o))
+            .and_then(|o| doc.resolve_dict(&o).cloned());
+        Some(Type3Glyphs {
+            font_matrix,
+            char_procs,
+            resources,
+        })
+    }
+
+    /// The procedure that draws `code`, found through the encoding's glyph
+    /// name — the only way Type3 glyphs are addressed.
+    pub fn procedure(&self, code: u32, text: &TextFont) -> Option<&PdfStream> {
+        let name = text.glyph_names.get(&u8::try_from(code).ok()?)?;
+        self.char_procs.get(name)
+    }
 }
 
 /// The embedded outline program, whichever format it turned out to be.
 enum Program {
     TrueType(Box<TrueTypeFont>),
     Cff(Box<CffFont>),
+    Type1(Box<Type1Font>),
 }
 
 /// A font ready for rendering: metrics from the PDF, outlines from the
@@ -54,12 +131,38 @@ pub struct RenderFont {
     symbolic: bool,
     /// Substitute outlines, used when nothing usable was embedded.
     fallback: Option<FallbackFont>,
+    /// Glyph procedures, for a Type3 font.
+    type3: Option<Type3Glyphs>,
+    /// The font is one of the standard 14 (or a metric-compatible alias such
+    /// as Arial), which a document may leave unembedded by design.
+    standard14: bool,
 }
 
 impl RenderFont {
     pub fn load(doc: &PdfDocument, dict: &Dictionary) -> RenderFont {
         let text = load_font(doc, dict).unwrap_or_default();
-        let composite = dict.get("Subtype").and_then(PdfObject::as_name) == Some("Type0");
+        let subtype = dict.get("Subtype").and_then(PdfObject::as_name);
+
+        // Type3 glyphs are content streams. Nothing about them resembles an
+        // outline program, so none of the descriptor logic below applies —
+        // and a substitute face would be wrong, since the glyphs are right
+        // there in the document.
+        if subtype == Some("Type3") {
+            let type3 = Type3Glyphs::load(doc, dict);
+            return RenderFont {
+                text,
+                source: GlyphSource::Type3,
+                program: None,
+                cid_to_gid: None,
+                composite: false,
+                symbolic: false,
+                fallback: None,
+                type3,
+                standard14: false,
+            };
+        }
+
+        let composite = subtype == Some("Type0");
 
         // For Type0, metrics and the font program live on the descendant.
         let descendant = if composite {
@@ -86,21 +189,29 @@ impl RenderFont {
             Some(descriptor) => load_program(doc, descriptor),
         };
 
+        let base_font = owner
+            .get("BaseFont")
+            .and_then(PdfObject::as_name)
+            .or_else(|| dict.get("BaseFont").and_then(PdfObject::as_name))
+            .unwrap_or("");
+        let standard14 = !composite && pdf_text::standard14::lookup(base_font).is_some();
+
         // Nothing drawable was embedded. Rather than skip the text — which
         // renders the page blank and looks like a broken file — borrow a
-        // substitute face matched to the font's declared weight and slope.
+        // substitute face matched to the font's declared weight, slope and
+        // design, and for CJK to the region whose glyph forms it expects.
         let fallback = if program.is_none() {
-            let base_font = owner
-                .get("BaseFont")
-                .and_then(PdfObject::as_name)
-                .or_else(|| dict.get("BaseFont").and_then(PdfObject::as_name))
-                .unwrap_or("");
             let flags = descriptor
                 .as_ref()
                 .and_then(|d| d.get("Flags"))
                 .and_then(PdfObject::as_i64)
                 .unwrap_or(0);
+            let region = text
+                .cid_collection()
+                .and_then(CjkRegion::from_collection)
+                .or_else(|| CjkRegion::from_font_name(base_font));
             FallbackFont::for_style(FallbackStyle::detect(base_font, flags))
+                .map(|fallback| fallback.with_region(region))
         } else {
             None
         };
@@ -127,7 +238,14 @@ impl RenderFont {
             composite,
             symbolic,
             fallback,
+            type3: None,
+            standard14,
         }
+    }
+
+    /// Glyph procedures, when this is a Type3 font.
+    pub fn type3(&self) -> Option<&Type3Glyphs> {
+        self.type3.as_ref()
     }
 
     /// The em size the outlines from [`RenderFont::outline`] are expressed
@@ -137,6 +255,7 @@ impl RenderFont {
         match &self.program {
             Some(Program::TrueType(f)) => f.units_per_em,
             Some(Program::Cff(f)) => f.units_per_em,
+            Some(Program::Type1(f)) => f.units_per_em,
             None => self
                 .fallback
                 .as_ref()
@@ -146,13 +265,20 @@ impl RenderFont {
     }
 
     pub fn can_draw_glyphs(&self) -> bool {
-        self.program.is_some() || self.fallback.is_some()
+        self.program.is_some() || self.fallback.is_some() || self.type3.is_some()
     }
 
     /// True when the glyphs being drawn are a stand-in rather than the
     /// document's own font, so a caller can note the page is approximate.
     pub fn is_substituted(&self) -> bool {
         self.program.is_none() && self.fallback.is_some()
+    }
+
+    /// Substituted, but for a standard 14 font. PDF lets a document leave
+    /// those unembedded and every reader supplies its own, with the standard
+    /// metrics; telling the reader the page is approximate would be noise.
+    pub fn is_standard_substitute(&self) -> bool {
+        self.is_substituted() && self.standard14
     }
 
     /// Advance for one code, in text-space units (em/1000).
@@ -163,6 +289,12 @@ impl RenderFont {
     /// substitute's own metric fill in, which is far closer than the flat
     /// 500-unit default it replaces.
     pub fn advance_width(&self, code: u32) -> f64 {
+        // Type3 /Widths are in glyph space, which only the font's own matrix
+        // relates to text space; a code with no width advances nothing.
+        if let Some(type3) = &self.type3 {
+            let width = self.text.explicit_width(code).unwrap_or(0.0);
+            return type3.font_matrix.apply_vector(width, 0.0).0 * 1000.0;
+        }
         if let Some(width) = self.text.explicit_width(code) {
             return width;
         }
@@ -184,10 +316,23 @@ impl RenderFont {
     pub fn outline(&self, code: u32) -> Option<Path> {
         let Some(program) = self.program.as_ref() else {
             // Substituted: the code's Unicode meaning is the only handle we
-            // have on the stand-in face.
+            // have on the stand-in face. The encoding's own character comes
+            // first — its glyph name says `fi` where ToUnicode says "fi".
             let fallback = self.fallback.as_ref()?;
-            let ch = self.text.decode_code(code).chars().next()?;
-            return fallback.outline_for_char(ch);
+            if let Some(outline) = self
+                .text
+                .encoding_char(code)
+                .and_then(|ch| fallback.outline_for_char(ch))
+            {
+                return Some(outline);
+            }
+            let text = self.text.decode_code(code);
+            let mut chars = text.chars();
+            let first = chars.next()?;
+            if chars.next().is_none() {
+                return fallback.outline_for_char(first);
+            }
+            return self.composed_outline(fallback, &text, code);
         };
         match program {
             Program::TrueType(program) => {
@@ -198,7 +343,102 @@ impl RenderFont {
                 let gid = self.cff_glyph_id(code, program)?;
                 program.glyph_outline(gid)
             }
+            Program::Type1(program) => {
+                let name = self.named_glyph(
+                    code,
+                    |name| program.has_glyph(name).then(|| name.to_owned()),
+                    |byte| {
+                        program
+                            .builtin_name(byte)
+                            .filter(|name| program.has_glyph(name))
+                            .map(str::to_owned)
+                    },
+                )?;
+                program.glyph_outline(&name)
+            }
         }
+    }
+
+    /// One code that stands for several characters — a ligature, an Indic
+    /// conjunct — in a font the document did not embed. Without the original
+    /// glyph, the characters are drawn side by side and squeezed into the
+    /// advance the document gave the code, so the line keeps its layout and
+    /// no letter silently disappears.
+    fn composed_outline(&self, fallback: &FallbackFont, text: &str, code: u32) -> Option<Path> {
+        let parts: Vec<(Option<Path>, f64)> = text
+            .chars()
+            .map(|ch| {
+                (
+                    fallback.outline_for_char(ch),
+                    fallback.advance(ch).unwrap_or(0.0),
+                )
+            })
+            .collect();
+        let natural: f64 = parts.iter().map(|(_, advance)| advance).sum();
+        let target = self.advance_width(code) * fallback.units_per_em() / 1000.0;
+        let squeeze = if natural > 0.0 && target > 0.0 {
+            (target / natural).min(1.0)
+        } else {
+            1.0
+        };
+        let mut out = Path::new();
+        let mut x = 0.0;
+        for (outline, advance) in parts {
+            if let Some(outline) = outline {
+                out.extend(&outline.transform(&Matrix::new(squeeze, 0.0, 0.0, 1.0, x, 0.0)));
+            }
+            x += advance * squeeze;
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The glyph a simple font addressed by glyph *name* — Type 1 and CFF —
+    /// draws for `code` (ISO 32000-1, 9.6.6.2):
+    ///
+    /// 1. the `/Differences` name, the document's own word on which glyph;
+    /// 2. a base encoding the PDF named outright (`/WinAnsiEncoding`);
+    /// 3. the program's built-in encoding, which is the implicit base for an
+    ///    embedded font — not StandardEncoding;
+    /// 4. the implicit base encoding's character;
+    /// 5. ToUnicode, last: it serves extraction and may name a ligature's
+    ///    first letter.
+    ///
+    /// Characters become names through every spelling the Adobe Glyph List
+    /// knows, so `é` finds `eacute` and a no-break space finds `space`.
+    fn named_glyph<G>(
+        &self,
+        code: u32,
+        by_name: impl Fn(&str) -> Option<G>,
+        builtin: impl Fn(u8) -> Option<G>,
+    ) -> Option<G> {
+        let by_char = |ch: char| -> Option<G> {
+            pdf_text::agl::names_for_char(ch)
+                .iter()
+                .find_map(|n| by_name(n))
+        };
+        let byte = u8::try_from(code).ok();
+        if let Some(name) = byte.and_then(|b| self.text.glyph_names.get(&b)) {
+            if let Some(glyph) = by_name(name) {
+                return Some(glyph);
+            }
+            // The same character under another spelling: /Differences says
+            // `uni00E9`, the program calls it `eacute`.
+            if let Some(glyph) = pdf_text::agl::char_for_name(name).and_then(by_char) {
+                return Some(glyph);
+            }
+        }
+        if self.text.explicit_base_encoding {
+            if let Some(glyph) = self.text.encoding_char(code).and_then(by_char) {
+                return Some(glyph);
+            }
+        }
+        if let Some(glyph) = byte.and_then(&builtin) {
+            return Some(glyph);
+        }
+        if let Some(glyph) = self.text.encoding_char(code).and_then(by_char) {
+            return Some(glyph);
+        }
+        self.text.decode_code(code).chars().next().and_then(by_char)
     }
 
     /// CFF glyph lookup.
@@ -209,26 +449,33 @@ impl RenderFont {
     /// encoding's glyph *name*, which is how CFF addresses glyphs natively.
     fn cff_glyph_id(&self, code: u32, program: &CffFont) -> Option<u16> {
         if self.composite {
-            let cid = u16::try_from(code).ok()?;
+            let cid = u16::try_from(self.text.cid(code)).ok()?;
             if let Some(gid) = program.gid_for_cid(cid) {
                 return Some(gid);
             }
             return (usize::from(cid) < program.num_glyphs()).then_some(cid);
         }
 
-        // Simple fonts: the encoding gives a character, and the character's
-        // standard name is how CFF addresses the glyph.
-        let decoded = self.text.decode_code(code);
-        if let Some(ch) = decoded.chars().next() {
-            if let Some(name) = cff::standard_name_for_char(ch) {
-                if let Some(gid) = program.gid_for_name(name) {
-                    return Some(gid);
-                }
-            }
+        // Simple fonts are addressed by glyph *name*. The /Differences name is
+        // the authority: it names the glyph the document means, whatever
+        // Unicode that glyph happens to look like — legacy Indic fonts call a
+        // Telugu letter `exclam`, symbol fonts call a bullet `a1`. Subsetters
+        // that discard names leave synthetic ones (`g42`) whose number is the
+        // glyph index.
+        let num_glyphs = program.num_glyphs();
+        let by_name = |name: &str| {
+            program
+                .gid_for_name(name)
+                .or_else(|| gid_from_glyph_name(name, num_glyphs))
+        };
+        if let Some(gid) =
+            self.named_glyph(code, by_name, |byte| program.gid_for_builtin_code(byte))
+        {
+            return Some(gid);
         }
         // Subset fonts frequently have no usable charset, and are built so the
         // code is already the glyph index.
-        if (code as usize) < program.num_glyphs() {
+        if (code as usize) < num_glyphs {
             return u16::try_from(code).ok();
         }
         None
@@ -236,11 +483,12 @@ impl RenderFont {
 
     fn glyph_id(&self, code: u32, program: &TrueTypeFont) -> Option<u16> {
         if self.composite {
-            // Identity-H: the code *is* the CID.
-            let cid = code as usize;
+            // The CMap turns the code into a CID; /CIDToGIDMap (or identity)
+            // turns the CID into a glyph.
+            let cid = self.text.cid(code);
             return match &self.cid_to_gid {
-                Some(table) => table.get(cid).copied(),
-                None => Some(code as u16),
+                Some(table) => table.get(cid as usize).copied(),
+                None => u16::try_from(cid).ok(),
             };
         }
 
@@ -254,6 +502,28 @@ impl RenderFont {
                 return Some(gid);
             }
         }
+        // The encoding's character (base encoding + /Differences) is what the
+        // spec looks up in the cmap (ISO 32000-1, 9.6.6.4).
+        if let Some(ch) = self.text.encoding_char(code) {
+            if let Some(gid) = program.glyph_for_char(ch as u32) {
+                return Some(gid);
+            }
+        }
+        // A /Differences name the cmap cannot express — a borrowed Latin name
+        // on an Indic glyph, or a name with no Unicode at all — still reaches
+        // its glyph through the font's own `post` names.
+        if let Ok(byte) = u8::try_from(code) {
+            if let Some(name) = self.text.glyph_names.get(&byte) {
+                if let Some(gid) = program.gid_for_name(name) {
+                    return Some(gid);
+                }
+                if let Some(gid) = gid_from_glyph_name(name, usize::from(program.num_glyphs())) {
+                    return Some(gid);
+                }
+            }
+        }
+        // ToUnicode is for extraction, and can name several characters for
+        // one glyph; it is only a last resort for picking one.
         let decoded = self.text.decode_code(code);
         if let Some(ch) = decoded.chars().next() {
             if let Some(gid) = program.glyph_for_char(ch as u32) {
@@ -272,20 +542,47 @@ impl RenderFont {
     }
 }
 
+/// Glyph id for the synthetic names subsetters emit when they have thrown the
+/// real ones away — `g42`, `glyph42`, `index42`, `cid42`, `G42` — where the
+/// number *is* the glyph index.
+fn gid_from_glyph_name(name: &str, num_glyphs: usize) -> Option<u16> {
+    let digits = ["glyph", "index", "cid", "g", "G"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let gid: usize = digits.parse().ok()?;
+    (gid < num_glyphs).then_some(gid as u16)
+}
+
 /// Parse whichever font program the descriptor embeds.
 ///
-/// `/FontFile2` is TrueType and `/FontFile3` is CFF, except that a
-/// `/Subtype /OpenType` program can be either — an sfnt wrapper holding
-/// `glyf` *or* `CFF `. So the bytes are tried as TrueType first and fall
-/// through to CFF, which knows how to unwrap an OpenType container.
+/// `/FontFile` is Type 1, `/FontFile2` TrueType and `/FontFile3` CFF, except
+/// that a `/Subtype /OpenType` program can be either — an sfnt wrapper
+/// holding `glyf` *or* `CFF `. So the bytes are tried as TrueType first and
+/// fall through to CFF, which knows how to unwrap an OpenType container.
+/// Writers mislabel programs often enough that a format which fails to parse
+/// is retried as the others before giving up.
 fn load_program(doc: &PdfDocument, descriptor: &Dictionary) -> (Option<Program>, GlyphSource) {
-    let Some((data, prefer_truetype)) = font_program(doc, descriptor) else {
+    let Some(embedded) = font_program(doc, descriptor) else {
         return (None, GlyphSource::NotEmbedded);
     };
+    let EmbeddedProgram {
+        data,
+        prefer_truetype,
+        type1,
+        length1,
+    } = embedded;
 
+    if type1 {
+        if let Some(font) = Type1Font::parse(&data, length1) {
+            return (Some(Program::Type1(Box::new(font))), GlyphSource::Type1);
+        }
+    }
     if prefer_truetype {
         if let Some(font) = TrueTypeFont::parse(data.clone()) {
-            if font.has_outlines() {
+            if font.has_glyf() {
                 return (
                     Some(Program::TrueType(Box::new(font))),
                     GlyphSource::TrueType,
@@ -299,8 +596,8 @@ fn load_program(doc: &PdfDocument, descriptor: &Dictionary) -> (Option<Program>,
         }
     }
     if !prefer_truetype {
-        if let Some(font) = TrueTypeFont::parse(data) {
-            if font.has_outlines() {
+        if let Some(font) = TrueTypeFont::parse(data.clone()) {
+            if font.has_glyf() {
                 return (
                     Some(Program::TrueType(Box::new(font))),
                     GlyphSource::TrueType,
@@ -308,7 +605,24 @@ fn load_program(doc: &PdfDocument, descriptor: &Dictionary) -> (Option<Program>,
             }
         }
     }
+    // A Type 1 program filed under another key.
+    if !type1 {
+        if let Some(font) = Type1Font::parse(&data, None) {
+            return (Some(Program::Type1(Box::new(font))), GlyphSource::Type1);
+        }
+    }
     (None, GlyphSource::UnsupportedProgram)
+}
+
+/// An embedded program and what its descriptor says it is.
+struct EmbeddedProgram {
+    data: Vec<u8>,
+    /// `/FontFile2`, or `/FontFile3` with `/Subtype /OpenType`.
+    prefer_truetype: bool,
+    /// `/FontFile`: a Type 1 program.
+    type1: bool,
+    /// `/Length1`: the size of a Type 1 program's cleartext part.
+    length1: Option<usize>,
 }
 
 fn descendant_font(doc: &PdfDocument, dict: &Dictionary) -> Option<Dictionary> {
@@ -321,8 +635,8 @@ fn descendant_font(doc: &PdfDocument, dict: &Dictionary) -> Option<Dictionary> {
     doc.resolve_dict(&resolved).cloned()
 }
 
-/// Returns `(bytes, is_truetype)` for an embedded font program.
-fn font_program(doc: &PdfDocument, descriptor: &Dictionary) -> Option<(Vec<u8>, bool)> {
+/// The embedded font program, if the descriptor has one.
+fn font_program(doc: &PdfDocument, descriptor: &Dictionary) -> Option<EmbeddedProgram> {
     for (key, is_truetype) in [
         ("FontFile2", true),
         ("FontFile3", false),
@@ -339,9 +653,19 @@ fn font_program(doc: &PdfDocument, descriptor: &Dictionary) -> Option<(Vec<u8>, 
                 .get("Subtype")
                 .and_then(PdfObject::as_name)
                 .unwrap_or("");
-            let truetype = is_truetype || subtype == "OpenType";
+            let length1 = stream
+                .dictionary
+                .get("Length1")
+                .map(|v| doc.resolve_value(v))
+                .and_then(|v| v.as_i64())
+                .and_then(|v| usize::try_from(v).ok());
             if let Ok(data) = doc.stream_data(&stream) {
-                return Some((data, truetype));
+                return Some(EmbeddedProgram {
+                    data,
+                    prefer_truetype: is_truetype || subtype == "OpenType",
+                    type1: key == "FontFile",
+                    length1,
+                });
             }
         }
     }
@@ -352,6 +676,28 @@ fn font_program(doc: &PdfDocument, descriptor: &Dictionary) -> Option<(Vec<u8>, 
 mod tests {
     use super::*;
     use pdf_core::object::PdfObject;
+
+    #[test]
+    fn synthetic_subset_names_resolve_to_their_glyph_index() {
+        assert_eq!(gid_from_glyph_name("g42", 100), Some(42));
+        assert_eq!(gid_from_glyph_name("glyph7", 100), Some(7));
+        assert_eq!(gid_from_glyph_name("index0", 100), Some(0));
+        assert_eq!(gid_from_glyph_name("cid13", 100), Some(13));
+        assert_eq!(gid_from_glyph_name("G9", 100), Some(9));
+        // Out of range, and names that merely start with a prefix letter.
+        assert_eq!(gid_from_glyph_name("g420", 100), None);
+        assert_eq!(gid_from_glyph_name("gamma", 100), None);
+        assert_eq!(gid_from_glyph_name("g", 100), None);
+        assert_eq!(gid_from_glyph_name("exclam", 100), None);
+    }
+
+    #[test]
+    fn uni_names_decode_to_their_character() {
+        assert_eq!(cff::char_for_uni_name("uni0C15"), Some('\u{0C15}'));
+        assert_eq!(cff::char_for_uni_name("u1F600"), Some('\u{1F600}'));
+        assert_eq!(cff::char_for_uni_name("exclam"), None);
+        assert_eq!(cff::char_for_uni_name("uni0C"), None);
+    }
 
     #[test]
     fn missing_descriptor_draws_a_substitute() {

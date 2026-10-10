@@ -1,0 +1,47 @@
+# Substitute faces bundled into data/fallback-fonts.bin, in the order they
+# are tried for a character Roboto does not cover. Each is Noto, unhinted,
+# SIL Open Font License 1.1. Regenerate with the build_fallback_bundle
+# example after editing this list.
+
+# Latin, Greek and Cyrillic beyond Roboto: African, Central Asian, IPA.
+NotoSans
+
+# Scripts of living languages.
+NotoNaskhArabic
+NotoSansHebrew
+NotoSansDevanagari
+NotoSansBengali
+NotoSansGurmukhi
+NotoSansGujarati
+NotoSansOriya
+NotoSansTamil
+NotoSansTelugu
+NotoSansKannada
+NotoSansMalayalam
+NotoSansSinhala
+NotoSansThai
+NotoSansLao
+NotoSansKhmer
+NotoSansMyanmar
+NotoSerifTibetan
+NotoSansGeorgian
+NotoSansArmenian
+NotoSansEthiopic
+NotoSansThaana
+NotoSansSyriac
+NotoSansMongolian
+NotoSansYi
+NotoSansCherokee
+NotoSansCanadianAboriginal
+NotoSansTifinagh
+NotoSansNKo
+NotoSansOlChiki
+NotoSansMeeteiMayek
+NotoSansJavanese
+NotoSansAdlam
+
+# Mathematics, arrows, dingbats and other symbols: what the standard Symbol
+# and ZapfDingbats fonts draw.
+NotoSansMath
+NotoSansSymbols
+NotoSansSymbols2

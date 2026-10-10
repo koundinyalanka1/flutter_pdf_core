@@ -357,10 +357,18 @@ impl<'a> Extractor<'a> {
                                         PdfObject::Real(v) => *v,
                                         _ => 0.0,
                                     };
+                                    let vertical = state
+                                        .font_key
+                                        .as_deref()
+                                        .and_then(|k| self.font_cache.get(k))
+                                        .is_some_and(|f| f.text.vertical);
                                     if let Some(t) = text.as_mut() {
-                                        let tx =
-                                            -adjust / 1000.0 * state.font_size * state.horiz_scale;
-                                        t.advance(tx);
+                                        let shift = -adjust / 1000.0 * state.font_size;
+                                        if vertical {
+                                            t.advance_vertical(shift);
+                                        } else {
+                                            t.advance(shift * state.horiz_scale);
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -478,10 +486,12 @@ impl<'a> Extractor<'a> {
                     .and_then(|f| f.metrics.as_ref())
                     .map(|f| f.advance_width(code))
                     .unwrap_or_else(|| font.width(code));
-                let mut advance = width / 1000.0 * state.font_size + state.char_spacing;
-                if font.is_space_code(code) {
-                    advance += state.word_spacing;
-                }
+                let spacing = state.char_spacing
+                    + if font.is_space_code(code) {
+                        state.word_spacing
+                    } else {
+                        0.0
+                    };
                 let mut bounds = [
                     0.0,
                     loaded.map(|f| f.descent).unwrap_or(-200.0),
@@ -497,10 +507,29 @@ impl<'a> Extractor<'a> {
                     bounds[2] = bounds[2].max(ink[2]);
                     bounds[3] = bounds[3].max(ink[3]);
                 }
-                glyphs.push((decoded, advance * state.horiz_scale, bounds));
+                let advance = if font.vertical {
+                    // The text position is the glyph's vertical origin; its
+                    // box hangs below it, offset by the position vector.
+                    let (w1y, vx, vy) = font.vertical_metrics(code);
+                    bounds = [
+                        bounds[0] - vx,
+                        bounds[1] - vy,
+                        bounds[2] - vx,
+                        bounds[3] - vy,
+                    ];
+                    w1y / 1000.0 * state.font_size + spacing
+                } else {
+                    (width / 1000.0 * state.font_size + spacing) * state.horiz_scale
+                };
+                glyphs.push((decoded, advance, bounds));
             }
             glyphs
         };
+        let vertical = state
+            .font_key
+            .as_deref()
+            .and_then(|k| self.font_cache.get(k))
+            .is_some_and(|f| f.text.vertical);
 
         let has_text = glyphs.iter().any(|g| !g.0.is_empty());
         for (decoded, _, _) in &glyphs {
@@ -549,16 +578,37 @@ impl<'a> Extractor<'a> {
                 }
             }
             if advance.is_finite() {
-                text.advance(advance);
+                if vertical {
+                    text.advance_vertical(advance);
+                } else {
+                    text.advance(advance);
+                }
             }
         }
         if has_text {
-            let scale = user_matrix.a.hypot(user_matrix.b).max(1e-8);
-            let sign = (state.font_size * state.horiz_scale).signum();
+            // The "baseline" of vertical text runs down the column — text
+            // space's −y — and its size is measured across it.
+            let (along, across) = if vertical {
+                (
+                    (-user_matrix.c, -user_matrix.d),
+                    (user_matrix.a, user_matrix.b),
+                )
+            } else {
+                (
+                    (user_matrix.a, user_matrix.b),
+                    (user_matrix.c, user_matrix.d),
+                )
+            };
+            let scale = along.0.hypot(along.1).max(1e-8);
+            let sign = if vertical {
+                state.font_size.signum()
+            } else {
+                (state.font_size * state.horiz_scale).signum()
+            };
             self.last_baseline = Some(Baseline {
                 end: text.position(ctm),
-                direction: (user_matrix.a / scale * sign, user_matrix.b / scale * sign),
-                size: (user_matrix.c.hypot(user_matrix.d) * state.font_size.abs()).max(1.0),
+                direction: (along.0 / scale * sign, along.1 / scale * sign),
+                size: (across.0.hypot(across.1) * state.font_size.abs()).max(1.0),
             });
         }
     }
@@ -628,10 +678,12 @@ pub(crate) mod test_support {
     pub fn doc_with_content(content: &[u8]) -> PdfDocument {
         let mut doc = PdfDocument::new_empty("1.7");
 
+        // Not one of the standard 14: the layout tests reason in the flat
+        // 500-unit default width, which Helvetica's real metrics would change.
         let mut font = Dictionary::new();
         font.insert("Type".into(), PdfObject::Name("Font".into()));
         font.insert("Subtype".into(), PdfObject::Name("Type1".into()));
-        font.insert("BaseFont".into(), PdfObject::Name("Helvetica".into()));
+        font.insert("BaseFont".into(), PdfObject::Name("TestSans".into()));
         font.insert("Encoding".into(), PdfObject::Name("WinAnsiEncoding".into()));
         let font_id = doc.add_object(PdfObject::Dictionary(font));
 

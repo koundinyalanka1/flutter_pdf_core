@@ -151,6 +151,11 @@ impl TextObject {
         self.text_matrix = Matrix::translation(tx, 0.0).multiply(&self.text_matrix);
     }
 
+    /// Vertical writing moves the text position down the column instead.
+    pub fn advance_vertical(&mut self, ty: f64) {
+        self.text_matrix = Matrix::translation(0.0, ty).multiply(&self.text_matrix);
+    }
+
     /// Device-space position of the current text origin.
     pub fn position(&self, ctm: &Matrix) -> (f64, f64) {
         let m = self.text_matrix.multiply(ctm);

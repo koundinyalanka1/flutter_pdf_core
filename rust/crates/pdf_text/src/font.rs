@@ -7,20 +7,52 @@
 //! * /Widths and CID /W arrays for advance computation
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use pdf_core::document::PdfDocument;
 use pdf_core::error::Result;
-use pdf_core::lexer::{Lexer, Token};
 use pdf_core::object::{Dictionary, PdfObject};
+
+use crate::cmap::{self, CMap, UnicodeForm};
 
 #[derive(Debug, Clone, Default)]
 pub struct Font {
-    /// 2-byte codes (Identity-H Type0 fonts).
-    pub two_byte_codes: bool,
+    /// For a composite (Type0) font, the CMap that splits strings into codes
+    /// and maps each code to a CID. `None` for simple fonts, whose codes are
+    /// single bytes.
+    pub cmap: Option<Arc<CMap>>,
+    /// The CMap is a predefined Unicode-keyed one, so codes spell text.
+    unicode_form: Option<UnicodeForm>,
+    /// `Registry-Ordering` of a composite font's character collection, e.g.
+    /// `Adobe-Japan1`, for CID → Unicode when there is no ToUnicode.
+    cid_collection: Option<String>,
+    cid_unicode: OnceLock<Option<Arc<HashMap<u32, String>>>>,
+    /// Vertical writing (WMode 1): glyphs advance down the page.
+    pub vertical: bool,
+    /// Per-CID vertical metrics from `/W2`: `(w1y, vx, vy)` in 1000ths of an
+    /// em, w1y being the (usually negative) vertical advance.
+    pub vertical_metrics: HashMap<u32, (f64, f64, f64)>,
+    /// `/DW2`: default `(vy, w1y)` for vertical writing.
+    pub default_vertical: (f64, f64),
     /// code -> unicode string, from the ToUnicode CMap.
     pub to_unicode: HashMap<u32, String>,
     /// code -> char for simple fonts (base encoding + /Differences).
     pub encoding: HashMap<u8, char>,
+    /// code -> glyph *name*, exactly as `/Differences` spelled it.
+    ///
+    /// For a simple font the name — not the Unicode character — is what
+    /// addresses a glyph in the embedded program, and the two are not
+    /// interchangeable. Legacy Indic, symbol and math fonts routinely give
+    /// Telugu or mathematical glyphs ordinary Latin names like `exclam` or
+    /// `infinity`, so deriving a name back from [`Font::decode_code`] picks
+    /// the wrong glyph or none at all. Extraction still uses `encoding`;
+    /// rendering needs this.
+    pub glyph_names: HashMap<u8, String>,
+    /// The PDF named a base encoding outright — `/Encoding /WinAnsiEncoding`
+    /// or a `/BaseEncoding` entry. Otherwise the base is implicit, and for an
+    /// embedded font that means the font program's own built-in encoding,
+    /// which `encoding` (filled from StandardEncoding) cannot represent.
+    pub explicit_base_encoding: bool,
     /// code -> advance width (in 1000ths of an em).
     pub widths: HashMap<u32, f64>,
     /// Default width for codes missing from `widths`.
@@ -31,22 +63,55 @@ pub struct Font {
 }
 
 impl Font {
-    /// Split a string operand into character codes.
+    /// True for a composite (Type0) font.
+    pub fn is_composite(&self) -> bool {
+        self.cmap.is_some()
+    }
+
+    /// A composite font's character collection, `Registry-Ordering` — e.g.
+    /// `Adobe-Japan1` — which says whose glyph forms the text expects.
+    pub fn cid_collection(&self) -> Option<&str> {
+        self.cid_collection.as_deref()
+    }
+
+    /// Split a string operand into character codes — one byte each for a
+    /// simple font, and as the CMap's codespace dictates (one to four bytes,
+    /// possibly mixed) for a composite one.
     pub fn codes(&self, bytes: &[u8]) -> Vec<u32> {
-        if self.two_byte_codes {
-            bytes
-                .chunks(2)
-                .map(|c| {
-                    if c.len() == 2 {
-                        u32::from(c[0]) << 8 | u32::from(c[1])
-                    } else {
-                        u32::from(c[0])
-                    }
-                })
-                .collect()
-        } else {
-            bytes.iter().map(|&b| u32::from(b)).collect()
+        let Some(cmap) = &self.cmap else {
+            return bytes.iter().map(|&b| u32::from(b)).collect();
+        };
+        let mut out = Vec::with_capacity(bytes.len() / 2 + 1);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (code, length) = cmap.next_code(rest);
+            out.push(code);
+            rest = &rest[length.clamp(1, rest.len())..];
         }
+        out
+    }
+
+    /// The CID a composite font's code selects; a simple font's code is
+    /// returned unchanged.
+    pub fn cid(&self, code: u32) -> u32 {
+        match &self.cmap {
+            Some(cmap) => cmap.cid_of(code),
+            None => code,
+        }
+    }
+
+    /// The character the font's *encoding* (base encoding plus `/Differences`)
+    /// assigns to a single-byte code, ignoring `/ToUnicode`.
+    ///
+    /// Glyph selection must use this, not [`Font::decode_code`]: ToUnicode
+    /// exists for text extraction and freely maps one code to several
+    /// characters — a ligature to `"fi"`, an Indic conjunct to three code
+    /// points — whose first character names the wrong glyph.
+    pub fn encoding_char(&self, code: u32) -> Option<char> {
+        if self.is_composite() {
+            return None;
+        }
+        self.encoding.get(&u8::try_from(code).ok()?).copied()
     }
 
     /// Best-effort Unicode for one code.
@@ -54,24 +119,63 @@ impl Font {
         if let Some(s) = self.to_unicode.get(&code) {
             return s.clone();
         }
-        if !self.two_byte_codes {
-            if let Some(&c) = self.encoding.get(&(code as u8)) {
-                return c.to_string();
-            }
-            // Latin-1 fallback for the printable range.
-            if (0x20..=0xFF).contains(&code) {
-                if let Some(c) = char::from_u32(code) {
-                    return c.to_string();
+        if self.is_composite() {
+            // A Unicode-keyed CMap spells the text in its codes.
+            if let Some(form) = self.unicode_form {
+                let length = ((32 - code.leading_zeros() as usize).div_ceil(8)).max(1);
+                if let Some(text) = form.decode(code, length) {
+                    return text;
                 }
+            }
+            // Otherwise the CID names a glyph in a known character
+            // collection, and Adobe publishes what each one means.
+            if let Some(table) = self.cid_unicode_table() {
+                if let Some(text) = table.get(&self.cid(code)) {
+                    return text.clone();
+                }
+            }
+            return String::new();
+        }
+        // A /Differences name can stand for several characters — `f_f_i`,
+        // `T_h` — which the one-character encoding table cannot hold.
+        if let Some(text) = self
+            .glyph_names
+            .get(&(code as u8))
+            .and_then(|name| crate::agl::text_for_name(name))
+        {
+            return text;
+        }
+        if let Some(&c) = self.encoding.get(&(code as u8)) {
+            return c.to_string();
+        }
+        // Latin-1 fallback for the printable range.
+        if (0x20..=0xFF).contains(&code) {
+            if let Some(c) = char::from_u32(code) {
+                return c.to_string();
             }
         }
         String::new()
     }
 
+    fn cid_unicode_table(&self) -> Option<&Arc<HashMap<u32, String>>> {
+        self.cid_unicode
+            .get_or_init(|| {
+                self.cid_collection
+                    .as_deref()
+                    .and_then(cmap::cid_to_unicode)
+            })
+            .as_ref()
+    }
+
+    /// Composite fonts key `/W` by CID, simple fonts `/Widths` by code.
+    fn width_key(&self, code: u32) -> u32 {
+        self.cid(code)
+    }
+
     /// Advance width for one code, in text-space units (em/1000).
     pub fn width(&self, code: u32) -> f64 {
         self.widths
-            .get(&code)
+            .get(&self.width_key(code))
             .copied()
             .unwrap_or(self.default_width)
     }
@@ -82,12 +186,28 @@ impl Font {
     /// nothing and 500 is a guess", which is the difference between honouring
     /// a document's layout and inventing one.
     pub fn explicit_width(&self, code: u32) -> Option<f64> {
-        self.widths.get(&code).copied()
+        self.widths.get(&self.width_key(code)).copied()
     }
 
-    /// Whether a (single-byte) code is an ASCII space — used for Tw.
+    /// Vertical metrics for one code in vertical writing: `(w1y, vx, vy)`,
+    /// where `(vx, vy)` is the position vector from the horizontal origin to
+    /// the vertical one. Unlisted CIDs use `/DW2` and half the glyph's width.
+    pub fn vertical_metrics(&self, code: u32) -> (f64, f64, f64) {
+        if let Some(&metrics) = self.vertical_metrics.get(&self.cid(code)) {
+            return metrics;
+        }
+        let (vy, w1y) = self.default_vertical;
+        (w1y, self.width(code) / 2.0, vy)
+    }
+
+    /// Whether a code is the single-byte space that word spacing applies to.
+    /// In a composite font only a code the CMap defines as one byte counts.
     pub fn is_space_code(&self, code: u32) -> bool {
-        !self.two_byte_codes && code == 32
+        code == 32
+            && match &self.cmap {
+                Some(cmap) => cmap.is_code_of_length(32, 1),
+                None => true,
+            }
     }
 }
 
@@ -99,17 +219,29 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
         .unwrap_or("");
     let mut font = Font {
         default_width: 500.0,
+        default_vertical: (880.0, -1000.0),
         ..Default::default()
     };
 
     if subtype == "Type0" {
-        font.two_byte_codes = matches!(
-            dict.get("Encoding").and_then(PdfObject::as_name),
-            Some("Identity-H") | Some("Identity-V") | None
-        );
+        let encoding = dict.get("Encoding").map(|e| doc.resolve_value(e));
+        let cmap = match &encoding {
+            Some(PdfObject::Name(name)) => {
+                font.unicode_form = cmap::is_unicode_keyed(name);
+                cmap::predefined(name)
+            }
+            Some(PdfObject::Stream(_)) => encoding.as_ref().and_then(|e| embedded_cmap(doc, e, 0)),
+            _ => None,
+        };
+        // Identity-H is the default and the only safe guess when a CMap is
+        // missing or names one this build does not have.
+        let cmap =
+            cmap.unwrap_or_else(|| cmap::predefined("Identity-H").expect("Identity-H is built in"));
+        font.vertical = cmap.vertical;
+        font.cmap = Some(cmap);
         font.default_width = 1000.0;
         font.authoritative_default_width = true;
-        // Descendant CIDFont carries /W and /DW.
+        // Descendant CIDFont carries /W, /DW, /W2, /DW2 and its collection.
         if let Some(PdfObject::Array(desc)) =
             dict.get("DescendantFonts").map(|d| doc.resolve_value(d))
         {
@@ -125,6 +257,33 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
                 if let Some(PdfObject::Array(w)) = cid_dict.get("W").map(|w| doc.resolve_value(w)) {
                     parse_cid_widths(doc, &w, &mut font.widths);
                 }
+                if let Some(PdfObject::Array(dw2)) =
+                    cid_dict.get("DW2").map(|v| doc.resolve_value(v))
+                {
+                    let values: Vec<f64> = dw2
+                        .iter()
+                        .filter_map(|v| number(&doc.resolve_value(v)))
+                        .collect();
+                    if let [vy, w1y] = values.as_slice() {
+                        font.default_vertical = (*vy, *w1y);
+                    }
+                }
+                if let Some(PdfObject::Array(w2)) = cid_dict.get("W2").map(|v| doc.resolve_value(v))
+                {
+                    parse_vertical_metrics(doc, &w2, &mut font.vertical_metrics);
+                }
+                font.cid_collection = cid_dict
+                    .get("CIDSystemInfo")
+                    .and_then(|info| doc.resolve_dict(info))
+                    .and_then(|info| {
+                        let text = |key: &str| match info.get(key).map(|v| doc.resolve_value(v)) {
+                            Some(PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes)) => {
+                                Some(String::from_utf8_lossy(&bytes).into_owned())
+                            }
+                            _ => None,
+                        };
+                        Some(format!("{}-{}", text("Registry")?, text("Ordering")?))
+                    });
             }
         }
     } else {
@@ -139,20 +298,35 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
             font.default_width = width;
             font.authoritative_default_width = true;
         }
-        // Simple font: base encoding + differences.
+        // Simple font: base encoding + differences. When the PDF names no
+        // base, a standard symbolic font (Symbol, ZapfDingbats) means its own
+        // built-in encoding; everything else means StandardEncoding.
+        let base_font = dict
+            .get("BaseFont")
+            .and_then(PdfObject::as_name)
+            .unwrap_or("");
+        let standard = crate::standard14::lookup(base_font);
+        let implicit_base = |font: &mut Font| match standard.filter(|s| s.is_symbolic()) {
+            Some(symbolic) => apply_builtin_encoding(symbolic, font),
+            None => apply_base_encoding("StandardEncoding", &mut font.encoding),
+        };
         match dict.get("Encoding").map(|e| doc.resolve_value(e)) {
-            Some(PdfObject::Name(name)) => apply_base_encoding(&name, &mut font.encoding),
+            Some(PdfObject::Name(name)) => {
+                font.explicit_base_encoding = true;
+                apply_base_encoding(&name, &mut font.encoding)
+            }
             Some(PdfObject::Dictionary(enc)) => {
                 if let Some(base) = enc.get("BaseEncoding").and_then(PdfObject::as_name) {
+                    font.explicit_base_encoding = true;
                     apply_base_encoding(base, &mut font.encoding);
                 } else {
-                    apply_base_encoding("StandardEncoding", &mut font.encoding);
+                    implicit_base(&mut font);
                 }
                 if let Some(PdfObject::Array(diffs)) = enc.get("Differences") {
-                    apply_differences(diffs, &mut font.encoding);
+                    apply_differences(diffs, &mut font.encoding, &mut font.glyph_names);
                 }
             }
-            _ => apply_base_encoding("StandardEncoding", &mut font.encoding),
+            _ => implicit_base(&mut font),
         }
         // /Widths indexed from /FirstChar.
         let first = dict
@@ -167,6 +341,15 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
                 font.widths.insert((first + i as i64).max(0) as u32, value);
             }
         }
+        // A standard font may omit /Widths altogether; the reader is meant
+        // to know them. Without this its lines were set at a flat 500 units
+        // per character. An explicit /MissingWidth is still the document's
+        // own word, and wins.
+        if font.widths.is_empty() && !font.authoritative_default_width {
+            if let Some(standard) = standard {
+                apply_standard_widths(standard, &mut font);
+            }
+        }
     }
 
     // ToUnicode CMap overrides everything.
@@ -176,6 +359,115 @@ pub fn load_font(doc: &PdfDocument, dict: &Dictionary) -> Result<Font> {
         }
     }
     Ok(font)
+}
+
+/// A CMap embedded as a stream, with its parent — named by the stream's
+/// `/UseCMap` entry or a `usecmap` in the program — resolved first.
+fn embedded_cmap(doc: &PdfDocument, object: &PdfObject, depth: usize) -> Option<Arc<CMap>> {
+    if depth > 4 {
+        return None;
+    }
+    let PdfObject::Stream(stream) = doc.resolve_value(object) else {
+        return match doc.resolve_value(object) {
+            PdfObject::Name(name) => cmap::predefined(&name),
+            _ => None,
+        };
+    };
+    let data = doc.stream_data(&stream).ok()?;
+    let parsed = cmap::parse(&data);
+    let parent = match stream.dictionary.get("UseCMap") {
+        Some(entry) => embedded_cmap(doc, entry, depth + 1),
+        None => parsed.parent.as_deref().and_then(cmap::predefined),
+    };
+    let vertical_by_dict = stream
+        .dictionary
+        .get("WMode")
+        .and_then(PdfObject::as_i64)
+        .map(|mode| mode == 1);
+    let mut built = parsed.into_cmap(parent);
+    if let Some(vertical) = vertical_by_dict {
+        built.vertical = vertical;
+    }
+    Some(Arc::new(built))
+}
+
+/// A standard symbolic font's own encoding, as characters and glyph names.
+fn apply_builtin_encoding(standard: &crate::standard14::StandardFont, font: &mut Font) {
+    for code in 0u8..=255 {
+        if let Some(name) = standard.builtin_name(code) {
+            if let Some(ch) = glyph_to_char(name) {
+                font.encoding.insert(code, ch);
+            }
+            font.glyph_names.insert(code, name.to_owned());
+        }
+    }
+}
+
+/// Widths for every code from a standard font's metrics, through the glyph
+/// name each code's encoding gives it.
+fn apply_standard_widths(standard: &crate::standard14::StandardFont, font: &mut Font) {
+    for code in 0u8..=255 {
+        let named = font
+            .glyph_names
+            .get(&code)
+            .and_then(|name| standard.width(name));
+        let width = named.or_else(|| {
+            let ch = *font.encoding.get(&code)?;
+            crate::agl::names_for_char(ch)
+                .iter()
+                .find_map(|name| standard.width(name))
+        });
+        if let Some(width) = width {
+            font.widths.insert(u32::from(code), width);
+        }
+    }
+}
+
+/// CID /W2 array: [ c [w1y vx vy w1y vx vy …] ] or [ c1 c2 w1y vx vy ].
+fn parse_vertical_metrics(
+    doc: &PdfDocument,
+    items: &[PdfObject],
+    out: &mut HashMap<u32, (f64, f64, f64)>,
+) {
+    let mut i = 0;
+    while i < items.len() {
+        let Some(first) = doc.resolve_value(&items[i]).as_i64() else {
+            i += 1;
+            continue;
+        };
+        match items.get(i + 1).map(|value| doc.resolve_value(value)) {
+            Some(PdfObject::Array(values)) => {
+                let numbers: Vec<f64> = values
+                    .iter()
+                    .filter_map(|v| number(&doc.resolve_value(v)))
+                    .collect();
+                for (offset, triple) in numbers.chunks_exact(3).take(65536).enumerate() {
+                    let cid = first + offset as i64;
+                    if (0..=65535).contains(&cid) {
+                        out.insert(cid as u32, (triple[0], triple[1], triple[2]));
+                    }
+                }
+                i += 2;
+            }
+            Some(second) => {
+                let Some(last) = second.as_i64() else {
+                    i += 2;
+                    continue;
+                };
+                let values: Vec<f64> = (2..5)
+                    .filter_map(|k| items.get(i + k))
+                    .filter_map(|v| number(&doc.resolve_value(v)))
+                    .collect();
+                if let [w1y, vx, vy] = values.as_slice() {
+                    for cid in first.max(0)..=last.min(65535) {
+                        out.insert(cid as u32, (*w1y, *vx, *vy));
+                    }
+                }
+                i += 5;
+            }
+            None => break,
+        }
+    }
 }
 
 /// CID /W array: [ c [w1 w2 …] ] or [ c1 c2 w ].
@@ -237,101 +529,10 @@ fn number(object: &PdfObject) -> Option<f64> {
     }
 }
 
-/// Parse bfchar/bfrange sections out of a ToUnicode CMap.
+/// Parse bfchar/bfrange sections out of a ToUnicode CMap, including the
+/// array form of bfrange that writers use for ligatures and conjuncts.
 fn parse_to_unicode(data: &[u8], out: &mut HashMap<u32, String>) {
-    let mut lexer = Lexer::new(data);
-    let mut window: Vec<Token> = Vec::new();
-    #[derive(PartialEq)]
-    enum Mode {
-        None,
-        BfChar,
-        BfRange,
-    }
-    let mut mode = Mode::None;
-
-    while let Ok(Some(tok)) = lexer.next_token() {
-        match &tok.token {
-            Token::Keyword(k) if k == "beginbfchar" => {
-                mode = Mode::BfChar;
-                window.clear();
-            }
-            Token::Keyword(k) if k == "endbfchar" => {
-                mode = Mode::None;
-                window.clear();
-            }
-            Token::Keyword(k) if k == "beginbfrange" => {
-                mode = Mode::BfRange;
-                window.clear();
-            }
-            Token::Keyword(k) if k == "endbfrange" => {
-                mode = Mode::None;
-                window.clear();
-            }
-            other => {
-                if mode == Mode::None {
-                    continue;
-                }
-                window.push(other.clone());
-                match mode {
-                    Mode::BfChar => {
-                        if window.len() == 2 {
-                            if let (Token::HexString(src), Token::HexString(dst)) =
-                                (&window[0], &window[1])
-                            {
-                                out.insert(hex_code(src), utf16_be(dst));
-                            }
-                            window.clear();
-                        }
-                    }
-                    Mode::BfRange => {
-                        if window.len() == 3 {
-                            apply_bfrange(&window[0], &window[1], &window[2], out);
-                            window.clear();
-                        }
-                    }
-                    Mode::None => {}
-                }
-            }
-        }
-    }
-}
-
-fn apply_bfrange(lo: &Token, hi: &Token, dst: &Token, out: &mut HashMap<u32, String>) {
-    let (Token::HexString(lo), Token::HexString(hi)) = (lo, hi) else {
-        return;
-    };
-    let (lo, hi) = (hex_code(lo), hex_code(hi));
-    if hi < lo || hi - lo > 0x10000 {
-        return;
-    }
-    match dst {
-        Token::HexString(base) => {
-            let base_str = utf16_be(base);
-            // Increment the last UTF-16 unit per step.
-            let mut units: Vec<u16> = base_str.encode_utf16().collect();
-            for code in lo..=hi {
-                out.insert(code, String::from_utf16_lossy(&units));
-                if let Some(last) = units.last_mut() {
-                    *last = last.wrapping_add(1);
-                }
-            }
-        }
-        Token::ArrayStart => { /* array form is consumed token-by-token; rare, skipped */ }
-        _ => {}
-    }
-}
-
-fn hex_code(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
-}
-
-fn utf16_be(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .chunks(2)
-        .filter(|c| c.len() == 2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+    out.extend(cmap::parse(data).unicode_table());
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +544,13 @@ fn apply_base_encoding(name: &str, out: &mut HashMap<u8, char>) {
     for code in 0x20..=0x7Eu8 {
         out.insert(code, code as char);
     }
+    // WinAnsi is Latin-1 from 0xA0 up — é, ü, ñ, ß — which the table of
+    // its 0x80–0x9F differences below does not list.
+    if name == "WinAnsiEncoding" {
+        for code in 0xA0..=0xFFu8 {
+            out.insert(code, code as char);
+        }
+    }
     let table: &[(u8, char)] = match name {
         "WinAnsiEncoding" => &WIN_ANSI_HIGH,
         "MacRomanEncoding" => &MAC_ROMAN_HIGH,
@@ -353,16 +561,26 @@ fn apply_base_encoding(name: &str, out: &mut HashMap<u8, char>) {
     }
 }
 
-fn apply_differences(diffs: &[PdfObject], out: &mut HashMap<u8, char>) {
+/// Walk a `/Differences` array, recording each code's Unicode character where
+/// one can be derived *and* its glyph name always. A name with no Unicode
+/// meaning is still the right way to reach the glyph, so it must survive even
+/// when `glyph_to_char` gives up.
+fn apply_differences(
+    diffs: &[PdfObject],
+    out: &mut HashMap<u8, char>,
+    names: &mut HashMap<u8, String>,
+) {
     let mut code: i64 = 0;
     for item in diffs {
         match item {
             PdfObject::Integer(v) => code = *v,
+            PdfObject::Real(v) => code = *v as i64,
             PdfObject::Name(glyph) => {
                 if (0..=255).contains(&code) {
                     if let Some(ch) = glyph_to_char(glyph) {
                         out.insert(code as u8, ch);
                     }
+                    names.insert(code as u8, glyph.clone());
                 }
                 code += 1;
             }
@@ -371,97 +589,23 @@ fn apply_differences(diffs: &[PdfObject], out: &mut HashMap<u8, char>) {
     }
 }
 
-/// A practical subset of the Adobe Glyph List plus uniXXXX support.
-fn glyph_to_char(glyph: &str) -> Option<char> {
-    if let Some(hex) = glyph.strip_prefix("uni") {
-        if hex.len() >= 4 {
-            if let Ok(v) = u32::from_str_radix(&hex[..4], 16) {
-                return char::from_u32(v);
-            }
-        }
-    }
-    if let Some(hex) = glyph.strip_prefix('u') {
-        if (4..=6).contains(&hex.len()) {
-            if let Ok(v) = u32::from_str_radix(hex, 16) {
-                return char::from_u32(v);
-            }
-        }
-    }
-    // Single-letter glyph names map to themselves (A, b, …).
-    let mut chars = glyph.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if c.is_ascii_alphanumeric() {
-            return Some(c);
-        }
-    }
-    AGL_SUBSET
-        .iter()
-        .find(|(name, _)| *name == glyph)
-        .map(|(_, c)| *c)
+/// The Unicode character a PostScript glyph name stands for, by the Adobe
+/// Glyph List specification (list names, `uniXXXX`, `uXXXX`, ligatures).
+pub fn char_for_glyph_name(glyph: &str) -> Option<char> {
+    glyph_to_char(glyph)
 }
 
-const AGL_SUBSET: [(&str, char); 60] = [
-    ("space", ' '),
-    ("exclam", '!'),
-    ("quotedbl", '"'),
-    ("numbersign", '#'),
-    ("dollar", '$'),
-    ("percent", '%'),
-    ("ampersand", '&'),
-    ("quotesingle", '\''),
-    ("parenleft", '('),
-    ("parenright", ')'),
-    ("asterisk", '*'),
-    ("plus", '+'),
-    ("comma", ','),
-    ("hyphen", '-'),
-    ("period", '.'),
-    ("slash", '/'),
-    ("zero", '0'),
-    ("one", '1'),
-    ("two", '2'),
-    ("three", '3'),
-    ("four", '4'),
-    ("five", '5'),
-    ("six", '6'),
-    ("seven", '7'),
-    ("eight", '8'),
-    ("nine", '9'),
-    ("colon", ':'),
-    ("semicolon", ';'),
-    ("less", '<'),
-    ("equal", '='),
-    ("greater", '>'),
-    ("question", '?'),
-    ("at", '@'),
-    ("bracketleft", '['),
-    ("backslash", '\\'),
-    ("bracketright", ']'),
-    ("underscore", '_'),
-    ("braceleft", '{'),
-    ("bar", '|'),
-    ("braceright", '}'),
-    ("quoteleft", '\u{2018}'),
-    ("quoteright", '\u{2019}'),
-    ("quotedblleft", '\u{201C}'),
-    ("quotedblright", '\u{201D}'),
-    ("endash", '\u{2013}'),
-    ("emdash", '\u{2014}'),
-    ("bullet", '\u{2022}'),
-    ("ellipsis", '\u{2026}'),
-    ("fi", '\u{FB01}'),
-    ("fl", '\u{FB02}'),
-    ("dagger", '\u{2020}'),
-    ("daggerdbl", '\u{2021}'),
-    ("copyright", '\u{00A9}'),
-    ("registered", '\u{00AE}'),
-    ("trademark", '\u{2122}'),
-    ("degree", '\u{00B0}'),
-    ("eacute", '\u{00E9}'),
-    ("egrave", '\u{00E8}'),
-    ("agrave", '\u{00E0}'),
-    ("ccedilla", '\u{00E7}'),
-];
+fn glyph_to_char(glyph: &str) -> Option<char> {
+    if let Some(ch) = crate::agl::char_for_name(glyph) {
+        return Some(ch);
+    }
+    // Not an AGL name, but writers do name glyphs "1" or "x" and mean it.
+    let mut chars = glyph.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_alphanumeric() => Some(c),
+        _ => None,
+    }
+}
 
 /// WinAnsi (cp1252) high range where it differs from Latin-1.
 const WIN_ANSI_HIGH: [(u8, char); 27] = [
@@ -676,9 +820,34 @@ mod tests {
             PdfObject::Name("bullet".into()),
             PdfObject::Name("uni0915".into()),
         ];
-        apply_differences(&diffs, &mut enc);
+        let mut names = HashMap::new();
+        apply_differences(&diffs, &mut enc, &mut names);
         assert_eq!(enc.get(&65), Some(&'\u{2022}'));
         assert_eq!(enc.get(&66), Some(&'\u{0915}'));
+    }
+
+    /// A legacy Telugu font names its glyphs after unrelated Latin and symbol
+    /// characters. The names are the only correct handle on those glyphs, so
+    /// they must survive whether or not they carry a Unicode meaning.
+    #[test]
+    fn differences_record_glyph_names_even_without_a_unicode_meaning() {
+        let diffs = vec![
+            PdfObject::Integer(2),
+            PdfObject::Name("greaterequal".into()),
+            PdfObject::Name("infinity".into()),
+            PdfObject::Integer(33),
+            PdfObject::Name("exclam".into()),
+            PdfObject::Name("nonesuchglyph".into()),
+        ];
+        let (mut enc, mut names) = (HashMap::new(), HashMap::new());
+        apply_differences(&diffs, &mut enc, &mut names);
+
+        assert_eq!(names.get(&2).map(String::as_str), Some("greaterequal"));
+        assert_eq!(names.get(&3).map(String::as_str), Some("infinity"));
+        assert_eq!(names.get(&33).map(String::as_str), Some("exclam"));
+        // No AGL entry, so no character — but the name is still the way in.
+        assert_eq!(enc.get(&34), None);
+        assert_eq!(names.get(&34).map(String::as_str), Some("nonesuchglyph"));
     }
 
     #[test]
@@ -755,5 +924,178 @@ endcmap
         assert_eq!(font.width(2), 555.5);
         assert_eq!(font.width(11), 700.0);
         assert_eq!(font.width(3), 1000.0);
+    }
+
+    /// A Type0 font with a predefined CMap and a CID collection, as a
+    /// Japanese or Chinese document without embedded fonts declares it.
+    fn cjk_font(encoding: &str, ordering: &str, extra: Vec<(&str, PdfObject)>) -> Font {
+        let mut cid = Dictionary::from([(
+            "CIDSystemInfo".into(),
+            PdfObject::Dictionary(Dictionary::from([
+                (
+                    "Registry".into(),
+                    PdfObject::LiteralString(b"Adobe".to_vec()),
+                ),
+                (
+                    "Ordering".into(),
+                    PdfObject::LiteralString(ordering.as_bytes().to_vec()),
+                ),
+                ("Supplement".into(), PdfObject::Integer(4)),
+            ])),
+        )]);
+        for (key, value) in extra {
+            cid.insert(key.into(), value);
+        }
+        let dict = Dictionary::from([
+            ("Subtype".into(), PdfObject::Name("Type0".into())),
+            ("Encoding".into(), PdfObject::Name(encoding.into())),
+            (
+                "DescendantFonts".into(),
+                PdfObject::Array(vec![PdfObject::Dictionary(cid)]),
+            ),
+        ]);
+        load_font(&PdfDocument::new_empty("1.7"), &dict).unwrap()
+    }
+
+    /// Shift-JIS mixes one-byte Roman with two-byte kanji in one string.
+    /// Splitting it two bytes at a time — what Identity-H assumed for every
+    /// CMap — turned Japanese documents into nonsense.
+    #[test]
+    fn shift_jis_strings_split_by_the_predefined_codespace() {
+        let font = cjk_font("90ms-RKSJ-H", "Japan1", vec![]);
+        // 日本 A 語
+        let codes = font.codes(&[0x93, 0xFA, 0x96, 0x7B, 0x41, 0x8C, 0xEA]);
+        assert_eq!(codes, vec![0x93FA, 0x967B, 0x41, 0x8CEA]);
+        let text: String = codes.iter().map(|&c| font.decode_code(c)).collect();
+        assert_eq!(text, "日本A語");
+    }
+
+    #[test]
+    fn unicode_keyed_cmaps_read_text_straight_off_the_codes() {
+        let font = cjk_font("UniGB-UCS2-H", "GB1", vec![]);
+        let codes = font.codes(&[0x4E, 0x2D, 0x65, 0x87]);
+        let text: String = codes.iter().map(|&c| font.decode_code(c)).collect();
+        assert_eq!(text, "中文");
+    }
+
+    /// `/W` is indexed by CID. With a non-identity CMap the code and the CID
+    /// differ, and reading widths by code spaced every glyph by /DW.
+    #[test]
+    fn composite_widths_are_looked_up_by_cid() {
+        let probe = cjk_font("90ms-RKSJ-H", "Japan1", vec![]);
+        let cid = probe.cid(0x8140);
+        assert_ne!(cid, 0x8140);
+        let font = cjk_font(
+            "90ms-RKSJ-H",
+            "Japan1",
+            vec![(
+                "W",
+                PdfObject::Array(vec![
+                    PdfObject::Integer(i64::from(cid)),
+                    PdfObject::Array(vec![PdfObject::Integer(777)]),
+                ]),
+            )],
+        );
+        assert_eq!(font.width(0x8140), 777.0);
+    }
+
+    #[test]
+    fn vertical_cmaps_use_dw2_unless_w2_says_otherwise() {
+        let font = cjk_font(
+            "UniJIS-UCS2-V",
+            "Japan1",
+            vec![(
+                "W2",
+                PdfObject::Array(vec![
+                    PdfObject::Integer(1),
+                    PdfObject::Integer(1),
+                    PdfObject::Integer(-500),
+                    PdfObject::Integer(250),
+                    PdfObject::Integer(800),
+                ]),
+            )],
+        );
+        assert!(font.vertical);
+        let listed = font.codes(&[0x00, 0x20]).remove(0);
+        assert_eq!(font.cid(listed), 1, "U+0020 is CID 1 in Adobe-Japan1");
+        assert_eq!(font.vertical_metrics(listed), (-500.0, 250.0, 800.0));
+        // Anything else: DW2's default [880 -1000] and half the width.
+        let other = font.codes(&[0x65, 0xE5]).remove(0);
+        assert_eq!(font.vertical_metrics(other), (-1000.0, 500.0, 880.0));
+    }
+
+    fn simple_font(base_font: &str, extra: Vec<(&str, PdfObject)>) -> Font {
+        let mut dict = Dictionary::from([
+            ("Subtype".into(), PdfObject::Name("Type1".into())),
+            ("BaseFont".into(), PdfObject::Name(base_font.into())),
+        ]);
+        for (key, value) in extra {
+            dict.insert(key.into(), value);
+        }
+        load_font(&PdfDocument::new_empty("1.7"), &dict).unwrap()
+    }
+
+    /// Symbol's code 0x61 is α. Read through StandardEncoding — what an
+    /// unencoded font dictionary used to get — it came out as "a".
+    #[test]
+    fn standard_symbol_font_uses_its_own_encoding() {
+        let font = simple_font("Symbol", vec![]);
+        let text: String = font
+            .codes(b"abp\"")
+            .iter()
+            .map(|&c| font.decode_code(c))
+            .collect();
+        assert_eq!(text, "αβπ∀");
+        assert_eq!(font.encoding_char(0x61), Some('α'));
+    }
+
+    #[test]
+    fn standard_dingbats_font_uses_its_own_encoding() {
+        let font = simple_font("ZapfDingbats", vec![]);
+        assert_eq!(font.decode_code(0x34), "✔");
+    }
+
+    /// An explicit base encoding still overrides a symbolic font's own.
+    #[test]
+    fn an_explicit_encoding_beats_the_builtin_one() {
+        let font = simple_font(
+            "Symbol",
+            vec![("Encoding", PdfObject::Name("WinAnsiEncoding".into()))],
+        );
+        assert_eq!(font.decode_code(0x61), "a");
+    }
+
+    /// A standard font without /Widths is set in its real metrics, not a
+    /// flat 500 units per character.
+    #[test]
+    fn standard_fonts_without_widths_use_their_metrics() {
+        let helvetica = simple_font("Helvetica", vec![]);
+        assert_eq!(helvetica.width(u32::from(b'A')), 667.0);
+        assert_eq!(helvetica.width(u32::from(b'i')), 222.0);
+        let courier = simple_font("Courier-Bold", vec![]);
+        assert_eq!(courier.width(u32::from(b'i')), 600.0);
+        // WinAnsi's é goes through its glyph name to Times' metrics.
+        let times = simple_font(
+            "Times-Roman",
+            vec![("Encoding", PdfObject::Name("WinAnsiEncoding".into()))],
+        );
+        assert_eq!(times.width(0xE9), 444.0);
+        // A document's own /Widths always win.
+        let given = simple_font(
+            "Helvetica",
+            vec![
+                ("FirstChar", PdfObject::Integer(65)),
+                ("Widths", PdfObject::Array(vec![PdfObject::Integer(999)])),
+            ],
+        );
+        assert_eq!(given.width(65), 999.0);
+    }
+
+    /// Word spacing applies to a one-byte code 32 only; in a two-byte CMap the
+    /// code 0x0020 is not that.
+    #[test]
+    fn word_spacing_needs_a_genuine_one_byte_space() {
+        assert!(cjk_font("90ms-RKSJ-H", "Japan1", vec![]).is_space_code(32));
+        assert!(!cjk_font("Identity-H", "Japan1", vec![]).is_space_code(32));
     }
 }

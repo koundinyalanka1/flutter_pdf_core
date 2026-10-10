@@ -4,7 +4,7 @@ use super::*;
 use pdf_core::stream::PdfStream;
 #[path = "page_functions.rs"]
 mod functions;
-use functions::ColorFunction;
+pub(super) use functions::ColorFunction;
 #[path = "page_mesh.rs"]
 mod mesh;
 
@@ -206,7 +206,7 @@ impl Renderer<'_> {
             .and_then(|o| self.doc.resolve_dict(o))
             .cloned()
             .unwrap_or_else(|| resources.clone());
-        let outer_fonts = std::mem::take(&mut self.fonts);
+        let outer = self.enter_resource_scope();
         self.depth += 1;
         for iy in iy0 as i64..=iy1 as i64 {
             for ix in ix0 as i64..=ix1 as i64 {
@@ -220,7 +220,7 @@ impl Renderer<'_> {
             }
         }
         self.depth -= 1;
-        self.fonts = outer_fonts;
+        self.leave_resource_scope(outer);
     }
 
     pub(super) fn draw_shading(

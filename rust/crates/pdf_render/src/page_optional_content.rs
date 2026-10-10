@@ -125,13 +125,16 @@ impl Renderer<'_> {
     }
 
     fn group_visible(&mut self, object: &PdfObject, group: &Dictionary) -> Option<bool> {
+        // Content marked as a layer in a document with no layer
+        // configuration is shown, as every reader does. It is what pdfTeX
+        // produces when it includes a figure that had layers of its own, so
+        // it is common and there is no other visibility to differ from.
         let Some(properties) = self
             .doc
             .catalog()
             .and_then(|c| c.get("OCProperties"))
             .and_then(|v| self.doc.resolve_dict(v))
         else {
-            self.warn("optional-content configuration is missing; visibility may differ");
             return Some(true);
         };
         let config = properties

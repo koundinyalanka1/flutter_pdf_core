@@ -58,6 +58,7 @@ mod tests {
                 doc: &doc,
                 canvas: &mut canvas,
                 fonts: HashMap::new(),
+                tint_transforms: HashMap::new(),
                 depth: 0,
                 pattern_pixels: 0.0,
                 temporary_bytes: 0,

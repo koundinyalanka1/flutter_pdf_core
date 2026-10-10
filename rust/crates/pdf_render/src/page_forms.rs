@@ -77,13 +77,13 @@ impl Renderer<'_> {
             inner.stroke_alpha = 1.0;
             inner.soft_mask = None;
         }
-        let outer_fonts = std::mem::take(&mut self.fonts);
+        let outer = self.enter_resource_scope();
         self.depth += 1;
         if self.run(&data, &inner_resources, &mut inner).is_err() {
             self.warn("form or annotation appearance skipped: malformed content stream");
         }
         self.depth -= 1;
-        self.fonts = outer_fonts;
+        self.leave_resource_scope(outer);
         if let Some((parent, isolated, bytes)) = layer {
             let rendered = std::mem::replace(self.canvas, parent);
             self.configure_canvas(state);

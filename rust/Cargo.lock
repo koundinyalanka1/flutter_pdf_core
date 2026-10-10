@@ -274,6 +274,7 @@ dependencies = [
  "pdf_core",
  "pdf_ocr",
  "pdf_ops",
+ "pdf_render",
  "pdf_text",
  "serde_json",
 ]

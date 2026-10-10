@@ -68,8 +68,8 @@ impl Renderer<'_> {
         state: &GraphicsState,
         knockout_group_active: bool,
     ) {
-        let fill = matches!(state.render_mode, 0 | 2 | 4 | 6);
-        let stroke = matches!(state.render_mode, 1 | 2 | 5 | 6);
+        let fill = matches!(state.render_mode, 0 | 2 | 4 | 6) && !state.fill_marks_nothing();
+        let stroke = matches!(state.render_mode, 1 | 2 | 5 | 6) && !state.stroke_marks_nothing();
         // Combined fill/stroke is itself one knockout object (11.7.4.4),
         // independently of TK. Inside the text's knockout group, painting
         // these two parts directly uses the same initial backdrop and is

@@ -768,3 +768,207 @@ fn branching_optional_content_cycles_are_bounded_and_reported() {
         .iter()
         .any(|w| w.contains("expression exceeds")));
 }
+
+/// `/Separation /Black` measures ink: a tint of 1 is solid black. Reading the
+/// tint as a grey level painted it white, so print-ready line art vanished.
+#[test]
+fn separation_tint_paints_ink_not_light() {
+    let mut doc = doc_with_content("/Sep cs 1 scn 10 10 80 40 re f", [0, 0, 100, 60]);
+    resources(&mut doc, "<< /ColorSpace << /Sep [/Separation /Black /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0 0 0] /N 1 >>] >> >>");
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    assert_eq!(pixel(&page, 50, 30), (0, 0, 0));
+}
+
+#[test]
+fn separation_tint_of_zero_is_bare_paper() {
+    let mut doc = doc_with_content("/Sep cs 0 scn 10 10 80 40 re f", [0, 0, 100, 60]);
+    resources(&mut doc, "<< /ColorSpace << /Sep [/Separation /Black /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0 0 0] /N 1 >>] >> >>");
+    assert_eq!(pixel(&render(&doc), 50, 30), (255, 255, 255));
+}
+
+/// A spot colour goes through its tint transform into the alternate space,
+/// here a CMYK alternate, rather than being read as a grey level.
+#[test]
+fn separation_tint_reaches_a_cmyk_alternate() {
+    let mut doc = doc_with_content("/Spot cs 1 scn 10 10 80 40 re f", [0, 0, 100, 60]);
+    resources(&mut doc, "<< /ColorSpace << /Spot [/Separation /PANTONE#20Red /DeviceCMYK << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 1 1 0] /N 1 >>] >> >>");
+    let (r, g, b) = pixel(&render(&doc), 50, 30);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "expected red, got {:?}",
+        (r, g, b)
+    );
+}
+
+/// DeviceN with several colorants evaluates its transform over all of them —
+/// here a PostScript calculator that keeps only the black ink.
+#[test]
+fn device_n_tints_go_through_the_transform() {
+    let mut doc = doc_with_content("/DN cs 0 0 0 1 scn 10 10 80 40 re f", [0, 0, 100, 60]);
+    let function = doc.add_object(PdfObject::Stream(PdfStream::new(
+        object("<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1] /Range [0 1] >>")
+            .as_dict()
+            .unwrap()
+            .clone(),
+        b"{ exch pop exch pop exch pop 1 exch sub }".to_vec(),
+    )));
+    resources(
+        &mut doc,
+        &format!(
+            "<< /ColorSpace << /DN [/DeviceN [/Cyan /Magenta /Yellow /Black] /DeviceGray {} 0 R] >> >>",
+            function.number
+        ),
+    );
+    assert_eq!(pixel(&render(&doc), 50, 30), (0, 0, 0), "full black ink");
+}
+
+/// `/Separation /None` is defined to mark nothing on any device, so a fill
+/// in it must leave the page as it was rather than paint any colour.
+#[test]
+fn separation_none_marks_nothing() {
+    let mut doc = doc_with_content("/N cs 1 scn 10 10 80 40 re f", [0, 0, 100, 60]);
+    resources(&mut doc, "<< /ColorSpace << /N [/Separation /None /DeviceGray << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>] >> >>");
+    assert_eq!(pixel(&render(&doc), 50, 30), (255, 255, 255));
+}
+
+/// Colour-space names are scoped by resources: a form whose `/CS0` is red ink
+/// must not reuse the page's cached `/CS0`, which is black ink.
+#[test]
+fn colour_space_names_are_scoped_to_their_resources() {
+    let mut doc = doc_with_content("/CS0 cs 1 scn 0 0 50 60 re f /Fm Do", [0, 0, 100, 60]);
+    let form = appearance(
+        &mut doc,
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 60] /Resources << /ColorSpace << /CS0 [/Separation /Red /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [1 0 0] /N 1 >>] >> >> >>",
+        "/CS0 cs 1 scn 50 0 50 60 re f",
+    );
+    let PdfObject::Reference(form) = form else {
+        unreachable!()
+    };
+    resources(
+        &mut doc,
+        &format!(
+            "<< /ColorSpace << /CS0 [/Separation /Black /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0 0 0] /N 1 >>] >> /XObject << /Fm {} 0 R >> >>",
+            form.number
+        ),
+    );
+    let page = render(&doc);
+    assert_eq!(pixel(&page, 25, 30), (0, 0, 0), "page's /CS0 is black ink");
+    assert_eq!(pixel(&page, 75, 30), (255, 0, 0), "form's /CS0 is red ink");
+}
+
+/// A page whose `/F1` is a Type3 font with one glyph, `/box`, drawn by
+/// `procedure` in a 1000-unit glyph space.
+fn type3_page(content: &str, procedure: &str) -> PdfDocument {
+    let mut doc = doc_with_content(content, [0, 0, 100, 60]);
+    let PdfObject::Reference(glyph) = appearance(&mut doc, "<< >>", procedure) else {
+        unreachable!()
+    };
+    resources(
+        &mut doc,
+        &format!(
+            "<< /Font << /F1 << /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /box {} 0 R >> /Encoding << /Type /Encoding /Differences [65 /box] >> /FirstChar 65 /LastChar 65 /Widths [1000] >> >> >>",
+            glyph.number
+        ),
+    );
+    doc
+}
+
+/// Type3 fonts used to draw nothing at all, so TeX bitmap fonts, dotted
+/// leaders and decorative glyphs vanished. An uncoloured (`d1`) glyph is a
+/// stencil: it paints in the text's colour and its own `rg` is ignored.
+#[test]
+fn uncoloured_type3_glyph_paints_in_the_text_colour() {
+    let doc = type3_page(
+        "0 0 1 rg BT /F1 20 Tf 10 20 Td (A) Tj ET",
+        "1000 0 0 0 1000 1000 d1 1 0 0 rg 0 0 1000 1000 re f",
+    );
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    assert_eq!(
+        pixel(&page, 20, 30),
+        (0, 0, 255),
+        "the text's blue, not the glyph's red"
+    );
+    assert_eq!(
+        pixel(&page, 5, 30),
+        (255, 255, 255),
+        "nothing outside the glyph"
+    );
+}
+
+/// A coloured (`d0`) glyph is a little picture with colours of its own.
+#[test]
+fn coloured_type3_glyph_keeps_its_own_colours() {
+    let doc = type3_page(
+        "0 0 1 rg BT /F1 20 Tf 10 20 Td (A) Tj ET",
+        "1000 0 d0 1 0 0 rg 0 0 1000 1000 re f",
+    );
+    assert_eq!(pixel(&render(&doc), 20, 30), (255, 0, 0));
+}
+
+/// Type3 widths are in glyph space and only the FontMatrix relates them to
+/// text space, so the second glyph must start where the first one ends.
+#[test]
+fn type3_advance_goes_through_the_font_matrix() {
+    let doc = type3_page(
+        "0 g BT /F1 20 Tf 10 20 Td (AA) Tj ET",
+        "1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f",
+    );
+    let page = render(&doc);
+    assert_eq!(pixel(&page, 40, 30), (0, 0, 0), "second glyph at 30..50");
+    assert_eq!(pixel(&page, 55, 30), (255, 255, 255), "and nothing past it");
+}
+
+/// Changing to a device colour leaves a `/Separation /None` space behind, so
+/// fills mark the page again.
+#[test]
+fn device_colour_after_separation_none_marks_again() {
+    let mut doc = doc_with_content("/N cs 1 scn 0 g 10 10 80 40 re f", [0, 0, 100, 60]);
+    resources(&mut doc, "<< /ColorSpace << /N [/Separation /None /DeviceGray << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>] >> >>");
+    assert_eq!(pixel(&render(&doc), 50, 30), (0, 0, 0));
+}
+
+/// The standard 14 may be left unembedded by design, and every reader
+/// supplies them; a page set in Helvetica is not "approximate".
+#[test]
+fn standard_fonts_draw_without_an_approximation_warning() {
+    let mut doc = doc_with_content("BT /F1 30 Tf 10 20 Td (Hi) Tj ET", [0, 0, 100, 60]);
+    resources(
+        &mut doc,
+        "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>",
+    );
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    assert!(
+        page.pixels.chunks(4).any(|p| p[0] < 128),
+        "the text is drawn"
+    );
+}
+
+/// A font that is neither embedded nor standard really is a guess.
+#[test]
+fn other_unembedded_fonts_still_warn() {
+    let mut doc = doc_with_content("BT /F1 30 Tf 10 20 Td (Hi) Tj ET", [0, 0, 100, 60]);
+    resources(
+        &mut doc,
+        "<< /Font << /F1 << /Type /Font /Subtype /TrueType /BaseFont /Garamond >> >> >>",
+    );
+    let page = render(&doc);
+    assert!(page.warnings.iter().any(|w| w.contains("substitute font")));
+}
+
+/// pdfTeX includes figures whose content is marked as layers without
+/// carrying the layer configuration over. Every reader shows that content,
+/// so there is nothing to warn about.
+#[test]
+fn layered_content_without_a_configuration_is_shown_quietly() {
+    let mut doc = doc_with_content("/OC /L BDC 0 g 10 10 80 40 re f EMC", [0, 0, 100, 60]);
+    resources(
+        &mut doc,
+        "<< /Properties << /L << /Type /OCG /Name (Layer) >> >> >>",
+    );
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    assert_eq!(pixel(&page, 50, 30), (0, 0, 0));
+}

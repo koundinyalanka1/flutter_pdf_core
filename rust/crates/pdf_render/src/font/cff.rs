@@ -33,6 +33,9 @@ pub struct CffFont {
     cid_to_gid: HashMap<u16, u16>,
     /// Glyph name → glyph id, for simple fonts addressed by name.
     name_to_gid: HashMap<String, u16>,
+    /// The program's own built-in encoding, code → glyph id. Used only when
+    /// the PDF's `/Encoding` leaves a code unnamed; the PDF always wins.
+    builtin_encoding: HashMap<u8, u16>,
     is_cid: bool,
     /// Design units per em, derived from `/FontMatrix` (1000 for most fonts).
     pub units_per_em: f64,
@@ -131,6 +134,18 @@ impl CffFont {
             }
         }
 
+        // A CID-keyed font is addressed by CID and has no code encoding.
+        let builtin_encoding = if is_cid {
+            HashMap::new()
+        } else {
+            let offset = top
+                .get(&Operator::Plain(16))
+                .and_then(|v| v.first())
+                .copied()
+                .unwrap_or(0.0) as usize;
+            read_encoding(&data, offset, &charset, num_glyphs)
+        };
+
         Some(CffFont {
             data,
             charstrings,
@@ -141,6 +156,7 @@ impl CffFont {
             charset,
             cid_to_gid,
             name_to_gid,
+            builtin_encoding,
             is_cid,
             units_per_em,
         })
@@ -152,6 +168,12 @@ impl CffFont {
 
     pub fn is_cid_keyed(&self) -> bool {
         self.is_cid
+    }
+
+    /// Glyph id for a character code under the program's own built-in
+    /// encoding, for codes the PDF's `/Encoding` does not name.
+    pub fn gid_for_builtin_code(&self, code: u8) -> Option<u16> {
+        self.builtin_encoding.get(&code).copied()
     }
 
     pub fn gid_for_name(&self, name: &str) -> Option<u16> {
@@ -455,6 +477,100 @@ fn read_charset(data: &[u8], offset: usize, num_glyphs: usize) -> Vec<u16> {
 
 /// Resolve a SID to its glyph name: standard strings first, then the font's
 /// own string INDEX.
+/// A CFF program's built-in encoding: code → glyph id.
+///
+/// Offsets 0 and 1 name the predefined Standard and Expert encodings, which
+/// address glyphs by *name*; those are resolved through the charset so the
+/// result is a glyph id either way. Any other offset points at a custom table
+/// in one of two formats, optionally followed by supplements.
+fn read_encoding(
+    data: &[u8],
+    offset: usize,
+    charset: &[u16],
+    num_glyphs: usize,
+) -> HashMap<u8, u16> {
+    let mut out = HashMap::new();
+
+    if offset <= 1 {
+        // Predefined. In StandardEncoding codes 32..=126 carry SIDs 1..=95 in
+        // order, so the code's SID is arithmetic; map it through the charset.
+        // The Expert encoding is rare enough that treating it as Standard
+        // beats refusing to draw anything.
+        let mut by_sid: HashMap<u16, u16> = HashMap::new();
+        for (gid, &sid) in charset.iter().enumerate().take(num_glyphs) {
+            by_sid.entry(sid).or_insert(gid as u16);
+        }
+        for code in 32u8..=126 {
+            if let Some(&gid) = by_sid.get(&(u16::from(code) - 31)) {
+                out.insert(code, gid);
+            }
+        }
+        return out;
+    }
+
+    let Some(&format) = data.get(offset) else {
+        return out;
+    };
+    let mut pos = offset + 1;
+    match format & 0x7F {
+        0 => {
+            let Some(&n_codes) = data.get(pos) else {
+                return out;
+            };
+            pos += 1;
+            // Code i belongs to glyph i + 1; glyph 0 is .notdef and unencoded.
+            for gid in 1..=usize::from(n_codes) {
+                let Some(&code) = data.get(pos) else { break };
+                pos += 1;
+                if gid < num_glyphs {
+                    out.insert(code, gid as u16);
+                }
+            }
+        }
+        1 => {
+            let Some(&n_ranges) = data.get(pos) else {
+                return out;
+            };
+            pos += 1;
+            let mut gid = 1usize;
+            for _ in 0..n_ranges {
+                let (Some(&first), Some(&n_left)) = (data.get(pos), data.get(pos + 1)) else {
+                    break;
+                };
+                pos += 2;
+                for i in 0..=u16::from(n_left) {
+                    let Some(code) = u8::try_from(u16::from(first) + i).ok() else {
+                        break;
+                    };
+                    if gid < num_glyphs {
+                        out.insert(code, gid as u16);
+                    }
+                    gid += 1;
+                }
+            }
+        }
+        _ => return out,
+    }
+
+    // Supplements: extra (code, SID) pairs sharing glyphs already encoded.
+    if format & 0x80 != 0 {
+        if let Some(&n_sups) = data.get(pos) {
+            pos += 1;
+            for _ in 0..n_sups {
+                let (Some(&code), Some(sid)) = (data.get(pos), data.get(pos + 1..pos + 3)) else {
+                    break;
+                };
+                pos += 3;
+                let sid = u16::from_be_bytes([sid[0], sid[1]]);
+                if let Some(gid) = charset.iter().position(|&s| s == sid) {
+                    out.insert(code, gid as u16);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn sid_name(sid: u16, strings: &[(usize, usize)], data: &[u8]) -> Option<String> {
     let sid = sid as usize;
     if sid < STANDARD_STRINGS.len() {
@@ -836,6 +952,22 @@ impl CharStringCtx<'_> {
         }
         false
     }
+}
+
+/// The character an AGL `uniXXXX` or `uXXXX`..`uXXXXXX` glyph name denotes.
+pub fn char_for_uni_name(name: &str) -> Option<char> {
+    let hex = match name.strip_prefix("uni") {
+        Some(rest) if rest.len() >= 4 => &rest[..4],
+        Some(_) => return None,
+        None => {
+            let rest = name.strip_prefix('u')?;
+            if !(4..=6).contains(&rest.len()) {
+                return None;
+            }
+            rest
+        }
+    };
+    char::from_u32(u32::from_str_radix(hex, 16).ok()?)
 }
 
 /// Standard-encoding glyph name for a character.
@@ -1357,6 +1489,46 @@ mod tests {
         for offset in 0..=2 {
             assert_eq!(read_charset(&[9, 9, 9, 9], offset, 3), vec![0, 1, 2]);
         }
+    }
+
+    #[test]
+    fn builtin_encoding_format_zero_maps_codes_in_glyph_order() {
+        // Offsets 0 and 1 are the predefined encodings, so a table starts at 2.
+        // Format 0: count, then one code per glyph starting at glyph 1.
+        let data = [0, 0, 0, 2, 65, 66];
+        let encoding = read_encoding(&data, 2, &[0, 1, 2], 3);
+        assert_eq!(encoding.get(&65), Some(&1));
+        assert_eq!(encoding.get(&66), Some(&2));
+        assert_eq!(encoding.get(&67), None);
+    }
+
+    #[test]
+    fn builtin_encoding_format_one_expands_ranges() {
+        // Format 1: count, then (first code, codes after it) per range.
+        let data = [0, 0, 1, 1, 65, 2];
+        let encoding = read_encoding(&data, 2, &[0, 1, 2, 3], 4);
+        assert_eq!(encoding.get(&65), Some(&1));
+        assert_eq!(encoding.get(&66), Some(&2));
+        assert_eq!(encoding.get(&67), Some(&3));
+    }
+
+    #[test]
+    fn builtin_encoding_reads_supplements_after_the_table() {
+        // High bit on the format byte means (code, SID) supplements follow.
+        let data = [0, 0, 0x80, 1, 65, 1, 90, 0, 2];
+        let encoding = read_encoding(&data, 2, &[0, 1, 2], 3);
+        assert_eq!(encoding.get(&65), Some(&1));
+        // Code 90 shares the glyph whose charset SID is 2, which is glyph 2.
+        assert_eq!(encoding.get(&90), Some(&2));
+    }
+
+    #[test]
+    fn predefined_builtin_encoding_goes_through_the_charset() {
+        // StandardEncoding gives code 32 the name "space" (SID 1) and code 33
+        // "exclam" (SID 2); the charset says which glyphs carry those SIDs.
+        let encoding = read_encoding(&[], 0, &[0, 2, 1], 3);
+        assert_eq!(encoding.get(&32), Some(&2), "space is glyph 2 here");
+        assert_eq!(encoding.get(&33), Some(&1), "exclam is glyph 1 here");
     }
 
     #[test]

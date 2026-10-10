@@ -1,14 +1,16 @@
 //! Minimal TrueType/OpenType parser: enough to turn a glyph id into an
 //! outline, and a character code into a glyph id.
 //!
-//! Covers `head`, `maxp`, `loca`, `glyf` (simple *and* composite glyphs) and
-//! `cmap` formats 0, 4, 6 and 12 — which is what PDF font subsets embedded as
-//! `/FontFile2` actually use. CFF/Type1C outlines (`/FontFile3`) are a
-//! different charstring format and are not handled here; see
-//! [`super::GlyphSource`] for how that is reported.
+//! Covers `head`, `maxp`, `loca`, `glyf` (simple *and* composite glyphs),
+//! `cmap` formats 0, 4, 6 and 12, `hmtx`, `post` and `name` — what PDF font
+//! subsets embedded as `/FontFile2` use, and what a system or bundled
+//! fallback face needs. Any face of a collection (`.ttc`) can be opened, and
+//! an OpenType face with CFF outlines (`OTTO`) draws through the CFF
+//! interpreter, as CJK system fonts require.
 
 use std::collections::HashMap;
 
+use super::cff::CffFont;
 use crate::geom::Path;
 
 #[derive(Debug)]
@@ -24,41 +26,82 @@ pub struct TrueTypeFont {
     /// True when the selected cmap subtable is a (3,0) symbol mapping, whose
     /// codes live in the 0xF000 private-use block.
     symbolic_cmap: bool,
+    /// Glyph name → glyph id from the `post` table, built on first use. Large
+    /// CJK faces carry tens of thousands of names nobody asks for.
+    post_names: std::sync::OnceLock<HashMap<String, u16>>,
+    /// CFF outlines, for an `OTTO` face that has no `glyf`.
+    cff: Option<Box<CffFont>>,
+}
+
+impl std::fmt::Debug for CffFont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CffFont")
+            .field("glyphs", &self.num_glyphs())
+            .finish()
+    }
+}
+
+/// How many faces a font file holds: the count of a collection, else one.
+pub fn face_count(data: &[u8]) -> usize {
+    if data.get(0..4) == Some(b"ttcf") {
+        read_u32(data, 8).map(|n| n as usize).unwrap_or(0).min(256)
+    } else {
+        usize::from(data.len() >= 12)
+    }
+}
+
+/// Table tag → (offset, length) in the font data.
+type Tables = HashMap<[u8; 4], (usize, usize)>;
+
+/// The sfnt version tag and table directory of face `index`.
+fn table_directory(data: &[u8], index: usize) -> Option<(u32, Tables)> {
+    if data.len() < 12 {
+        return None;
+    }
+    // In a collection the header lists one offset per face; offsets in each
+    // face's directory are relative to the start of the whole file.
+    let base = if &data[0..4] == b"ttcf" {
+        if index >= face_count(data) {
+            return None;
+        }
+        read_u32(data, 12 + index * 4)? as usize
+    } else if index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let tag = read_u32(data, base)?;
+    // 0x00010000 / 'true' carry TrueType outlines, 'OTTO' carries CFF.
+    if tag != 0x0001_0000 && tag != 0x7472_7565 && tag != 0x4F54_544F {
+        return None;
+    }
+    let table_count = read_u16(data, base + 4)? as usize;
+    let mut tables = HashMap::with_capacity(table_count);
+    for i in 0..table_count {
+        let record = base + 12 + i * 16;
+        if record + 16 > data.len() {
+            break;
+        }
+        let mut name = [0u8; 4];
+        name.copy_from_slice(&data[record..record + 4]);
+        let offset = read_u32(data, record + 8)? as usize;
+        let length = read_u32(data, record + 12)? as usize;
+        if offset <= data.len() {
+            tables.insert(name, (offset, length.min(data.len() - offset)));
+        }
+    }
+    Some((tag, tables))
 }
 
 impl TrueTypeFont {
+    /// Parse a font as embedded in a PDF: the first face of whatever it is.
     pub fn parse(data: Vec<u8>) -> Option<TrueTypeFont> {
-        if data.len() < 12 {
-            return None;
-        }
-        // A TrueType Collection points at its first font.
-        let base = if &data[0..4] == b"ttcf" {
-            read_u32(&data, 12)? as usize
-        } else {
-            0
-        };
-        let tag = read_u32(&data, base)?;
-        // 0x00010000 = TrueType outlines, 'true' = legacy Apple.
-        // 'OTTO' means CFF outlines, which this parser cannot read.
-        if tag != 0x0001_0000 && tag != 0x7472_7565 {
-            return None;
-        }
+        Self::parse_face(data, 0)
+    }
 
-        let table_count = read_u16(&data, base + 4)? as usize;
-        let mut tables = HashMap::with_capacity(table_count);
-        for i in 0..table_count {
-            let record = base + 12 + i * 16;
-            if record + 16 > data.len() {
-                break;
-            }
-            let mut name = [0u8; 4];
-            name.copy_from_slice(&data[record..record + 4]);
-            let offset = read_u32(&data, record + 8)? as usize;
-            let length = read_u32(&data, record + 12)? as usize;
-            if offset <= data.len() {
-                tables.insert(name, (offset, length.min(data.len() - offset)));
-            }
-        }
+    /// Parse face `index` of a font file or collection.
+    pub fn parse_face(data: Vec<u8>, index: usize) -> Option<TrueTypeFont> {
+        let (tag, mut tables) = table_directory(&data, index)?;
 
         let (head_offset, _) = *tables.get(b"head")?;
         let units_per_em = read_u16(&data, head_offset + 18)? as f64;
@@ -74,6 +117,36 @@ impl TrueTypeFont {
             })
             .unwrap_or_default();
 
+        // An OTTO face draws through its CFF table. Copy that out, then keep
+        // only the small tables this struct still reads, so a 20 MB CJK face
+        // is not held twice.
+        let mut data = data;
+        let mut cff = None;
+        if tag == 0x4F54_544F && !tables.contains_key(b"glyf") {
+            let &(offset, length) = tables.get(b"CFF ")?;
+            cff = Some(Box::new(CffFont::parse(
+                data.get(offset..offset + length)?.to_vec(),
+            )?));
+            let mut compact = Vec::new();
+            let mut kept = HashMap::new();
+            for tag in [
+                b"head", b"maxp", b"hhea", b"hmtx", b"cmap", b"post", b"name", b"OS/2",
+            ] {
+                if let Some(&(offset, length)) = tables.get(tag) {
+                    if let Some(bytes) = data.get(offset..offset + length) {
+                        kept.insert(*tag, (compact.len(), length));
+                        compact.extend_from_slice(bytes);
+                        // Keep tables 4-aligned like the format expects.
+                        while compact.len() % 4 != 0 {
+                            compact.push(0);
+                        }
+                    }
+                }
+            }
+            data = compact;
+            tables = kept;
+        }
+
         let mut font = TrueTypeFont {
             units_per_em: if units_per_em > 0.0 {
                 units_per_em
@@ -84,6 +157,8 @@ impl TrueTypeFont {
             loca,
             cmap: HashMap::new(),
             symbolic_cmap: false,
+            post_names: std::sync::OnceLock::new(),
+            cff,
             tables,
             data,
         };
@@ -93,6 +168,92 @@ impl TrueTypeFont {
 
     pub fn num_glyphs(&self) -> u16 {
         self.num_glyphs
+    }
+
+    /// The face's family name from its `name` table (Unicode or Mac Roman
+    /// records), for matching a substitute's style to the original's.
+    pub fn family_name(&self) -> Option<String> {
+        // Typographic family first: "Noto Sans CJK JP" rather than the
+        // style-linked "Noto Sans CJK JP Regular".
+        self.name_record(16).or_else(|| self.name_record(1))
+    }
+
+    /// The PostScript name (name ID 6), e.g. `HiraginoSans-W3`.
+    pub fn postscript_name(&self) -> Option<String> {
+        self.name_record(6)
+    }
+
+    fn name_record(&self, wanted: u16) -> Option<String> {
+        let &(table, length) = self.tables.get(b"name")?;
+        let count = usize::from(read_u16(&self.data, table + 2)?);
+        let strings = table + usize::from(read_u16(&self.data, table + 4)?);
+        let mut fallback = None;
+        for i in 0..count {
+            let record = table + 6 + i * 12;
+            if record + 12 > table + length {
+                break;
+            }
+            let platform = read_u16(&self.data, record)?;
+            let id = read_u16(&self.data, record + 6)?;
+            if id != wanted {
+                continue;
+            }
+            let len = usize::from(read_u16(&self.data, record + 8)?);
+            let offset = usize::from(read_u16(&self.data, record + 10)?);
+            let bytes = self.data.get(strings + offset..strings + offset + len)?;
+            match platform {
+                // Windows and Unicode platforms: UTF-16BE.
+                0 | 3 => {
+                    let units: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect();
+                    return Some(String::from_utf16_lossy(&units));
+                }
+                // Macintosh: Roman, close enough to ASCII for family names.
+                1 if fallback.is_none() => {
+                    fallback = Some(bytes.iter().map(|&b| b as char).collect());
+                }
+                _ => {}
+            }
+        }
+        fallback
+    }
+
+    /// `OS/2` weight class (400 regular, 700 bold) and italic flag.
+    pub fn weight_and_italic(&self) -> (u16, bool) {
+        let Some(&(os2, _)) = self.tables.get(b"OS/2") else {
+            return (400, false);
+        };
+        let weight = read_u16(&self.data, os2 + 4).unwrap_or(400);
+        let selection = read_u16(&self.data, os2 + 62).unwrap_or(0);
+        (weight, selection & 1 != 0)
+    }
+
+    /// Whether the face has serifs, from `OS/2` sFamilyClass (classes 1–7
+    /// are serif designs, 8 is sans) — `None` when the font does not say.
+    pub fn is_serif(&self) -> Option<bool> {
+        let &(os2, _) = self.tables.get(b"OS/2")?;
+        let class = read_i16(&self.data, os2 + 30)? >> 8;
+        match class {
+            1..=7 => Some(true),
+            8 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Every code point the face maps to a glyph, as sorted ranges.
+    pub fn coverage(&self) -> Vec<(u32, u32)> {
+        let mut points: Vec<u32> = self.cmap.keys().copied().collect();
+        points.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for point in points {
+            match ranges.last_mut() {
+                Some((_, end)) if *end + 1 == point => *end = point,
+                _ => ranges.push((point, point)),
+            }
+        }
+        ranges
     }
 
     /// Advance width for a glyph, in font units.
@@ -115,7 +276,13 @@ impl TrueTypeFont {
         read_u16(&self.data, at).map(f64::from)
     }
 
+    /// Whether the face can draw anything — TrueType or CFF outlines.
     pub fn has_outlines(&self) -> bool {
+        self.has_glyf() || self.cff.is_some()
+    }
+
+    /// Whether the face carries TrueType (`glyf`) outlines specifically.
+    pub fn has_glyf(&self) -> bool {
         !self.loca.is_empty() && self.tables.contains_key(b"glyf")
     }
 
@@ -133,9 +300,78 @@ impl TrueTypeFont {
         None
     }
 
+    /// Glyph id for a PostScript glyph name, from the `post` table.
+    ///
+    /// This is how a simple font's `/Differences` names reach glyphs the cmap
+    /// does not expose — legacy Indic and symbol TrueType fonts hang their
+    /// glyphs on borrowed Latin names, or on names with no Unicode at all.
+    pub fn gid_for_name(&self, name: &str) -> Option<u16> {
+        self.post_names
+            .get_or_init(|| self.read_post_names())
+            .get(name)
+            .copied()
+    }
+
+    /// `post` formats 1.0 (the 258 standard Macintosh names, in order) and
+    /// 2.0 (an index per glyph into those names or the table's own Pascal
+    /// strings). Format 3.0 carries no names, so it yields an empty map.
+    fn read_post_names(&self) -> HashMap<String, u16> {
+        let mut names = HashMap::new();
+        let Some(&(post, length)) = self.tables.get(b"post") else {
+            return names;
+        };
+        let end = post + length;
+        match read_u32(&self.data, post) {
+            Some(0x0001_0000) => {
+                let count = usize::from(self.num_glyphs).min(MAC_GLYPH_NAMES.len());
+                for (gid, name) in MAC_GLYPH_NAMES.iter().enumerate().take(count) {
+                    names.entry((*name).to_owned()).or_insert(gid as u16);
+                }
+            }
+            Some(0x0002_0000) => {
+                let Some(count) = read_u16(&self.data, post + 32) else {
+                    return names;
+                };
+                let indices = post + 34;
+                // Custom names follow the index array, in index order.
+                let mut custom = Vec::new();
+                let mut at = indices + usize::from(count) * 2;
+                while at < end {
+                    let Some(&len) = self.data.get(at) else { break };
+                    let Some(bytes) = self.data.get(at + 1..at + 1 + usize::from(len)) else {
+                        break;
+                    };
+                    custom.push(String::from_utf8_lossy(bytes).into_owned());
+                    at += 1 + usize::from(len);
+                }
+                for gid in 0..count {
+                    let Some(index) = read_u16(&self.data, indices + usize::from(gid) * 2) else {
+                        break;
+                    };
+                    let name = match usize::from(index) {
+                        i if i < MAC_GLYPH_NAMES.len() => MAC_GLYPH_NAMES[i].to_owned(),
+                        i => match custom.get(i - MAC_GLYPH_NAMES.len()) {
+                            Some(name) => name.clone(),
+                            None => continue,
+                        },
+                    };
+                    // Several glyphs may share a name; the first one wins,
+                    // matching what other readers resolve.
+                    names.entry(name).or_insert(gid);
+                }
+            }
+            _ => {}
+        }
+        names
+    }
+
     /// Outline for `glyph_id`, in font units (y up). `None` for empty glyphs
     /// such as space.
     pub fn glyph_outline(&self, glyph_id: u16) -> Option<Path> {
+        if let Some(cff) = &self.cff {
+            // An OpenType face's glyph ids are its CFF glyph indices.
+            return cff.glyph_outline(glyph_id);
+        }
         let mut path = Path::with_tolerance(self.units_per_em / 300.0);
         self.append_glyph(glyph_id, &mut path, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0)?;
         if path.subpaths.is_empty() {
@@ -634,9 +870,333 @@ fn read_f2dot14(data: &[u8], offset: usize) -> Option<f64> {
     read_i16(data, offset).map(|v| v as f64 / 16384.0)
 }
 
+/// The standard Macintosh glyph order, which `post` format 1.0 assigns to
+/// glyphs 0..258 and format 2.0 indices below 258 refer to.
+const MAC_GLYPH_NAMES: [&str; 258] = [
+    ".notdef",
+    ".null",
+    "nonmarkingreturn",
+    "space",
+    "exclam",
+    "quotedbl",
+    "numbersign",
+    "dollar",
+    "percent",
+    "ampersand",
+    "quotesingle",
+    "parenleft",
+    "parenright",
+    "asterisk",
+    "plus",
+    "comma",
+    "hyphen",
+    "period",
+    "slash",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "colon",
+    "semicolon",
+    "less",
+    "equal",
+    "greater",
+    "question",
+    "at",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "bracketleft",
+    "backslash",
+    "bracketright",
+    "asciicircum",
+    "underscore",
+    "grave",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "braceleft",
+    "bar",
+    "braceright",
+    "asciitilde",
+    "Adieresis",
+    "Aring",
+    "Ccedilla",
+    "Eacute",
+    "Ntilde",
+    "Odieresis",
+    "Udieresis",
+    "aacute",
+    "agrave",
+    "acircumflex",
+    "adieresis",
+    "atilde",
+    "aring",
+    "ccedilla",
+    "eacute",
+    "egrave",
+    "ecircumflex",
+    "edieresis",
+    "iacute",
+    "igrave",
+    "icircumflex",
+    "idieresis",
+    "ntilde",
+    "oacute",
+    "ograve",
+    "ocircumflex",
+    "odieresis",
+    "otilde",
+    "uacute",
+    "ugrave",
+    "ucircumflex",
+    "udieresis",
+    "dagger",
+    "degree",
+    "cent",
+    "sterling",
+    "section",
+    "bullet",
+    "paragraph",
+    "germandbls",
+    "registered",
+    "copyright",
+    "trademark",
+    "acute",
+    "dieresis",
+    "notequal",
+    "AE",
+    "Oslash",
+    "infinity",
+    "plusminus",
+    "lessequal",
+    "greaterequal",
+    "yen",
+    "mu",
+    "partialdiff",
+    "summation",
+    "product",
+    "pi",
+    "integral",
+    "ordfeminine",
+    "ordmasculine",
+    "Omega",
+    "ae",
+    "oslash",
+    "questiondown",
+    "exclamdown",
+    "logicalnot",
+    "radical",
+    "florin",
+    "approxequal",
+    "Delta",
+    "guillemotleft",
+    "guillemotright",
+    "ellipsis",
+    "nonbreakingspace",
+    "Agrave",
+    "Atilde",
+    "Otilde",
+    "OE",
+    "oe",
+    "endash",
+    "emdash",
+    "quotedblleft",
+    "quotedblright",
+    "quoteleft",
+    "quoteright",
+    "divide",
+    "lozenge",
+    "ydieresis",
+    "Ydieresis",
+    "fraction",
+    "currency",
+    "guilsinglleft",
+    "guilsinglright",
+    "fi",
+    "fl",
+    "daggerdbl",
+    "periodcentered",
+    "quotesinglbase",
+    "quotedblbase",
+    "perthousand",
+    "Acircumflex",
+    "Ecircumflex",
+    "Aacute",
+    "Edieresis",
+    "Egrave",
+    "Iacute",
+    "Icircumflex",
+    "Idieresis",
+    "Igrave",
+    "Oacute",
+    "Ocircumflex",
+    "apple",
+    "Ograve",
+    "Uacute",
+    "Ucircumflex",
+    "Ugrave",
+    "dotlessi",
+    "circumflex",
+    "tilde",
+    "macron",
+    "breve",
+    "dotaccent",
+    "ring",
+    "cedilla",
+    "hungarumlaut",
+    "ogonek",
+    "caron",
+    "Lslash",
+    "lslash",
+    "Scaron",
+    "scaron",
+    "Zcaron",
+    "zcaron",
+    "brokenbar",
+    "Eth",
+    "eth",
+    "Yacute",
+    "yacute",
+    "Thorn",
+    "thorn",
+    "minus",
+    "multiply",
+    "onesuperior",
+    "twosuperior",
+    "threesuperior",
+    "onehalf",
+    "onequarter",
+    "threequarters",
+    "franc",
+    "Gbreve",
+    "gbreve",
+    "Idotaccent",
+    "Scedilla",
+    "scedilla",
+    "Cacute",
+    "cacute",
+    "Ccaron",
+    "ccaron",
+    "dcroat",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_glyph_names_are_the_standard_258_in_order() {
+        // Spot checks across the table; one shifted entry would misname every
+        // glyph after it in a format 1.0 or 2.0 `post` table.
+        assert_eq!(MAC_GLYPH_NAMES[0], ".notdef");
+        assert_eq!(MAC_GLYPH_NAMES[3], "space");
+        assert_eq!(MAC_GLYPH_NAMES[36], "A");
+        assert_eq!(MAC_GLYPH_NAMES[68], "a");
+        assert_eq!(MAC_GLYPH_NAMES[146], "infinity");
+        assert_eq!(MAC_GLYPH_NAMES[172], "nonbreakingspace");
+        assert_eq!(MAC_GLYPH_NAMES[210], "apple");
+        assert_eq!(MAC_GLYPH_NAMES[257], "dcroat");
+    }
+
+    /// A minimal sfnt carrying just `post`, enough for name lookups.
+    fn sfnt_with_post(post: &[u8], num_glyphs: u16) -> TrueTypeFont {
+        let mut tables = HashMap::new();
+        let mut data = vec![0u8; 12];
+        let offset = data.len();
+        data.extend_from_slice(post);
+        tables.insert(*b"post", (offset, post.len()));
+        TrueTypeFont {
+            data,
+            tables,
+            units_per_em: 1000.0,
+            num_glyphs,
+            loca: Vec::new(),
+            cmap: HashMap::new(),
+            symbolic_cmap: false,
+            post_names: std::sync::OnceLock::new(),
+            cff: None,
+        }
+    }
+
+    #[test]
+    fn post_format_two_resolves_standard_and_custom_names() {
+        // Header (32 bytes), 3 glyphs: .notdef, "exclam" (standard 4), and a
+        // custom name at index 258.
+        let mut post = vec![0, 2, 0, 0];
+        post.extend_from_slice(&[0; 28]);
+        post.extend_from_slice(&3u16.to_be_bytes());
+        for index in [0u16, 4, 258] {
+            post.extend_from_slice(&index.to_be_bytes());
+        }
+        post.push(4);
+        post.extend_from_slice(b"ttaa");
+        let font = sfnt_with_post(&post, 3);
+        assert_eq!(font.gid_for_name("exclam"), Some(1));
+        assert_eq!(font.gid_for_name("ttaa"), Some(2));
+        assert_eq!(font.gid_for_name("nonesuch"), None);
+    }
+
+    #[test]
+    fn post_format_one_uses_the_mac_order() {
+        let mut post = vec![0, 1, 0, 0];
+        post.extend_from_slice(&[0; 28]);
+        let font = sfnt_with_post(&post, 258);
+        assert_eq!(font.gid_for_name("A"), Some(36));
+        assert_eq!(font.gid_for_name("infinity"), Some(146));
+    }
 
     #[test]
     fn rejects_non_sfnt_data() {

@@ -49,6 +49,7 @@ use crate::canvas::{stroke_outline, BlendMode, Canvas, ClipMask, Rgb};
 use crate::font::RenderFont;
 use crate::geom::{FillRule, Matrix, Path};
 use crate::image::decode_image;
+use paints::ColorFunction;
 
 /// How large to render.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +164,7 @@ pub fn render_page(
         doc,
         canvas: &mut canvas,
         fonts: HashMap::new(),
+        tint_transforms: HashMap::new(),
         depth: 0,
         pattern_pixels: 0.0,
         temporary_bytes: 0,
@@ -289,6 +291,15 @@ struct GraphicsState {
     pattern_ctm: Matrix,
     fill_components: usize,
     stroke_components: usize,
+    /// Tint transform for a Separation/DeviceN fill space, when the current
+    /// one has it. Without it a tint is read as a colour and the painting
+    /// comes out inverted — `1 scn` in /Separation /Black means full ink.
+    fill_tint: Option<Rc<TintTransform>>,
+    stroke_tint: Option<Rc<TintTransform>>,
+    /// Set by `d1` inside a Type3 glyph: the glyph is a stencil painted in the
+    /// text's colour, so its own colour operators are ignored. Inherited by
+    /// anything the glyph draws, such as a form.
+    color_locked: bool,
     line_width: f64,
     line_cap: i64,
     line_join: i64,
@@ -315,6 +326,19 @@ struct GraphicsState {
 }
 
 impl GraphicsState {
+    /// Filling in `/Separation /None` is defined to make no marks at all.
+    fn fill_marks_nothing(&self) -> bool {
+        self.fill_tint
+            .as_ref()
+            .is_some_and(|t| t.function.is_none())
+    }
+
+    fn stroke_marks_nothing(&self) -> bool {
+        self.stroke_tint
+            .as_ref()
+            .is_some_and(|t| t.function.is_none())
+    }
+
     fn new(ctm: Matrix) -> Self {
         Self {
             ctm,
@@ -327,6 +351,9 @@ impl GraphicsState {
             pattern_ctm: ctm,
             fill_components: 1,
             stroke_components: 1,
+            fill_tint: None,
+            stroke_tint: None,
+            color_locked: false,
             line_width: 1.0,
             line_cap: 0,
             line_join: 0,
@@ -354,10 +381,20 @@ impl GraphicsState {
     }
 }
 
+/// The outer scope's name-keyed caches, held while a nested content stream
+/// runs with its own resources.
+struct ResourceScope {
+    fonts: HashMap<String, Rc<RenderFont>>,
+    tint_transforms: HashMap<String, Option<Rc<TintTransform>>>,
+}
+
 struct Renderer<'a> {
     doc: &'a PdfDocument,
     canvas: &'a mut Canvas,
     fonts: HashMap<String, Rc<RenderFont>>,
+    /// Tint transforms by `/ColorSpace` resource name; `None` records a space
+    /// that needs none, so it is not re-examined on every `cs`.
+    tint_transforms: HashMap<String, Option<Rc<TintTransform>>>,
     depth: usize,
     pattern_pixels: f64,
     temporary_bytes: usize,
@@ -417,8 +454,20 @@ impl Renderer<'_> {
                 }
                 continue;
             }
+            // Inside an uncoloured (d1) Type3 glyph the colour belongs to the
+            // text being shown, so the glyph's own colour operators are
+            // ignored (ISO 32000-1, 9.6.5) — it is a stencil, not a picture.
+            if state.color_locked && is_color_operator(&op.operator) {
+                continue;
+            }
             let n = |i: usize| number(op, i);
             match op.operator.as_str() {
+                // -- Type3 glyph metrics ---------------------------------------
+                // `d0` declares a coloured glyph, `d1` an uncoloured one. Both
+                // also give the advance, which /Widths already supplied.
+                "d1" => state.color_locked = true,
+                "d0" => {}
+
                 // -- graphics state ------------------------------------------
                 "q" => {
                     if stack.len() >= 128 {
@@ -473,53 +522,64 @@ impl Renderer<'_> {
                 "g" => {
                     state.fill_pattern_space = false;
                     state.fill_pattern = None;
+                    state.fill_tint = None;
                     state.fill = Rgb::gray(n(0) as f32);
                     state.fill_components = 1;
                 }
                 "G" => {
                     state.stroke_pattern_space = false;
                     state.stroke_pattern = None;
+                    state.stroke_tint = None;
                     state.stroke = Rgb::gray(n(0) as f32);
                     state.stroke_components = 1;
                 }
                 "rg" => {
                     state.fill_pattern_space = false;
                     state.fill_pattern = None;
+                    state.fill_tint = None;
                     state.fill = Rgb::new(n(0) as f32, n(1) as f32, n(2) as f32);
                     state.fill_components = 3;
                 }
                 "RG" => {
                     state.stroke_pattern_space = false;
                     state.stroke_pattern = None;
+                    state.stroke_tint = None;
                     state.stroke = Rgb::new(n(0) as f32, n(1) as f32, n(2) as f32);
                     state.stroke_components = 3;
                 }
                 "k" => {
                     state.fill_pattern_space = false;
                     state.fill_pattern = None;
+                    state.fill_tint = None;
                     state.fill = Rgb::from_cmyk(n(0) as f32, n(1) as f32, n(2) as f32, n(3) as f32);
                     state.fill_components = 4;
                 }
                 "K" => {
                     state.stroke_pattern_space = false;
                     state.stroke_pattern = None;
+                    state.stroke_tint = None;
                     state.stroke =
                         Rgb::from_cmyk(n(0) as f32, n(1) as f32, n(2) as f32, n(3) as f32);
                     state.stroke_components = 4;
                 }
                 "cs" | "CS" => {
                     let components = self.space_components(op, resources);
-                    let black = Rgb::BLACK;
                     let pattern = self.is_pattern_space(op, resources);
+                    let tint = self.space_tint_transform(op, resources);
+                    // Setting a space resets the colour to its initial value,
+                    // which is black in every device and CIE space.
+                    let black = Rgb::BLACK;
                     if op.operator == "cs" {
                         state.fill_pattern_space = pattern;
                         state.fill_pattern = None;
                         state.fill_components = components;
+                        state.fill_tint = tint;
                         state.fill = black;
                     } else {
                         state.stroke_pattern_space = pattern;
                         state.stroke_pattern = None;
                         state.stroke_components = components;
+                        state.stroke_tint = tint;
                         state.stroke = black;
                     }
                 }
@@ -536,8 +596,19 @@ impl Renderer<'_> {
                         state.stroke_pattern = pattern;
                     }
                     let values: Vec<f64> = op.operands.iter().filter_map(as_number).collect();
-                    if let Some(color) = color_from(&values) {
-                        if op.operator.starts_with('s') {
+                    let tint = if is_fill {
+                        state.fill_tint.as_ref()
+                    } else {
+                        state.stroke_tint.as_ref()
+                    };
+                    // A Separation/DeviceN space carries ink amounts, which
+                    // only its tint transform can turn into a colour.
+                    let color = match tint {
+                        Some(tint) => tint.to_rgb(&values),
+                        None => color_from(&values),
+                    };
+                    if let Some(color) = color {
+                        if is_fill {
                             state.fill = color;
                         } else {
                             state.stroke = color;
@@ -658,12 +729,18 @@ impl Renderer<'_> {
                                 other => {
                                     if let Some(adjust) = as_number(other) {
                                         // Kerning is expressed in 1/1000 em,
-                                        // subtracted from the advance.
-                                        let tx = -adjust / 1000.0
-                                            * state.font_size
-                                            * state.horizontal_scale;
-                                        state.text_matrix =
-                                            Matrix::translate(tx, 0.0).then(&state.text_matrix);
+                                        // subtracted from the advance — which
+                                        // runs down the page in vertical
+                                        // writing, where Th does not apply.
+                                        let shift = -adjust / 1000.0 * state.font_size;
+                                        let vertical =
+                                            state.font.as_ref().is_some_and(|f| f.text.vertical);
+                                        let step = if vertical {
+                                            Matrix::translate(0.0, shift)
+                                        } else {
+                                            Matrix::translate(shift * state.horizontal_scale, 0.0)
+                                        };
+                                        state.text_matrix = step.then(&state.text_matrix);
                                     }
                                 }
                             }
@@ -757,10 +834,10 @@ impl Renderer<'_> {
             FillRule::NonZero
         };
 
-        if fills && self.visible && !device.is_empty() {
+        if fills && self.visible && !device.is_empty() && !state.fill_marks_nothing() {
             self.paint_color(&device, rule, true, resources, state);
         }
-        if strokes && self.visible && !device.is_empty() {
+        if strokes && self.visible && !device.is_empty() && !state.stroke_marks_nothing() {
             self.paint_stroke(path, resources, state);
         }
 
@@ -879,6 +956,60 @@ impl Renderer<'_> {
         }
     }
 
+    /// Set aside every cache keyed by resource name before running a nested
+    /// content stream — a form, a tiling pattern, a Type3 glyph — that has its
+    /// own `/Resources`. Inside it `/F1` or `/CS0` may name something else
+    /// entirely, and a hit from the outer scope would draw with the wrong font
+    /// or colour. Pair with [`Renderer::leave_resource_scope`].
+    fn enter_resource_scope(&mut self) -> ResourceScope {
+        ResourceScope {
+            fonts: std::mem::take(&mut self.fonts),
+            tint_transforms: std::mem::take(&mut self.tint_transforms),
+        }
+    }
+
+    fn leave_resource_scope(&mut self, scope: ResourceScope) {
+        self.fonts = scope.fonts;
+        self.tint_transforms = scope.tint_transforms;
+    }
+
+    /// The tint transform for the space a `cs`/`CS` names, when it is a
+    /// Separation or DeviceN space. Cached per resource name: the function
+    /// can be a large sampled table and a page may set the space hundreds of
+    /// times.
+    fn space_tint_transform(
+        &mut self,
+        op: &Operation,
+        resources: &Dictionary,
+    ) -> Option<Rc<TintTransform>> {
+        let Some(PdfObject::Name(name)) = op.operands.first() else {
+            return None;
+        };
+        if matches!(
+            name.as_str(),
+            "DeviceGray"
+                | "G"
+                | "CalGray"
+                | "DeviceRGB"
+                | "RGB"
+                | "CalRGB"
+                | "DeviceCMYK"
+                | "CMYK"
+                | "Pattern"
+        ) {
+            return None;
+        }
+        if let Some(cached) = self.tint_transforms.get(name.as_str()) {
+            return cached.clone();
+        }
+        let loaded = self
+            .resource_object(resources, "ColorSpace", name)
+            .and_then(|object| TintTransform::load(self.doc, &object))
+            .map(Rc::new);
+        self.tint_transforms.insert(name.clone(), loaded.clone());
+        loaded
+    }
+
     fn load_font(&mut self, name: &str, resources: &Dictionary) -> Option<Rc<RenderFont>> {
         // Cache per resource name — a page typically reuses a handful.
         if let Some(font) = self.fonts.get(name) {
@@ -909,7 +1040,7 @@ impl Renderer<'_> {
         let units_per_em = font.units_per_em();
 
         if !invisible {
-            if font.is_substituted() {
+            if font.is_substituted() && !font.is_standard_substitute() {
                 self.warn("some text uses a substitute font: the document did not embed its own");
             } else if !font.can_draw_glyphs() {
                 self.warn("some text could not be drawn: no usable font outlines");
@@ -919,14 +1050,43 @@ impl Renderer<'_> {
         for code in font.text.codes(bytes) {
             let width = font.advance_width(code) / 1000.0;
 
-            if !invisible && font.can_draw_glyphs() {
+            if let Some(type3) = font.type3() {
+                if !invisible {
+                    if let Some(procedure) = type3.procedure(code, &font.text) {
+                        // Glyph space -> text space -> user space -> device.
+                        let glyph_ctm = type3
+                            .font_matrix
+                            .then(&Matrix::scale(
+                                state.font_size * state.horizontal_scale,
+                                state.font_size,
+                            ))
+                            .then(&Matrix::translate(0.0, state.rise))
+                            .then(&state.text_matrix)
+                            .then(&state.ctm);
+                        let glyph_resources = type3.resources.as_ref().unwrap_or(resources);
+                        self.draw_type3_glyph(procedure, glyph_resources, glyph_ctm, state);
+                    }
+                }
+            } else if !invisible && font.can_draw_glyphs() {
                 if let Some(outline) = font.outline(code) {
                     // Glyph space -> text space -> user space -> device.
                     let scale = Matrix::scale(
                         state.font_size * state.horizontal_scale / units_per_em,
                         state.font_size / units_per_em,
                     );
-                    let offset = Matrix::translate(0.0, state.rise);
+                    // In vertical writing the text position is the glyph's
+                    // *vertical* origin, which sits (vx, vy) from the
+                    // horizontal one its outline is drawn around (9.7.4.3).
+                    let (origin_x, origin_y) = if font.text.vertical {
+                        let (_, vx, vy) = font.text.vertical_metrics(code);
+                        (
+                            -vx / 1000.0 * state.font_size,
+                            -vy / 1000.0 * state.font_size,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let offset = Matrix::translate(origin_x, origin_y + state.rise);
                     let user = outline.transform(&scale.then(&offset).then(&state.text_matrix));
                     let device = user.transform(&state.ctm);
                     self.paint_glyph(&user, &device, resources, state, knockout_group_active);
@@ -944,10 +1104,52 @@ impl Renderer<'_> {
             } else {
                 0.0
             };
-            let advance =
-                (width * state.font_size + state.char_spacing + word) * state.horizontal_scale;
-            state.text_matrix = Matrix::translate(advance, 0.0).then(&state.text_matrix);
+            let step = if font.text.vertical {
+                // ty = w1y × Tfs + Tc + Tw; w1y is negative, so text runs
+                // down the page, and horizontal scaling does not apply.
+                let (w1y, _, _) = font.text.vertical_metrics(code);
+                Matrix::translate(
+                    0.0,
+                    w1y / 1000.0 * state.font_size + state.char_spacing + word,
+                )
+            } else {
+                let advance =
+                    (width * state.font_size + state.char_spacing + word) * state.horizontal_scale;
+                Matrix::translate(advance, 0.0)
+            };
+            state.text_matrix = step.then(&state.text_matrix);
         }
+    }
+
+    /// Run one Type3 glyph procedure with its glyph space mapped onto the
+    /// page. It is a self-contained content stream: its graphics-state
+    /// changes do not leak into the text that follows.
+    fn draw_type3_glyph(
+        &mut self,
+        procedure: &pdf_core::stream::PdfStream,
+        resources: &Dictionary,
+        glyph_ctm: Matrix,
+        state: &GraphicsState,
+    ) {
+        if self.depth >= 12 {
+            self.warn("Type3 glyph skipped: recursive content exceeds renderer limit");
+            return;
+        }
+        let Ok(data) = self.doc.stream_data(procedure) else {
+            self.warn("Type3 glyph skipped: its procedure cannot be decoded");
+            return;
+        };
+        let mut inner = state.clone();
+        inner.ctm = glyph_ctm;
+        inner.pattern_ctm = glyph_ctm;
+        let outer = self.enter_resource_scope();
+        self.depth += 1;
+        if self.run(&data, resources, &mut inner).is_err() {
+            self.warn("Type3 glyph skipped: malformed procedure");
+        }
+        self.depth -= 1;
+        self.leave_resource_scope(outer);
+        self.configure_canvas(state);
     }
 
     fn draw_xobject(&mut self, name: &str, resources: &Dictionary, state: &mut GraphicsState) {
@@ -1069,6 +1271,66 @@ impl Renderer<'_> {
 fn next_line(state: &mut GraphicsState) {
     state.line_matrix = Matrix::translate(0.0, -state.leading).then(&state.line_matrix);
     state.text_matrix = state.line_matrix;
+}
+
+/// Operators that set a colour or colour space — everything an uncoloured
+/// Type3 glyph must not do.
+fn is_color_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "g" | "G" | "rg" | "RG" | "k" | "K" | "cs" | "CS" | "sc" | "SC" | "scn" | "SCN"
+    )
+}
+
+/// A Separation or DeviceN space's tint transform, plus the alternate space
+/// its output lands in.
+///
+/// These spaces measure *ink*, not light: in `/Separation /Black`, a tint of 1
+/// is solid black and 0 is bare paper. Reading the tint as a grey level paints
+/// exactly the inverse, which turns black line art white and makes it vanish
+/// against the page. The transform is the only correct way across, and it is
+/// what the alternate space expects.
+struct TintTransform {
+    /// `None` for `/Separation /None`, which marks nothing on any device.
+    function: Option<ColorFunction>,
+    /// Component count of the alternate space the function outputs into.
+    alternate_components: usize,
+}
+
+impl TintTransform {
+    /// Build one for a Separation or DeviceN space, or `None` for any other
+    /// space (which needs no conversion).
+    fn load(doc: &PdfDocument, object: &PdfObject) -> Option<TintTransform> {
+        let PdfObject::Array(items) = doc.resolve_value(object) else {
+            return None;
+        };
+        let kind = items.first().and_then(PdfObject::as_name)?;
+        if kind != "Separation" && kind != "DeviceN" {
+            return None;
+        }
+        let colorant = items.get(1).map(|o| doc.resolve_value(o));
+        if kind == "Separation" && colorant.as_ref().and_then(PdfObject::as_name) == Some("None") {
+            return Some(TintTransform {
+                function: None,
+                alternate_components: 1,
+            });
+        }
+        let alternate = doc.resolve_value(items.get(2)?);
+        Some(TintTransform {
+            alternate_components: components_of_space(doc, &alternate),
+            function: Some(ColorFunction::load(doc, items.get(3)?, 0, &mut 64)?),
+        })
+    }
+
+    /// Convert tint values to RGB through the transform. `None` means paint
+    /// nothing — either the space is `/None` or the function would not run.
+    fn to_rgb(&self, tints: &[f64]) -> Option<Rgb> {
+        let mut out = self.function.as_ref()?.evaluate_inputs(tints)?;
+        // Trust the alternate space's component count over the function's
+        // declared /Range, which some writers pad beyond the real output.
+        out.truncate(self.alternate_components.max(1));
+        color_from(&out)
+    }
 }
 
 fn components_of_space(doc: &PdfDocument, object: &PdfObject) -> usize {
