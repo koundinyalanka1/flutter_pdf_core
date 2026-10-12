@@ -27,11 +27,15 @@ impl Renderer<'_> {
         state.dash_phase = phase;
     }
 
+    /// Stroke `path` (user space). `adjust` lets thin horizontal and vertical
+    /// lines snap to whole pixels; text outlines pass `false` and keep their
+    /// exact shape.
     pub(super) fn paint_stroke(
         &mut self,
         path: &Path,
         resources: &Dictionary,
         state: &GraphicsState,
+        adjust: bool,
     ) {
         let dashed = match dash_path(path, &state.dash, state.dash_phase) {
             Some(path) => path,
@@ -40,26 +44,94 @@ impl Renderer<'_> {
                 return;
             }
         };
-        let outline = if state.line_width == 0.0 {
+        let ctm = &state.ctm;
+        // Device pixels per unit of user space, averaged over the two axes —
+        // the measure PDFium uses for the same rule.
+        let unit = (ctm.a.hypot(ctm.b) + ctm.c.hypot(ctm.d)) / 2.0;
+        let width = state.line_width.abs();
+        let device_width = width * unit;
+        let adjust = adjust && self.type3_depth == 0;
+        let stroke = |path: &Path, width: f64| {
             stroke_outline_styled(
-                &dashed.transform(&state.ctm),
-                1.0,
+                path,
+                width,
                 state.line_cap,
                 state.line_join,
                 state.miter_limit,
             )
+        };
+        // Nothing is thinner than one device pixel. Width 0 already meant
+        // that; a 0.25pt table rule shown on a phone came out a faint grey
+        // that read as missing, where PDFium draws it as a solid pixel.
+        let outline = if width == 0.0 || !device_width.is_finite() || device_width < 1.0 {
+            let device = dashed.transform(ctm);
+            let device = if adjust {
+                snap_axis_strokes(&device, 1.0).unwrap_or(device)
+            } else {
+                device
+            };
+            stroke(&device, 1.0)
+        } else if adjust && device_width < 2.5 {
+            let pixels = device_width.round().max(1.0);
+            match snap_axis_strokes(&dashed.transform(ctm), pixels) {
+                Some(snapped) => stroke(&snapped, pixels),
+                None => stroke(&dashed, width).transform(ctm),
+            }
         } else {
-            stroke_outline_styled(
-                &dashed,
-                state.line_width.abs(),
-                state.line_cap,
-                state.line_join,
-                state.miter_limit,
-            )
-            .transform(&state.ctm)
+            stroke(&dashed, width).transform(ctm)
         };
         self.paint_color(&outline, FillRule::NonZero, false, resources, state);
     }
+}
+
+/// Automatic stroke adjustment (ISO 32000-1, 10.7.5) for a thin stroke built
+/// only from horizontal and vertical segments (device space): both edges of a
+/// `width`-pixel line fall on pixel boundaries, so a rule is one or two solid
+/// rows of pixels instead of a grey smear straddling a boundary. `None` when
+/// any segment is slanted or curved; those stay anti-aliased.
+fn snap_axis_strokes(path: &Path, width: f64) -> Option<Path> {
+    // Lines a PDF draws straight are straight to within rounding noise.
+    const STRAIGHT: f64 = 1e-3;
+    let snap = |value: f64| (value - width / 2.0).round() + width / 2.0;
+    let mut snapped = path.clone();
+    for (subpath, out) in path.subpaths.iter().zip(snapped.subpaths.iter_mut()) {
+        let points = &subpath.points;
+        let count = points.len();
+        if count < 2 {
+            continue;
+        }
+        let mut snap_x = vec![false; count];
+        let mut snap_y = vec![false; count];
+        let segments = if subpath.closed { count } else { count - 1 };
+        for i in 0..segments {
+            let (a, b) = (points[i], points[(i + 1) % count]);
+            let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+            if !(dx.is_finite() && dy.is_finite()) {
+                return None;
+            }
+            if dx < 1e-12 && dy < 1e-12 {
+                continue;
+            }
+            if dy <= STRAIGHT {
+                snap_y[i] = true;
+                snap_y[(i + 1) % count] = true;
+            } else if dx <= STRAIGHT {
+                snap_x[i] = true;
+                snap_x[(i + 1) % count] = true;
+            } else {
+                return None;
+            }
+        }
+        for (i, point) in out.points.iter_mut().enumerate() {
+            if snap_x[i] {
+                point.x = snap(point.x);
+            }
+            if snap_y[i] {
+                point.y = snap(point.y);
+            }
+        }
+    }
+    Some(snapped)
 }
 
 fn dash_path(path: &Path, pattern: &[f64], phase: f64) -> Option<Path> {

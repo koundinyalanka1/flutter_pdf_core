@@ -886,6 +886,86 @@ pub unsafe extern "C" fn pdf_render_page_png(
     }
 }
 
+/// Render part of page `page` (0-based) as PNG: the page is laid out to fit
+/// `page_width` x `page_height` pixels exactly as [`pdf_render_page_png`]
+/// would draw it, and only the `region_width` x `region_height` pixels at
+/// (`region_x`, `region_y`) of that are drawn. The region is clipped to the
+/// page, and one that misses it is an error.
+///
+/// This is how a viewer stays sharp far into a zoom: it renders what is on
+/// screen at full resolution instead of the whole page, whose bitmap at that
+/// scale would run to hundreds of megabytes.
+///
+/// Free the result with `pdf_free_buffer`. On failure, returns NULL and sets
+/// `out_len` to zero.
+///
+/// # Safety
+/// As [`pdf_render_page_png`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pdf_render_page_region_png(
+    path: *const c_char,
+    password: *const c_char,
+    page: i32,
+    page_width: i32,
+    page_height: i32,
+    region_x: i32,
+    region_y: i32,
+    region_width: i32,
+    region_height: i32,
+    out_len: *mut i32,
+) -> *mut u8 {
+    set_warnings(&[]);
+    if out_len.is_null() {
+        set_error("ERROR: null out_len");
+        return std::ptr::null_mut();
+    }
+    *out_len = 0;
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
+    if page_width <= 0
+        || page_height <= 0
+        || region_x < 0
+        || region_y < 0
+        || region_width <= 0
+        || region_height <= 0
+    {
+        set_error("ERROR: render sizes must be positive and the region must start on the page");
+        return std::ptr::null_mut();
+    }
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, PdfError> {
+        let doc = open_for_reading(path, password)?;
+        let options = pdf_render::RenderOptions {
+            region: Some(pdf_render::PixelRegion {
+                x: region_x as u32,
+                y: region_y as u32,
+                width: region_width as u32,
+                height: region_height as u32,
+            }),
+            ..render_options(page_width, page_height)
+        };
+        let rendered = pdf_render::render_page(&doc, page, options)?;
+        set_warnings(&rendered.warnings);
+        pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
+            .ok_or_else(|| PdfError::Structure("could not encode PNG".into()))
+    }));
+    match result {
+        Ok(Ok(data)) => release_buffer(data, out_len),
+        Ok(Err(err)) => {
+            set_pdf_error(&err);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_error("PANIC: internal error");
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Render page `page` (0-based) as raw RGBA8, top-left origin.
 ///
 /// Writes the pixel dimensions into `out_width`/`out_height` so the caller can
@@ -1584,6 +1664,71 @@ mod tests {
                 let (mut w, mut h) = (123.0, 123.0);
                 assert_eq!(pdf_page_size(input, empty.as_ptr(), 99, &mut w, &mut h), -1);
                 assert_eq!((w, h), (0.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn region_renders_are_clipped_to_the_page_and_reject_bad_regions() {
+        let path = fixture_path();
+        let empty = c("");
+        let size = |png: &[u8]| {
+            (
+                u32::from_be_bytes(png[16..20].try_into().unwrap()),
+                u32::from_be_bytes(png[20..24].try_into().unwrap()),
+            )
+        };
+        unsafe {
+            let mut len = 0;
+            let full = pdf_render_page_png(path.as_ptr(), empty.as_ptr(), 0, 200, 4000, &mut len);
+            assert!(!full.is_null(), "{}", last_error());
+            let (width, height) = size(std::slice::from_raw_parts(full, len as usize));
+            pdf_free_buffer(full, len);
+            assert_eq!(width, 200);
+
+            // Hanging off the right edge: only the part on the page is drawn.
+            let region = pdf_render_page_region_png(
+                path.as_ptr(),
+                empty.as_ptr(),
+                0,
+                200,
+                4000,
+                150,
+                10,
+                100,
+                30,
+                &mut len,
+            );
+            assert!(!region.is_null(), "{}", last_error());
+            assert_eq!(
+                size(std::slice::from_raw_parts(region, len as usize)),
+                (50, 30)
+            );
+            pdf_free_buffer(region, len);
+
+            for (x, y, w, h) in [
+                (-1, 0, 10, 10),
+                (0, 0, 0, 10),
+                (width as i32, 0, 10, 10),
+                (0, height as i32, 10, 10),
+            ] {
+                let mut len = 123;
+                set_warnings(&["previous render".to_owned()]);
+                let png = pdf_render_page_region_png(
+                    path.as_ptr(),
+                    empty.as_ptr(),
+                    0,
+                    200,
+                    4000,
+                    x,
+                    y,
+                    w,
+                    h,
+                    &mut len,
+                );
+                assert!(png.is_null(), "region ({x}, {y}, {w}, {h}) should fail");
+                assert_eq!(len, 0);
+                assert!(CStr::from_ptr(pdf_last_warnings()).to_bytes().is_empty());
             }
         }
     }

@@ -780,6 +780,55 @@ class PdfCore {
     return PdfRenderedPng(bytes, _lastWarnings());
   }
 
+  /// Whether this build of the engine can render part of a page
+  /// ([renderPageRegionPngWithWarnings]).
+  static bool get canRenderRegions => _b.renderPageRegionPng != null;
+
+  /// Rasterize part of [page] (0-based) to PNG.
+  ///
+  /// The page is laid out to fit inside [pageWidth] x [pageHeight] pixels,
+  /// exactly as [renderPagePng] would draw it at that size, and only the
+  /// [width] x [height] pixels at ([x], [y]) of that layout are drawn. The
+  /// region is clipped to the page; one that misses the page throws.
+  ///
+  /// A viewer zoomed far into a page needs sharp pixels only for what is on
+  /// screen. Rendering the whole page at that scale would take hundreds of
+  /// megabytes; rendering the visible part takes about a screenful.
+  ///
+  /// Throws [PdfException] with code `REGION_RENDER_UNAVAILABLE` when the
+  /// native library predates region rendering ([canRenderRegions]).
+  static PdfRenderedPng renderPageRegionPngWithWarnings(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+  }) {
+    final render = _b.renderPageRegionPng;
+    if (render == null) {
+      throw PdfException(
+        'REGION_RENDER_UNAVAILABLE',
+        'Rendering part of a page is unavailable in this version of the PDF engine.',
+      );
+    }
+    final bytes = _withUtf8([path, password], (args) {
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = render(args[0], args[1], page, pageWidth, pageHeight, x,
+            y, width, height, lengthOut);
+        if (buffer == nullptr) throw _lastError();
+        return _takeBuffer(buffer, lengthOut.value);
+      } finally {
+        calloc.free(lengthOut);
+      }
+    });
+    return PdfRenderedPng(bytes, _lastWarnings());
+  }
+
   /// Rasterize [page] (0-based) to raw RGBA8 — the cheapest path to a
   /// `ui.Image`, with no encode/decode round trip.
   static PdfRenderedPage renderPageRgba(
@@ -1049,6 +1098,26 @@ class PdfCore {
   }) =>
       Isolate.run(() => renderPagePngWithWarnings(path, page,
           width: width, height: height, password: password));
+
+  static Future<PdfRenderedPng> renderPageRegionPngWithWarningsAsync(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+  }) =>
+      Isolate.run(() => renderPageRegionPngWithWarnings(path, page,
+          pageWidth: pageWidth,
+          pageHeight: pageHeight,
+          x: x,
+          y: y,
+          width: width,
+          height: height,
+          password: password));
 
   static Future<PdfRenderedPage> renderPageRgbaAsync(
     String path,

@@ -12,7 +12,8 @@ A lightweight PDF toolkit for Flutter, **built from scratch in Rust** — no thi
 * OCR for scanned pages, also built from scratch: reads printed Latin-script text,
   makes scans searchable with an invisible text layer, and gives scans the same
   selection/search geometry as born-digital pages
-* CPU raster rendering to PNG or RGBA, with warnings for approximate/skipped content
+* CPU raster rendering to PNG or RGBA, with warnings for approximate/skipped content;
+  whole pages or just a region of one (for sharp zoom without huge bitmaps)
 * JPEG-to-PDF composition with page-size, fit and margin controls
 * AI-ready JSON/NDJSON export (paragraph-aware chunks with overlap) for feeding local models
 * AES-256 password protection; opens RC4/AES-128/AES-256 encrypted files
@@ -73,6 +74,13 @@ codecs include JPEG, JPEG 2000, JBIG2 (shared globals), CCITT, Flate and LZW.
 Standalone image decoders are used; the PDF parser and renderer remain native
 project code. Vendored codec allocation limits and licenses are documented in
 [rust/vendor/README.md](rust/vendor/README.md).
+
+Screen output follows PDFium's conventions where they make pages read more
+clearly: images are area-sampled, lone filled rectangles and rectangular
+clips land on whole pixels, and no stroke is thinner than one device pixel.
+To look as sharp as other viewers, render at the page's size on screen in
+device pixels (its width, not its long edge in a square box), and draw the
+bitmap one pixel per device pixel.
 
 Missing annotation appearances can use geometry/text/widget fallbacks including
 rotation, comb cells, choice selection and button captions/icons. Generated

@@ -1,5 +1,31 @@
 ## Unreleased
 
+* Sharper rendering, measured against PDFium (what Chrome and Drive use) at
+  phone resolution on Latin, Indic, CJK and scanned pages:
+  * Images are area-sampled. Each device pixel averages the part of the image
+    it covers; before, it took one source pixel, so a 300 dpi scan shown at
+    phone width lost most of its pixels and thin strokes broke up. Enlarged
+    images keep crisp pixel edges unless `/Interpolate` asks for smoothing,
+    as in PDFium. Upright, flipped and quarter-turned images use an exact
+    separable filter; others are supersampled, with smooth edges.
+  * A filled rectangle on its own (a table border, an underline, a cell
+    background) lands on whole pixels, at least one wide, by PDFium's rule,
+    and rectangular clips widen to whole pixels. Strokes are never thinner
+    than one device pixel, and thin horizontal and vertical strokes snap to
+    the pixel grid (automatic stroke adjustment). A 0.25 pt rule on a phone
+    is now a solid line instead of a faint grey one.
+  * Anti-aliasing samples 16 sub-scanlines per row instead of 4, so hairline
+    horizontal strokes no longer drop out between samples. Only edges that
+    cross a row, and only the pixels it touched, are visited, which keeps
+    rendering as fast as before.
+  * Partly covered pixels of glyph outlines are drawn a little darker
+    (coverage to the power 0.9), matching the weight of PDFium's hinted text
+    to within 1%; solid pixels and large text are unchanged.
+* Render part of a page: `RenderOptions::region`, `pdf_render_page_region_png`
+  (`PdfCore.renderPageRegionPngWithWarnings`, `PdfCore.canRenderRegions`).
+  The page is laid out at the requested size and only the region is drawn
+  and allocated, so a viewer can keep a zoomed page sharp with a screenful of
+  pixels instead of a full-page bitmap of hundreds of megabytes.
 * OCR, written from scratch (new `pdf_ocr` crate). Recognizes printed
   Latin-script text on scanned pages. Pages scanned skewed, sideways or upside
   down are handled. `pdf_ocr_page_json` (`PdfCore.ocrPage`) reads a page and

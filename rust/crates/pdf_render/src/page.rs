@@ -25,6 +25,8 @@
 mod annotations;
 #[path = "page_forms.rs"]
 mod forms;
+#[path = "page_images.rs"]
+mod images;
 #[path = "page_limits.rs"]
 mod limits;
 #[path = "page_optional_content.rs"]
@@ -67,6 +69,20 @@ pub struct RenderOptions {
     /// Hard cap on output pixels, so a malformed /MediaBox cannot ask for a
     /// gigapixel buffer on a phone. Must be at least one.
     pub max_pixels: usize,
+    /// Draw only this part of the page as `size` lays it out. A viewer zoomed
+    /// far into a page needs sharp pixels for what is on screen, not a
+    /// full-page bitmap of hundreds of megapixels; `max_pixels` then bounds
+    /// the region rather than the page. Clipped to the page.
+    pub region: Option<PixelRegion>,
+}
+
+/// A rectangle of a rendered page, in its output pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Default for RenderOptions {
@@ -75,6 +91,7 @@ impl Default for RenderOptions {
             size: RenderSize::Scale(1.0),
             background: Rgb::new(1.0, 1.0, 1.0),
             max_pixels: 32_000_000,
+            region: None,
         }
     }
 }
@@ -122,7 +139,17 @@ pub fn render_page(
         (page_w, page_h)
     };
 
-    let (out_w, out_h) = output_dimensions(display_w, display_h, options)?;
+    let (page_px_w, page_px_h) = output_dimensions(display_w, display_h, options)?;
+    let region = match options.region {
+        None => PixelRegion {
+            x: 0,
+            y: 0,
+            width: page_px_w as u32,
+            height: page_px_h as u32,
+        },
+        Some(region) => clip_region(region, page_px_w, page_px_h, options.max_pixels)?,
+    };
+    let (out_w, out_h) = (region.width as usize, region.height as usize);
 
     let mut canvas = Canvas::new(out_w, out_h);
     canvas.fill_background(options.background);
@@ -136,8 +163,15 @@ pub fn render_page(
         270 => Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, page_w),
         _ => Matrix::IDENTITY,
     };
-    let device_scale = Matrix::scale(out_w as f64 / display_w, out_h as f64 / display_h);
-    let base_ctm = flip.then(&rotation).then(&device_scale);
+    let device_scale = Matrix::scale(page_px_w as f64 / display_w, page_px_h as f64 / display_h);
+    // A region is the same page shifted so the region's corner is the origin.
+    let base_ctm = flip
+        .then(&rotation)
+        .then(&device_scale)
+        .then(&Matrix::translate(
+            -f64::from(region.x),
+            -f64::from(region.y),
+        ));
 
     let resources = page
         .get("Resources")
@@ -173,6 +207,7 @@ pub fn render_page(
         render_stopped: false,
         warnings: doc.recovery_warnings.clone(),
         visible: true,
+        type3_depth: 0,
     };
     let mut state = GraphicsState::new(base_ctm);
     // Parsing recovers from damage rather than failing, so this only errors
@@ -250,7 +285,14 @@ fn output_dimensions(width: f64, height: f64, options: RenderOptions) -> Result<
     // RGBA allocations must fit Rust's allocation limit as well as the caller's
     // pixel budget. Bound the scale before multiplying any dimensions.
     // Canvas also allocates a coverage row of width + 2 f32 elements.
-    let budget = options.max_pixels.min(isize::MAX as usize / 4 - 2);
+    // When only a region is drawn, only the region is allocated, so the
+    // caller's budget applies to it (see `clip_region`) and not to the page.
+    let caller_budget = if options.region.is_some() {
+        usize::MAX
+    } else {
+        options.max_pixels
+    };
+    let budget = caller_budget.min(isize::MAX as usize / 4 - 2);
     if budget == 0 {
         return Err(PdfError::Structure(
             "render pixel budget must be positive".into(),
@@ -273,6 +315,37 @@ fn output_dimensions(width: f64, height: f64, options: RenderOptions) -> Result<
         }
     }
     Ok((out_w, out_h))
+}
+
+/// `region` clipped to a page of `page_w` x `page_h` pixels, within the pixel
+/// budget. A region that misses the page entirely is an error rather than an
+/// empty bitmap, so a caller with stale geometry finds out.
+fn clip_region(
+    region: PixelRegion,
+    page_w: usize,
+    page_h: usize,
+    max_pixels: usize,
+) -> Result<PixelRegion> {
+    let (x, y) = (region.x as usize, region.y as usize);
+    if region.width == 0 || region.height == 0 || x >= page_w || y >= page_h {
+        return Err(PdfError::Structure(
+            "render region must overlap the page".into(),
+        ));
+    }
+    let width = (region.width as usize).min(page_w - x);
+    let height = (region.height as usize).min(page_h - y);
+    let budget = max_pixels.min(isize::MAX as usize / 4 - 2);
+    if budget == 0 || width > budget / height {
+        return Err(PdfError::Structure(
+            "render region exceeds the pixel budget".into(),
+        ));
+    }
+    Ok(PixelRegion {
+        x: region.x,
+        y: region.y,
+        width: width as u32,
+        height: height as u32,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +476,9 @@ struct Renderer<'a> {
     render_stopped: bool,
     warnings: Vec<String>,
     visible: bool,
+    /// How many Type3 glyph procedures are running. Their shapes are glyph
+    /// outlines, so page-level pixel snapping stays out of them.
+    type3_depth: usize,
 }
 
 impl Renderer<'_> {
@@ -835,16 +911,41 @@ impl Renderer<'_> {
         };
 
         if fills && self.visible && !device.is_empty() && !state.fill_marks_nothing() {
-            self.paint_color(&device, rule, true, resources, state);
+            // A filled rectangle on its own — a table border, an underline, a
+            // cell background — lands on whole pixels, as PDFium draws it.
+            // Anti-aliased at a fractional position, a one-pixel rule
+            // smears into two grey rows; at phone resolution every border in
+            // a form looked washed out next to the same page in Drive.
+            // Not inside a Type3 glyph, though: a font drawn from tiny
+            // squares would bloat into blobs.
+            let snapped = if strokes || self.type3_depth > 0 {
+                None
+            } else {
+                snap_rect_fill(&device)
+            };
+            self.paint_color(
+                snapped.as_ref().unwrap_or(&device),
+                rule,
+                true,
+                resources,
+                state,
+            );
         }
         if strokes && self.visible && !device.is_empty() && !state.stroke_marks_nothing() {
-            self.paint_stroke(path, resources, state);
+            self.paint_stroke(path, resources, state, true);
         }
 
         // `W` names the clip, but it only takes effect after the painting
         // operator that follows it — which is this one.
         if let Some(clip_rule) = pending_clip.take() {
-            self.clip_path(&device, clip_rule, state);
+            // A rectangular clip widens to whole pixels, so what it frames
+            // keeps sharp edges instead of fading out over a partial pixel.
+            let snapped = if self.type3_depth > 0 {
+                None
+            } else {
+                snap_rect_clip(&device)
+            };
+            self.clip_path(snapped.as_ref().unwrap_or(&device), clip_rule, state);
         }
     }
 
@@ -1144,9 +1245,11 @@ impl Renderer<'_> {
         inner.pattern_ctm = glyph_ctm;
         let outer = self.enter_resource_scope();
         self.depth += 1;
+        self.type3_depth += 1;
         if self.run(&data, resources, &mut inner).is_err() {
             self.warn("Type3 glyph skipped: malformed procedure");
         }
+        self.type3_depth -= 1;
         self.depth -= 1;
         self.leave_resource_scope(outer);
         self.configure_canvas(state);
@@ -1186,71 +1289,6 @@ impl Renderer<'_> {
         }
     }
 
-    /// Paint an image into the unit square mapped by the CTM.
-    ///
-    /// Walks device pixels and inverse-maps each one into image space, which
-    /// handles rotation and skew for free and never allocates a resampled
-    /// intermediate.
-    fn draw_image(&mut self, stream: &pdf_core::stream::PdfStream, state: &GraphicsState) {
-        if !self.visible {
-            return;
-        }
-        self.configure_canvas(state);
-        let Some(image) = decode_image(self.doc, stream) else {
-            let codec = image_codec_name(self.doc, stream);
-            self.warn(format!(
-                "image skipped: {codec} is unsupported or its data is damaged"
-            ));
-            return;
-        };
-        if image.is_stencil && state.fill_pattern_space {
-            self.warn(
-                "pattern-coloured stencil image skipped: this paint combination is unsupported",
-            );
-            return;
-        }
-        let Some(inverse) = state.ctm.invert() else {
-            return;
-        };
-
-        // Device-space bounds of the transformed unit square.
-        let corners = [
-            state.ctm.apply(0.0, 0.0),
-            state.ctm.apply(1.0, 0.0),
-            state.ctm.apply(0.0, 1.0),
-            state.ctm.apply(1.0, 1.0),
-        ];
-        let min_x = corners.iter().map(|c| c.0).fold(f64::MAX, f64::min);
-        let max_x = corners.iter().map(|c| c.0).fold(f64::MIN, f64::max);
-        let min_y = corners.iter().map(|c| c.1).fold(f64::MAX, f64::min);
-        let max_y = corners.iter().map(|c| c.1).fold(f64::MIN, f64::max);
-
-        let x0 = min_x.floor().max(0.0) as usize;
-        let y0 = min_y.floor().max(0.0) as usize;
-        let x1 = (max_x.ceil().min(self.canvas.width as f64)).max(0.0) as usize;
-        let y1 = (max_y.ceil().min(self.canvas.height as f64)).max(0.0) as usize;
-
-        let clip = state.clip.clone();
-        for py in y0..y1 {
-            for px in x0..x1 {
-                // Sample at the pixel centre.
-                let (u, v) = inverse.apply(px as f64 + 0.5, py as f64 + 0.5);
-                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-                    continue;
-                }
-                // Image space runs top-down, the unit square bottom-up.
-                let sx = (u * image.width as f64) as usize;
-                let sy = ((1.0 - v) * image.height as f64) as usize;
-                let Some((color, alpha)) = image.sample(sx, sy) else {
-                    continue;
-                };
-                let color = if image.is_stencil { state.fill } else { color };
-                self.canvas
-                    .blend(px, py, color, alpha * state.fill_alpha, clip.as_deref());
-            }
-        }
-    }
-
     fn resource(&self, resources: &Dictionary, category: &str, name: &str) -> Option<Dictionary> {
         let object = self.resource_object(resources, category, name)?;
         self.doc.resolve_dict(&object).cloned()
@@ -1271,6 +1309,102 @@ impl Renderer<'_> {
 fn next_line(state: &mut GraphicsState) {
     state.line_matrix = Matrix::translate(0.0, -state.leading).then(&state.line_matrix);
     state.text_matrix = state.line_matrix;
+}
+
+/// `(left, top, right, bottom)` when `path` (device space) is one
+/// axis-aligned rectangle, possibly with no width or no height.
+fn axis_aligned_rect(path: &Path) -> Option<(f64, f64, f64, f64)> {
+    const EPSILON: f64 = 1e-6;
+    let mut subpaths = path.subpaths.iter().filter(|s| s.points.len() > 1);
+    let subpath = subpaths.next()?;
+    if subpaths.next().is_some() {
+        return None;
+    }
+    let mut points = subpath.points.as_slice();
+    if points.len() == 5
+        && (points[4].x - points[0].x).abs() < EPSILON
+        && (points[4].y - points[0].y).abs() < EPSILON
+    {
+        points = &points[..4];
+    }
+    if points.len() != 4 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return None;
+    }
+    let left = points.iter().map(|p| p.x).fold(f64::MAX, f64::min);
+    let right = points.iter().map(|p| p.x).fold(f64::MIN, f64::max);
+    let top = points.iter().map(|p| p.y).fold(f64::MAX, f64::min);
+    let bottom = points.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+    let on =
+        |value: f64, a: f64, b: f64| (value - a).abs() < EPSILON || (value - b).abs() < EPSILON;
+    // Every point is a corner, every edge runs along an axis, and the four
+    // points visit the four corners (rather than doubling back along a line).
+    let mut corners = [false; 4];
+    for (i, p) in points.iter().enumerate() {
+        if !on(p.x, left, right) || !on(p.y, top, bottom) {
+            return None;
+        }
+        let q = points[(i + 1) % 4];
+        if (p.x - q.x).abs() >= EPSILON && (p.y - q.y).abs() >= EPSILON {
+            return None;
+        }
+        let column = usize::from((p.x - right).abs() < EPSILON && right - left >= EPSILON);
+        let row = usize::from((p.y - bottom).abs() < EPSILON && bottom - top >= EPSILON);
+        corners[row * 2 + column] = true;
+    }
+    let wide = right - left >= EPSILON;
+    let tall = bottom - top >= EPSILON;
+    if wide && tall && !corners.iter().all(|&c| c) {
+        return None;
+    }
+    Some((left, top, right, bottom))
+}
+
+/// PDFium's rule for a filled rectangle: whole pixels, as many as the
+/// rectangle's size rounded up (never none), on the side it covers more of.
+/// A sliver that would anti-alias to a faint grey line becomes one solid
+/// pixel row instead.
+fn snap_rect_fill(path: &Path) -> Option<Path> {
+    let (left, top, right, bottom) = axis_aligned_rect(path)?;
+    // Far off-canvas or absurdly large rectangles gain nothing from snapping.
+    if [left, top, right, bottom].iter().any(|v| v.abs() > 1e7) {
+        return None;
+    }
+    let snap = |low: f64, high: f64| {
+        let size = (high - low).ceil().max(1.0);
+        let mut start = low.floor();
+        let mut end = high.ceil().max(start + size);
+        if end - start >= size + 1.0 {
+            // One pixel too many: drop whichever end pixel is less covered.
+            if low - start > end - high {
+                start += 1.0;
+            } else {
+                end -= 1.0;
+            }
+        }
+        (start, end)
+    };
+    let (x0, x1) = snap(left, right);
+    let (y0, y1) = snap(top, bottom);
+    let mut snapped = Path::new();
+    snapped.rect(x0, y0, x1 - x0, y1 - y0);
+    Some(snapped)
+}
+
+/// A rectangular clip widened to the pixels it touches (PDFium does the same),
+/// so the edges of whatever it frames stay sharp. Anything else clips as drawn.
+fn snap_rect_clip(path: &Path) -> Option<Path> {
+    let (left, top, right, bottom) = axis_aligned_rect(path)?;
+    // A clip with no area shows nothing; widening it would show a pixel.
+    if right - left < 1e-6 || bottom - top < 1e-6 {
+        return None;
+    }
+    if [left, top, right, bottom].iter().any(|v| v.abs() > 1e7) {
+        return None;
+    }
+    let mut snapped = Path::new();
+    let (x0, y0) = (left.floor(), top.floor());
+    snapped.rect(x0, y0, right.ceil() - x0, bottom.ceil() - y0);
+    Some(snapped)
 }
 
 /// Operators that set a colour or colour space — everything an uncoloured
@@ -1927,3 +2061,7 @@ mod regressions;
 #[cfg(test)]
 #[path = "page_transparency_tests.rs"]
 mod transparency_tests;
+
+#[cfg(test)]
+#[path = "page_crisp_tests.rs"]
+mod crisp_tests;

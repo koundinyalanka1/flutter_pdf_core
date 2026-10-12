@@ -62,6 +62,11 @@ typedef _RenderPngC = Pointer<Uint8> Function(
 typedef _RenderPngDart = Pointer<Uint8> Function(
     Pointer<Utf8>, Pointer<Utf8>, int, int, int, Pointer<Int32>);
 
+typedef _RenderRegionPngC = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
+    Int32, Int32, Int32, Int32, Int32, Int32, Int32, Pointer<Int32>);
+typedef _RenderRegionPngDart = Pointer<Uint8> Function(Pointer<Utf8>,
+    Pointer<Utf8>, int, int, int, int, int, int, int, Pointer<Int32>);
+
 typedef _RenderRgbaC = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
     Int32, Int32, Int32, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>);
 typedef _RenderRgbaDart = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
@@ -200,6 +205,12 @@ class PdfBindings {
           Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>)?
       applyOcrJson = _optional(
           () => _library.lookupFunction<_Op4C, _Op4Dart>('pdf_apply_ocr_json'));
+
+  /// Optional for the same reason as [pageTextLayoutJson]: region renders
+  /// arrived after OCR.
+  late final _RenderRegionPngDart? renderPageRegionPng = _optional(() =>
+      _library.lookupFunction<_RenderRegionPngC, _RenderRegionPngDart>(
+          'pdf_render_page_region_png'));
 
   static T? _optional<T>(T Function() lookup) {
     try {

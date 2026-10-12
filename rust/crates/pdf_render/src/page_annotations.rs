@@ -120,7 +120,7 @@ impl Renderer<'_> {
                                         &state,
                                     );
                                 }
-                                self.paint_stroke(&marker, &resources, &state);
+                                self.paint_stroke(&marker, &resources, &state, true);
                             }
                         }
                     }
@@ -164,7 +164,7 @@ impl Renderer<'_> {
             }
         }
         if state.line_width > 0.0 {
-            self.paint_stroke(&path, &resources, &state);
+            self.paint_stroke(&path, &resources, &state, true);
         }
         if annotation
             .get("BE")
@@ -237,7 +237,7 @@ impl Renderer<'_> {
             &state,
         );
         state.stroke = Rgb::BLACK;
-        self.paint_stroke(&shape, &resources, &state);
+        self.paint_stroke(&shape, &resources, &state, true);
         let label = if subtype == "Stamp" {
             annotation
                 .get("Name")
@@ -991,7 +991,7 @@ impl Renderer<'_> {
                 (rect.3 - rect.1 - state.line_width).max(0.0),
             );
         }
-        self.paint_stroke(&path, &Dictionary::new(), state);
+        self.paint_stroke(&path, &Dictionary::new(), state, true);
         if matches!(style, "B" | "I") {
             let d = state
                 .line_width

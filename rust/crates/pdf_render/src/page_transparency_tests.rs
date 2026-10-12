@@ -169,7 +169,16 @@ fn stroked_text_is_hollow_and_fill_stroke_uses_both_colours() {
             .count()
     };
     assert!(count([255, 0, 0]) > 100);
-    assert!(count([0, 0, 255]) > 20);
+    // The one-pixel outline straddles pixel boundaries, so its pixels are
+    // mostly blue rather than exactly blue.
+    let blue = both
+        .pixels
+        .chunks_exact(4)
+        .filter(|p| {
+            i32::from(p[2]) - i32::from(p[0]) > 100 && i32::from(p[2]) - i32::from(p[1]) > 100
+        })
+        .count();
+    assert!(blue > 20, "only {blue} stroke pixels");
 }
 
 #[test]

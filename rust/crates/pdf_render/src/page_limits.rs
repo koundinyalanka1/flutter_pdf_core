@@ -67,6 +67,7 @@ mod tests {
                 render_stopped: false,
                 warnings: Vec::new(),
                 visible: true,
+                type3_depth: 0,
             };
             renderer
                 .run(

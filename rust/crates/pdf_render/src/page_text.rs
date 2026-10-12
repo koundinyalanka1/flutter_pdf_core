@@ -83,10 +83,12 @@ impl Renderer<'_> {
             None
         };
         if fill {
+            self.canvas.glyph_fill = true;
             self.paint_color(device, FillRule::NonZero, true, resources, state);
+            self.canvas.glyph_fill = false;
         }
         if stroke {
-            self.paint_stroke(user, resources, state);
+            self.paint_stroke(user, resources, state, false);
         }
         if let Some(group) = group {
             self.finish_text_group(group, state);
