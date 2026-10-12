@@ -8,7 +8,7 @@
 //! An enlarged image keeps crisp pixel edges, again as PDFium draws it, unless
 //! the document asks for `/Interpolate`.
 use super::*;
-use crate::image::DecodedImage;
+use crate::image::{AlphaPlane, DecodedImage};
 use pdf_core::stream::PdfStream;
 
 /// Skew, in device pixels across the whole image, small enough to treat the
@@ -46,14 +46,28 @@ impl Renderer<'_> {
             Some(PdfObject::Bool(true))
         );
         let source = Source::new(&image);
+        // A mask of another size than the image is sampled at its own
+        // resolution, so a fine text mask over coarse colour stays sharp.
+        let mask = image.mask.as_ref().map(Source::coverage);
         let paint = Paint {
             stencil_color: image.is_stencil.then_some(state.fill),
             alpha: state.fill_alpha,
             clip: state.clip.clone(),
         };
-        match AxisPlan::new(&state.ctm, image.width, image.height) {
-            Some(plan) => self.draw_axis_aligned(&source, &plan, interpolate, &paint),
-            None => self.draw_transformed(&source, &state.ctm, interpolate, &paint),
+        let plans =
+            AxisPlan::new(&state.ctm, image.width, image.height).and_then(|plan| match &mask {
+                Some(mask) => Some((
+                    plan,
+                    Some(AxisPlan::new(&state.ctm, mask.width, mask.height)?),
+                )),
+                None => Some((plan, None)),
+            });
+        match plans {
+            Some((plan, mask_plan)) => {
+                let mask = mask.as_ref().zip(mask_plan.as_ref());
+                self.draw_axis_aligned(&source, &plan, mask, interpolate, &paint)
+            }
+            None => self.draw_transformed(&source, mask.as_ref(), &state.ctm, interpolate, &paint),
         }
     }
 
@@ -64,46 +78,38 @@ impl Renderer<'_> {
         &mut self,
         source: &Source,
         plan: &AxisPlan,
+        mask: Option<(&Source, &AxisPlan)>,
         interpolate: bool,
         paint: &Paint,
     ) {
         let (width, height) = (self.canvas.width, self.canvas.height);
-        let Some(columns) = plan.columns.taps(plan.device_x(width), interpolate) else {
+        let Some(mut color) = AxisResampler::new(source, plan, width, height, interpolate) else {
             return;
         };
-        let Some(rows) = plan.rows.taps(plan.device_y(height), interpolate) else {
-            return;
-        };
-        // The stretch of the image's column axis any device column reads.
-        let (low, high) = columns.source_span();
-        if low >= high {
-            return;
-        }
-        let mut blended = vec![[0f32; 4]; high - low];
-        for (y, row) in rows.pixels() {
-            blended.fill([0.0; 4]);
-            for &(along_rows, weight) in row {
-                for (offset, slot) in blended.iter_mut().enumerate() {
-                    let along_columns = low + offset;
-                    let texel = if plan.straight {
-                        source.texel(along_columns, along_rows)
-                    } else {
-                        source.texel(along_rows, along_columns)
-                    };
-                    for c in 0..4 {
-                        slot[c] += weight * texel[c];
-                    }
-                }
+        let mut mask = match mask {
+            Some((mask, plan)) => {
+                let Some(resampler) = AxisResampler::new(mask, plan, width, height, interpolate)
+                else {
+                    return;
+                };
+                Some(resampler)
             }
-            for (x, column) in columns.pixels() {
-                let mut sum = [0f32; 4];
-                for &(along_columns, weight) in column {
-                    let texel = blended[along_columns - low];
-                    for c in 0..4 {
-                        sum[c] += weight * texel[c];
-                    }
+            None => None,
+        };
+        let rows: Vec<usize> = color.rows.pixels().map(|(y, _)| y).collect();
+        let columns: Vec<usize> = color.columns.pixels().map(|(x, _)| x).collect();
+        for y in rows {
+            color.blend_row(y);
+            if let Some(mask) = &mut mask {
+                mask.blend_row(y);
+            }
+            for &x in &columns {
+                let mut texel = color.sample(x);
+                if let Some(mask) = &mask {
+                    let coverage = mask.sample(x)[3];
+                    texel = texel.map(|c| c * coverage);
                 }
-                self.blend_texel(x, y, sum, paint);
+                self.blend_texel(x, y, texel, paint);
             }
         }
     }
@@ -115,6 +121,7 @@ impl Renderer<'_> {
     fn draw_transformed(
         &mut self,
         source: &Source,
+        mask: Option<&Source>,
         ctm: &Matrix,
         interpolate: bool,
         paint: &Paint,
@@ -140,22 +147,38 @@ impl Renderer<'_> {
         let x1 = (max_x.ceil().min(self.canvas.width as f64)).max(0.0) as usize;
         let y1 = (max_y.ceil().min(self.canvas.height as f64)).max(0.0) as usize;
 
-        // Source pixels per device pixel along each image axis.
-        let along_x = source.width as f64 / ctm.a.hypot(ctm.b).max(1e-9);
-        let along_y = source.height as f64 / ctm.c.hypot(ctm.d).max(1e-9);
-        let factor_x = (along_x.floor() as usize).clamp(1, source.width);
-        let factor_y = (along_y.floor() as usize).clamp(1, source.height);
-        let reduced;
-        let source = if factor_x > 1 || factor_y > 1 {
-            reduced = source.reduced(factor_x, factor_y);
-            &reduced
-        } else {
-            source
+        // Each source is boxed down to about device resolution on its own,
+        // and `residual` is what is left of the reduction for the samples.
+        let mut residual = 1.0f64;
+        let mut reduce = |source: &Source| -> Option<Source<'static>> {
+            // Source pixels per device pixel along each image axis.
+            let along_x = source.width as f64 / ctm.a.hypot(ctm.b).max(1e-9);
+            let along_y = source.height as f64 / ctm.c.hypot(ctm.d).max(1e-9);
+            let factor_x = (along_x.floor() as usize).clamp(1, source.width);
+            let factor_y = (along_y.floor() as usize).clamp(1, source.height);
+            residual = residual
+                .max(along_x / factor_x as f64)
+                .max(along_y / factor_y as f64);
+            (factor_x > 1 || factor_y > 1).then(|| source.reduced(factor_x, factor_y))
         };
-        let residual = (along_x / factor_x as f64).max(along_y / factor_y as f64);
+        let reduced = reduce(source);
+        let source = reduced.as_ref().unwrap_or(source);
+        let reduced_mask = mask.and_then(&mut reduce);
+        let mask = reduced_mask.as_ref().or(mask);
         let samples = (residual.ceil() as usize).clamp(2, 4);
         let step = 1.0 / samples as f64;
-        let (w, h) = (source.width as f64, source.height as f64);
+        // Image space runs top-down, the unit square bottom-up.
+        let sample = |source: &Source, u: f64, v: f64| -> [f32; 4] {
+            let (w, h) = (source.width as f64, source.height as f64);
+            if interpolate {
+                source.bilinear(u * w, (1.0 - v) * h)
+            } else {
+                source.texel(
+                    ((u * w) as usize).min(source.width - 1),
+                    (((1.0 - v) * h) as usize).min(source.height - 1),
+                )
+            }
+        };
 
         for py in y0..y1 {
             for px in x0..x1 {
@@ -169,15 +192,11 @@ impl Renderer<'_> {
                         if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                             continue;
                         }
-                        // Image space runs top-down, the unit square bottom-up.
-                        let texel = if interpolate {
-                            source.bilinear(u * w, (1.0 - v) * h)
-                        } else {
-                            source.texel(
-                                ((u * w) as usize).min(source.width - 1),
-                                (((1.0 - v) * h) as usize).min(source.height - 1),
-                            )
-                        };
+                        let mut texel = sample(source, u, v);
+                        if let Some(mask) = mask {
+                            let coverage = sample(mask, u, v)[3];
+                            texel = texel.map(|c| c * coverage);
+                        }
                         for c in 0..4 {
                             sum[c] += texel[c];
                         }
@@ -226,6 +245,8 @@ struct Source<'a> {
 
 enum Pixels<'a> {
     Decoded(&'a DecodedImage),
+    /// A mask kept at its own resolution: only the alpha channel counts.
+    Coverage(&'a AlphaPlane),
     /// Boxed down for a heavily reduced, turned image.
     Reduced(Vec<[f32; 4]>),
 }
@@ -239,10 +260,19 @@ impl<'a> Source<'a> {
         }
     }
 
+    fn coverage(plane: &'a AlphaPlane) -> Source<'a> {
+        Source {
+            width: plane.width,
+            height: plane.height,
+            pixels: Pixels::Coverage(plane),
+        }
+    }
+
     fn texel(&self, x: usize, y: usize) -> [f32; 4] {
         let index = y * self.width + x;
         match &self.pixels {
             Pixels::Reduced(data) => data[index],
+            Pixels::Coverage(plane) => [0.0, 0.0, 0.0, f32::from(plane.data[index]) / 255.0],
             Pixels::Decoded(image) => {
                 let alpha = image
                     .alpha
@@ -305,6 +335,72 @@ impl<'a> Source<'a> {
             height,
             pixels: Pixels::Reduced(data),
         }
+    }
+}
+
+/// One source resampled onto device pixels: for each device row, the image
+/// rows it covers are blended into one row ([`AxisResampler::blend_row`]),
+/// which each device column then reads ([`AxisResampler::sample`]).
+struct AxisResampler<'s> {
+    source: &'s Source<'s>,
+    straight: bool,
+    columns: Taps,
+    rows: Taps,
+    /// The stretch of the column axis any device column reads.
+    low: usize,
+    blended: Vec<[f32; 4]>,
+}
+
+impl<'s> AxisResampler<'s> {
+    fn new(
+        source: &'s Source<'s>,
+        plan: &AxisPlan,
+        width: usize,
+        height: usize,
+        interpolate: bool,
+    ) -> Option<AxisResampler<'s>> {
+        let columns = plan.columns.taps(plan.device_x(width), interpolate)?;
+        let rows = plan.rows.taps(plan.device_y(height), interpolate)?;
+        let (low, high) = columns.source_span();
+        if low >= high {
+            return None;
+        }
+        Some(AxisResampler {
+            source,
+            straight: plan.straight,
+            columns,
+            rows,
+            low,
+            blended: vec![[0.0; 4]; high - low],
+        })
+    }
+
+    fn blend_row(&mut self, y: usize) {
+        self.blended.fill([0.0; 4]);
+        for &(along_rows, weight) in self.rows.at(y) {
+            for (offset, slot) in self.blended.iter_mut().enumerate() {
+                let along_columns = self.low + offset;
+                let texel = if self.straight {
+                    self.source.texel(along_columns, along_rows)
+                } else {
+                    self.source.texel(along_rows, along_columns)
+                };
+                for c in 0..4 {
+                    slot[c] += weight * texel[c];
+                }
+            }
+        }
+    }
+
+    fn sample(&self, x: usize) -> [f32; 4] {
+        let mut sum = [0f32; 4];
+        for &(along_columns, weight) in self.columns.at(x) {
+            let texel = self.blended[along_columns - self.low];
+            for c in 0..4 {
+                sum[c] += weight * texel[c];
+            }
+        }
+        sum
     }
 }
 
@@ -464,6 +560,13 @@ impl Taps {
             .map(|(i, span)| (self.first + i, &self.entries[span.clone()]))
     }
 
+    /// What device pixel `p` reads; nothing outside the range or the image.
+    fn at(&self, p: usize) -> &[(usize, f32)] {
+        p.checked_sub(self.first)
+            .and_then(|i| self.spans.get(i))
+            .map_or(&[], |span| &self.entries[span.clone()])
+    }
+
     /// The lowest and one past the highest source index any pixel reads.
     fn source_span(&self) -> (usize, usize) {
         let low = self.entries.iter().map(|e| e.0).min().unwrap_or(0);
@@ -514,6 +617,159 @@ mod tests {
         );
         doc.set_object(id, PdfObject::Dictionary(page));
         render_page(&doc, 0, RenderOptions::default()).unwrap()
+    }
+
+    /// A page drawing a `width` x `height` grey image whose `/{mask_key}`
+    /// is a second image described by `mask_dict`.
+    #[allow(clippy::too_many_arguments)]
+    fn page_with_masked_image(
+        samples: &[u8],
+        width: usize,
+        height: usize,
+        mask_key: &str,
+        mask_dict: &str,
+        mask_samples: &[u8],
+        placement: &str,
+        media: [i64; 4],
+    ) -> RenderedPage {
+        let mut doc = doc_with_content(&format!("q {placement} cm /Im Do Q"), media);
+        let parse = |source: String| {
+            pdf_core::parser::Parser::new(source.as_bytes())
+                .parse_object()
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .clone()
+        };
+        let mask = doc.add_object(PdfObject::Stream(PdfStream::new(
+            parse(format!("<< /Type /XObject /Subtype /Image {mask_dict} >>")),
+            mask_samples.to_vec(),
+        )));
+        let image = doc.add_object(PdfObject::Stream(PdfStream::new(
+            parse(format!(
+                "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 /{mask_key} {} {} R >>",
+                mask.number, mask.generation
+            )),
+            samples.to_vec(),
+        )));
+        let id = doc.collect_page_ids().unwrap()[0];
+        let mut page = doc.resolve(id).unwrap().as_dict().unwrap().clone();
+        page.insert(
+            "Resources".into(),
+            PdfObject::Dictionary(Dictionary::from([(
+                "XObject".into(),
+                PdfObject::Dictionary(Dictionary::from([(
+                    "Im".into(),
+                    PdfObject::Reference(image),
+                )])),
+            )])),
+        );
+        doc.set_object(id, PdfObject::Dictionary(page));
+        render_page(&doc, 0, RenderOptions::default()).unwrap()
+    }
+
+    /// The layout of a scanned book from the Internet Archive: a dark layer
+    /// shown only through a text mask. Painting the whole layer, as ignoring
+    /// /Mask did, greyed out the page.
+    #[test]
+    fn an_explicit_mask_shows_the_image_only_where_it_paints() {
+        // 8x1 mask, one bit per pixel: 0 (painted) on the left half.
+        let page = page_with_masked_image(
+            &[0; 8],
+            8,
+            1,
+            "Mask",
+            "/Width 8 /Height 1 /ImageMask true",
+            &[0b0000_1111],
+            "8 0 0 2 0 0",
+            [0, 0, 8, 2],
+        );
+        assert_eq!(pixel(&page, 1, 1), (0, 0, 0));
+        assert_eq!(pixel(&page, 6, 1), (255, 255, 255));
+    }
+
+    #[test]
+    fn a_finer_mask_keeps_its_own_resolution() {
+        // A single black pixel of colour under a 16-pixel mask: the mask
+        // decides each of the 16 device pixels, not the image's one.
+        let page = page_with_masked_image(
+            &[0],
+            1,
+            1,
+            "Mask",
+            "/Width 16 /Height 1 /ImageMask true",
+            &[0b0101_0101, 0b0101_0101],
+            "16 0 0 2 0 0",
+            [0, 0, 16, 2],
+        );
+        for x in 0..16 {
+            let expected = if x % 2 == 0 {
+                (0, 0, 0)
+            } else {
+                (255, 255, 255)
+            };
+            assert_eq!(pixel(&page, x, 1), expected, "column {x}");
+        }
+    }
+
+    #[test]
+    fn a_colour_key_makes_matching_samples_transparent() {
+        // Samples 0 and 10 fall in the key range [0 20]; 200 does not.
+        let page = page_with_image(
+            &[0, 10, 200],
+            3,
+            1,
+            "3 0 0 1 0 0",
+            "/Mask [0 20]",
+            [0, 0, 3, 1],
+        );
+        assert_eq!(pixel(&page, 0, 0), (255, 255, 255));
+        assert_eq!(pixel(&page, 1, 0), (255, 255, 255));
+        assert_eq!(pixel(&page, 2, 0), (200, 200, 200));
+    }
+
+    #[test]
+    fn a_soft_mask_of_another_size_keeps_its_own_resolution() {
+        // Squeezed onto the one-pixel image, as soft masks used to be, the
+        // mask's first sample would have made the whole image opaque.
+        let page = page_with_masked_image(
+            &[0],
+            1,
+            1,
+            "SMask",
+            "/Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[255, 0],
+            "2 0 0 2 0 0",
+            [0, 0, 2, 2],
+        );
+        assert_eq!(pixel(&page, 0, 1), (0, 0, 0));
+        assert_eq!(pixel(&page, 1, 1), (255, 255, 255));
+    }
+
+    #[test]
+    fn a_turned_image_honours_its_mask() {
+        // The same half-painted mask, turned 30 degrees: one half dark, the
+        // other the white page.
+        let (cos, sin) = (
+            30f64.to_radians().cos() * 20.0,
+            30f64.to_radians().sin() * 20.0,
+        );
+        let page = page_with_masked_image(
+            &[0; 64],
+            8,
+            8,
+            "Mask",
+            "/Width 2 /Height 1 /ImageMask true",
+            &[0b0100_0000],
+            &format!("{cos} {sin} {} {cos} 20 5", -sin),
+            [0, 0, 40, 40],
+        );
+        let dark = page.pixels.chunks_exact(4).filter(|p| p[0] < 40).count();
+        let white = page.pixels.chunks_exact(4).filter(|p| p[0] > 215).count();
+        // The image covers 400 pixels, half of them shown.
+        assert!((150..=250).contains(&dark), "{dark} dark pixels");
+        assert!(white > 1600 - 250, "{white} white pixels");
     }
 
     /// One-pixel black and white stripes, 40 wide: shrunk to 10 device

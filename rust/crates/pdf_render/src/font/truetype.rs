@@ -29,6 +29,9 @@ pub struct TrueTypeFont {
     /// Glyph name → glyph id from the `post` table, built on first use. Large
     /// CJK faces carry tens of thousands of names nobody asks for.
     post_names: std::sync::OnceLock<HashMap<String, u16>>,
+    /// The `vert` substitutions from `GSUB` — a glyph's form for vertical
+    /// writing — built on first use.
+    vertical_forms: std::sync::OnceLock<HashMap<u16, u16>>,
     /// CFF outlines, for an `OTTO` face that has no `glyf`.
     cff: Option<Box<CffFont>>,
 }
@@ -130,7 +133,7 @@ impl TrueTypeFont {
             let mut compact = Vec::new();
             let mut kept = HashMap::new();
             for tag in [
-                b"head", b"maxp", b"hhea", b"hmtx", b"cmap", b"post", b"name", b"OS/2",
+                b"head", b"maxp", b"hhea", b"hmtx", b"cmap", b"post", b"name", b"OS/2", b"GSUB",
             ] {
                 if let Some(&(offset, length)) = tables.get(tag) {
                     if let Some(bytes) = data.get(offset..offset + length) {
@@ -158,12 +161,30 @@ impl TrueTypeFont {
             cmap: HashMap::new(),
             symbolic_cmap: false,
             post_names: std::sync::OnceLock::new(),
+            vertical_forms: std::sync::OnceLock::new(),
             cff,
             tables,
             data,
         };
         font.load_cmap();
         Some(font)
+    }
+
+    /// The glyph to draw for `glyph_id` in vertical writing, when the face has
+    /// a different one: punctuation that moves to the top right of its cell
+    /// (、。), brackets turned on their side (（ → ︵), the long vowel mark
+    /// drawn down instead of across (ー). From the `GSUB` `vert` feature.
+    pub fn vertical_glyph(&self, glyph_id: u16) -> Option<u16> {
+        self.vertical_forms
+            .get_or_init(|| {
+                self.tables
+                    .get(b"GSUB")
+                    .and_then(|&(offset, length)| self.data.get(offset..offset + length))
+                    .map(vert_substitutions)
+                    .unwrap_or_default()
+            })
+            .get(&glyph_id)
+            .copied()
     }
 
     pub fn num_glyphs(&self) -> u16 {
@@ -852,6 +873,119 @@ fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     ]))
 }
 
+/// Every single substitution of the `vert` features in a `GSUB` table, as
+/// glyph → vertical glyph. Features are taken from the FeatureList whatever
+/// script names them; CJK faces list `vert` under kana, han and hangul alike.
+/// Malformed offsets end the walk early rather than failing the face.
+fn vert_substitutions(gsub: &[u8]) -> HashMap<u16, u16> {
+    let mut map = HashMap::new();
+    let read = |offset: usize| read_u16(gsub, offset).map(usize::from);
+    let (Some(features), Some(lookups)) = (read(6), read(8)) else {
+        return map;
+    };
+    let Some(lookup_count) = read(lookups) else {
+        return map;
+    };
+    let mut wanted = Vec::new();
+    for i in 0..read(features).unwrap_or(0).min(4096) {
+        let record = features + 2 + i * 6;
+        if gsub.get(record..record + 4) != Some(b"vert") {
+            continue;
+        }
+        let Some(feature) = read(record + 4).map(|o| features + o) else {
+            continue;
+        };
+        for j in 0..read(feature + 2).unwrap_or(0).min(4096) {
+            if let Some(index) = read(feature + 4 + j * 2).filter(|&ix| ix < lookup_count) {
+                wanted.push(index);
+            }
+        }
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    for index in wanted {
+        let Some(lookup) = read(lookups + 2 + index * 2).map(|o| lookups + o) else {
+            continue;
+        };
+        let lookup_type = read(lookup).unwrap_or(0);
+        for k in 0..read(lookup + 4).unwrap_or(0).min(4096) {
+            let Some(mut subtable) = read(lookup + 6 + k * 2).map(|o| lookup + o) else {
+                continue;
+            };
+            let mut kind = lookup_type;
+            if kind == 7 {
+                // Extension: the real subtable sits at a 32-bit offset.
+                kind = read(subtable + 2).unwrap_or(0);
+                match read_u32(gsub, subtable + 4) {
+                    Some(offset) => subtable += offset as usize,
+                    None => continue,
+                }
+            }
+            if kind == 1 {
+                single_substitutions(gsub, subtable, &mut map);
+            }
+        }
+    }
+    map
+}
+
+/// A single-substitution subtable (GSUB lookup type 1, formats 1 and 2).
+fn single_substitutions(gsub: &[u8], subtable: usize, map: &mut HashMap<u16, u16>) {
+    let read = |offset: usize| read_u16(gsub, offset);
+    let (Some(format), Some(coverage)) = (read(subtable), read(subtable + 2)) else {
+        return;
+    };
+    let covered = coverage_glyphs(gsub, subtable + usize::from(coverage));
+    match format {
+        1 => {
+            let Some(delta) = read(subtable + 4) else {
+                return;
+            };
+            for glyph in covered {
+                map.entry(glyph).or_insert(glyph.wrapping_add(delta));
+            }
+        }
+        2 => {
+            for (index, glyph) in covered.into_iter().enumerate() {
+                if let Some(substitute) = read(subtable + 6 + index * 2) {
+                    map.entry(glyph).or_insert(substitute);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The glyphs of an OpenType Coverage table, in coverage-index order.
+fn coverage_glyphs(data: &[u8], table: usize) -> Vec<u16> {
+    let read = |offset: usize| read_u16(data, offset);
+    let mut glyphs = Vec::new();
+    match read(table) {
+        Some(1) => {
+            for i in 0..read(table + 2).unwrap_or(0).min(16_384) {
+                match read(table + 4 + usize::from(i) * 2) {
+                    Some(glyph) => glyphs.push(glyph),
+                    None => break,
+                }
+            }
+        }
+        Some(2) => {
+            for i in 0..read(table + 2).unwrap_or(0).min(16_384) {
+                let record = table + 4 + usize::from(i) * 6;
+                let (Some(start), Some(end)) = (read(record), read(record + 2)) else {
+                    break;
+                };
+                if end < start || glyphs.len() + usize::from(end - start) > 65_536 {
+                    break;
+                }
+                glyphs.extend(start..=end);
+            }
+        }
+        _ => {}
+    }
+    glyphs
+}
+
 fn read_i16(data: &[u8], offset: usize) -> Option<i16> {
     read_u16(data, offset).map(|v| v as i16)
 }
@@ -1137,6 +1271,61 @@ const MAC_GLYPH_NAMES: [&str; 258] = [
 mod tests {
     use super::*;
 
+    /// A GSUB table with a `liga` feature (lookup 0, to be ignored) and a
+    /// `vert` feature using a format 2 substitution (lookup 1) and a format 1
+    /// substitution wrapped in an extension lookup (lookup 2).
+    fn sample_gsub() -> Vec<u8> {
+        let mut t: Vec<u8> = Vec::new();
+        let u16s = |t: &mut Vec<u8>, values: &[u16]| {
+            for v in values {
+                t.extend_from_slice(&v.to_be_bytes());
+            }
+        };
+        u16s(&mut t, &[1, 0, 10, 12, 40]); // header: 1.0, script, feature, lookup lists
+        u16s(&mut t, &[0]); // 10: empty ScriptList
+        u16s(&mut t, &[2]); // 12: FeatureList with two records
+        t.extend_from_slice(b"liga");
+        u16s(&mut t, &[14]); // -> 26
+        t.extend_from_slice(b"vert");
+        u16s(&mut t, &[20]); // -> 32
+        u16s(&mut t, &[0, 1, 0]); // 26: liga uses lookup 0
+        u16s(&mut t, &[0, 2, 1, 2]); // 32: vert uses lookups 1 and 2
+        u16s(&mut t, &[3, 8, 28, 54]); // 40: LookupList -> 48, 68, 94
+        u16s(&mut t, &[1, 0, 1, 8]); // 48: lookup 0, single substitution
+        u16s(&mut t, &[1, 6, 1]); // 56: format 1, coverage at +6, delta 1
+        u16s(&mut t, &[1, 1, 5]); // 62: coverage [5]
+        u16s(&mut t, &[1, 0, 1, 8]); // 68: lookup 1, single substitution
+        u16s(&mut t, &[2, 10, 2, 11, 21]); // 76: format 2, coverage at +10, [11, 21]
+        u16s(&mut t, &[1, 2, 10, 20]); // 86: coverage [10, 20]
+        u16s(&mut t, &[7, 0, 1, 8]); // 94: lookup 2, extension
+        u16s(&mut t, &[1, 1]); // 102: extension of a single substitution...
+        t.extend_from_slice(&8u32.to_be_bytes()); // ...at +8
+        u16s(&mut t, &[1, 6, 100]); // 110: format 1, coverage at +6, delta 100
+        u16s(&mut t, &[2, 1, 30, 32, 0]); // 116: coverage range 30..=32
+        t
+    }
+
+    #[test]
+    fn vertical_forms_come_from_the_vert_feature_only() {
+        let map = vert_substitutions(&sample_gsub());
+        assert_eq!(map.get(&10), Some(&11));
+        assert_eq!(map.get(&20), Some(&21));
+        for glyph in 30..=32 {
+            assert_eq!(map.get(&glyph), Some(&(glyph + 100)), "glyph {glyph}");
+        }
+        // The ligature feature's substitution is not a vertical form.
+        assert_eq!(map.get(&5), None);
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn a_truncated_gsub_table_yields_what_it_can_and_no_panic() {
+        let table = sample_gsub();
+        for length in 0..table.len() {
+            let _ = vert_substitutions(&table[..length]);
+        }
+    }
+
     #[test]
     fn mac_glyph_names_are_the_standard_258_in_order() {
         // Spot checks across the table; one shifted entry would misname every
@@ -1167,8 +1356,23 @@ mod tests {
             cmap: HashMap::new(),
             symbolic_cmap: false,
             post_names: std::sync::OnceLock::new(),
+            vertical_forms: std::sync::OnceLock::new(),
             cff: None,
         }
+    }
+
+    #[test]
+    fn a_face_reports_its_vertical_forms() {
+        let mut font = sfnt_with_post(&[0; 32], 200);
+        let gsub = sample_gsub();
+        let offset = font.data.len();
+        font.data.extend_from_slice(&gsub);
+        font.tables.insert(*b"GSUB", (offset, gsub.len()));
+        assert_eq!(font.vertical_glyph(20), Some(21));
+        assert_eq!(font.vertical_glyph(31), Some(131));
+        assert_eq!(font.vertical_glyph(5), None);
+        // A face without GSUB has none.
+        assert_eq!(sfnt_with_post(&[0; 32], 200).vertical_glyph(20), None);
     }
 
     #[test]

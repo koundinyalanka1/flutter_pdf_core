@@ -61,6 +61,25 @@ fn axial_gradient_interpolates_and_respects_clip() {
     assert!(right.2 > 200 && right.0 < 50, "{right:?}");
 }
 
+/// The gradient macOS and Adobe's design tools write: an ICC-based colour
+/// space, given by reference. It used to be skipped, leaving a blank band.
+#[test]
+fn gradients_in_icc_based_colour_are_drawn() {
+    let mut doc = doc_with_content("10 10 80 40 re W n /S sh", [0, 0, 100, 60]);
+    let profile = doc.add_object(PdfObject::Stream(PdfStream::new(
+        object("<< /N 3 >>").as_dict().unwrap().clone(),
+        Vec::new(),
+    )));
+    let space = doc.add_object(object(&format!("[/ICCBased {} 0 R]", profile.number)));
+    resources(&mut doc, &format!("<< /Shading << /S << /ShadingType 2 /ColorSpace {} 0 R /Coords [0 0 100 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>", space.number));
+    let page = render(&doc);
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    let left = pixel(&page, 15, 30);
+    let right = pixel(&page, 85, 30);
+    assert!(left.0 > 200 && left.2 < 50, "{left:?}");
+    assert!(right.2 > 200 && right.0 < 50, "{right:?}");
+}
+
 #[test]
 fn radial_gradient_leaves_outside_circles_unpainted() {
     let mut doc = doc_with_content("/S sh", [0, 0, 100, 100]);

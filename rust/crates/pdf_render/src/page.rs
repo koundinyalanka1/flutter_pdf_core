@@ -912,7 +912,8 @@ impl Renderer<'_> {
 
         if fills && self.visible && !device.is_empty() && !state.fill_marks_nothing() {
             // A filled rectangle on its own — a table border, an underline, a
-            // cell background — lands on whole pixels, as PDFium draws it.
+            // cell background — lands on whole pixels, as PDFium and
+            // Acrobat draw it.
             // Anti-aliased at a fractional position, a one-pixel rule
             // smears into two grey rows; at phone resolution every border in
             // a form looked washed out next to the same page in Drive.
@@ -1359,10 +1360,11 @@ fn axis_aligned_rect(path: &Path) -> Option<(f64, f64, f64, f64)> {
     Some((left, top, right, bottom))
 }
 
-/// PDFium's rule for a filled rectangle: whole pixels, as many as the
-/// rectangle's size rounded up (never none), on the side it covers more of.
+/// A filled rectangle on whole pixels, as Acrobat draws it: its size rounded
+/// to the nearest whole number of pixels (never none), centred where it was.
 /// A sliver that would anti-alias to a faint grey line becomes one solid
-/// pixel row instead.
+/// pixel row instead. (PDFium rounds the size up, which drew a 1.45-pixel
+/// rule two pixels thick; Acrobat's one pixel is truer to the document.)
 fn snap_rect_fill(path: &Path) -> Option<Path> {
     let (left, top, right, bottom) = axis_aligned_rect(path)?;
     // Far off-canvas or absurdly large rectangles gain nothing from snapping.
@@ -1370,18 +1372,9 @@ fn snap_rect_fill(path: &Path) -> Option<Path> {
         return None;
     }
     let snap = |low: f64, high: f64| {
-        let size = (high - low).ceil().max(1.0);
-        let mut start = low.floor();
-        let mut end = high.ceil().max(start + size);
-        if end - start >= size + 1.0 {
-            // One pixel too many: drop whichever end pixel is less covered.
-            if low - start > end - high {
-                start += 1.0;
-            } else {
-                end -= 1.0;
-            }
-        }
-        (start, end)
+        let size = (high - low).round().max(1.0);
+        let start = ((low + high) / 2.0 - size / 2.0).round();
+        (start, start + size)
     };
     let (x0, x1) = snap(left, right);
     let (y0, y1) = snap(top, bottom);

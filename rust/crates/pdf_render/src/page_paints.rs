@@ -252,14 +252,31 @@ impl Renderer<'_> {
                 space = resolved;
             }
         }
-        let components = match space.as_name() {
-            Some("DeviceGray" | "G") => 1,
-            Some("DeviceRGB" | "RGB") => 3,
-            Some("DeviceCMYK" | "CMYK") => 4,
-            _ => {
-                self.warn("shading skipped: colour space is not DeviceGray/RGB/CMYK");
-                return;
-            }
+        // ICC-based and calibrated spaces draw as their device equivalent, as
+        // they do everywhere else in this renderer. macOS and Adobe's design
+        // tools write gradients in ICC sRGB; those used to be skipped, leaving
+        // a blank band where the gradient belonged.
+        let components = match &space {
+            PdfObject::Name(name) => match name.as_str() {
+                "DeviceGray" | "G" | "CalGray" => Some(1),
+                "DeviceRGB" | "RGB" | "CalRGB" => Some(3),
+                "DeviceCMYK" | "CMYK" => Some(4),
+                _ => None,
+            },
+            PdfObject::Array(items) => match items.first().and_then(PdfObject::as_name) {
+                Some("ICCBased") => match components_of_space(self.doc, &space) {
+                    n @ (1 | 3 | 4) => Some(n),
+                    _ => None,
+                },
+                Some("CalGray") => Some(1),
+                Some("CalRGB") => Some(3),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(components) = components else {
+            self.warn("shading skipped: its colour space is not supported");
+            return;
         };
         let mut local = state.clone();
         if let Some(bbox) = array_rect(self.doc, dict, "BBox") {

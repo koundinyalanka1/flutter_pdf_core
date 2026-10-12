@@ -191,6 +191,7 @@ fn decode_jpx_inner(
         rgb,
         alpha,
         is_stencil,
+        mask: None,
     })
 }
 

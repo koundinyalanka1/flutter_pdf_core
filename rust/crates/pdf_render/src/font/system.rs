@@ -251,9 +251,10 @@ pub fn load_face(path: &Path, index: usize) -> Option<TrueTypeFont> {
     };
     let tag = be32(&read_at(&mut file, base, 4)?, 0);
     let tables = directory(&mut file, base)?;
+    // GSUB carries the vertical forms of punctuation for vertical CJK text.
     let wanted: &[&[u8; 4]] = &[
         b"head", b"maxp", b"hhea", b"hmtx", b"cmap", b"post", b"name", b"OS/2", b"loca", b"glyf",
-        b"CFF ",
+        b"CFF ", b"GSUB",
     ];
     let mut chosen = Vec::new();
     for tag in wanted {

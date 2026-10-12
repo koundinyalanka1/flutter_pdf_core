@@ -1,5 +1,31 @@
 ## Unreleased
 
+* Gradients whose colour space is `ICCBased`, `CalRGB` or `CalGray` are
+  drawn; they were skipped, so a gradient in a page written by macOS
+  (Quartz) was missing.
+* A substitute for a font the document did not embed matches its weight, not
+  just bold or regular: the weight comes from style words in the name
+  (`Light`, `Medium`, `Heavy`, ...) or a Japanese `W0`–`W9` grade, and the
+  nearest weight of the chosen family wins, so a `GothicBBB-Medium` heading
+  is not set in the family's hairline `W0` face. More Japanese family names
+  (`GothicBBB`, `FutoGo`, `FutoMin`, `Midashi`, `Jun101`, `KozGo`, `KozMin`)
+  pick a gothic or mincho substitute. Found, with the rectangle rounding
+  below, by comparing pages with Adobe Acrobat; most pages of the test corpus
+  now differ from Acrobat's render by 0.2–3 grey levels on average.
+* Vertical CJK text in fonts the document did not embed uses the vertical
+  forms the substitute face carries (its `GSUB` `vert` feature), as other
+  viewers do: 、 and 。 sit at the top right of their cells, brackets turn on
+  their side, ー runs down the page. CJK punctuation now comes from the
+  device's CJK face rather than a bundled Yi or Mongolian face, which also
+  carries 、 and 。 but in its own design and without vertical forms. Found by
+  comparing renders with Apple's PDF engine and MuPDF.
+* Images honour `/Mask`. Explicit masks (an image mask that says where the
+  image shows) were ignored, so a scanned book built as a coloured layer seen
+  through a sharp text mask, as every Internet Archive scan is, painted the
+  whole layer: a grey page streaked with the colour smeared between the
+  letters. Colour-key masks (`/Mask [min max ...]`) make matching samples
+  transparent. A mask or `/SMask` of another size than its image is sampled at
+  its own resolution, so a fine text mask over coarse colour stays sharp.
 * Sharper rendering, measured against PDFium (what Chrome and Drive use) at
   phone resolution on Latin, Indic, CJK and scanned pages:
   * Images are area-sampled. Each device pixel averages the part of the image
@@ -9,8 +35,9 @@
     as in PDFium. Upright, flipped and quarter-turned images use an exact
     separable filter; others are supersampled, with smooth edges.
   * A filled rectangle on its own (a table border, an underline, a cell
-    background) lands on whole pixels, at least one wide, by PDFium's rule,
-    and rectangular clips widen to whole pixels. Strokes are never thinner
+    background) lands on whole pixels, at least one wide, its size rounded
+    as Adobe Acrobat rounds it (PDFium rounds up, which drew a 1.45-pixel
+    border two pixels thick), and rectangular clips widen to whole pixels. Strokes are never thinner
     than one device pixel, and thin horizontal and vertical strokes snap to
     the pixel grid (automatic stroke adjustment). A 0.25 pt rule on a phone
     is now a solid line instead of a faint grey one.

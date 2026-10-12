@@ -211,7 +211,7 @@ impl RenderFont {
                 .and_then(CjkRegion::from_collection)
                 .or_else(|| CjkRegion::from_font_name(base_font));
             FallbackFont::for_style(FallbackStyle::detect(base_font, flags))
-                .map(|fallback| fallback.with_region(region))
+                .map(|fallback| fallback.with_region(region).with_vertical(text.vertical))
         } else {
             None
         };

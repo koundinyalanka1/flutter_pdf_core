@@ -1,5 +1,5 @@
-//! Rules, borders and clips land on whole pixels the way PDFium draws them,
-//! so a page reads as crisply here as the same page does in Drive.
+//! Rules, borders and clips land on whole pixels the way PDFium and Acrobat
+//! draw them, so a page reads as crisply here as it does in Drive.
 use super::tests::{doc_with_content, pixel};
 use super::*;
 
@@ -24,6 +24,16 @@ fn a_thin_filled_rule_is_one_solid_row() {
     assert_eq!(pixel(&page, 50, 19), (0, 0, 0));
     assert_eq!(pixel(&page, 50, 18), (255, 255, 255));
     assert_eq!(pixel(&page, 50, 20), (255, 255, 255));
+}
+
+#[test]
+fn a_rule_is_as_many_pixels_as_its_width_rounds_to() {
+    // 1.45 pixels tall (device rows 19.3 to 20.75): one solid row, as
+    // Acrobat draws it, not two.
+    let page = render("0 g 10 19.25 80 1.45 re f");
+    assert_eq!(pixel(&page, 50, 20), (0, 0, 0));
+    assert_eq!(pixel(&page, 50, 19), (255, 255, 255));
+    assert_eq!(pixel(&page, 50, 21), (255, 255, 255));
 }
 
 #[test]

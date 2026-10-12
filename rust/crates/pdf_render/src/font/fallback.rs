@@ -71,6 +71,8 @@ pub struct FallbackStyle {
     pub fixed_pitch: bool,
     /// Times, Mincho, Song: a design with serifs.
     pub serif: bool,
+    /// CSS-style weight the name asks for, 100 (thin) to 900 (black).
+    pub weight: u16,
 }
 
 impl FallbackStyle {
@@ -79,12 +81,12 @@ impl FallbackStyle {
     /// words are the only part worth trusting.
     pub fn detect(base_font: &str, flags: i64) -> FallbackStyle {
         let name = base_font.to_ascii_lowercase();
-        let bold = name.contains("bold")
-            || name.contains("black")
-            || name.contains("heavy")
-            || name.contains("semibold")
-            // Bit 19 (1 << 18) is ForceBold.
-            || flags & (1 << 18) != 0;
+        let mut weight = weight_from_name(&name);
+        // Bit 19 (1 << 18) is ForceBold.
+        if flags & (1 << 18) != 0 {
+            weight = weight.max(700);
+        }
+        let bold = weight >= 600;
         let italic = name.contains("italic")
             || name.contains("oblique")
             // Bit 7 (1 << 6) is Italic.
@@ -100,8 +102,44 @@ impl FallbackStyle {
             italic,
             fixed_pitch,
             serif,
+            weight,
         }
     }
+}
+
+/// The weight a font name asks for: its style word (`-Light`, `-Medium`,
+/// `-Bold`...), or a Japanese-style `W3`/`W6` grade. Regular when it says
+/// nothing.
+fn weight_from_name(name: &str) -> u16 {
+    // Japanese faces grade weight W0..W9 (HiraginoSans-W6, DFHSMincho-W3).
+    let bytes = name.as_bytes();
+    for i in 1..bytes.len().saturating_sub(1) {
+        let grade = bytes[i + 1];
+        let ends = bytes.get(i + 2).is_none_or(|b| !b.is_ascii_digit());
+        if bytes[i] == b'w'
+            && matches!(bytes[i - 1], b'-' | b'_' | b' ')
+            && grade.is_ascii_digit()
+            && ends
+        {
+            return (u16::from(grade - b'0') * 100).clamp(100, 900);
+        }
+    }
+    // Longest words first: "semibold" is not "bold", "extralight" not "light".
+    let words: [(&[&str], u16); 9] = [
+        (&["extrablack", "ultrablack"], 950),
+        (&["black", "heavy"], 900),
+        (&["extrabold", "ultrabold"], 800),
+        (&["semibold", "demibold", "demi"], 600),
+        (&["bold"], 700),
+        (&["medium"], 500),
+        (&["extralight", "ultralight"], 200),
+        (&["hairline", "thin"], 100),
+        (&["light"], 300),
+    ];
+    words
+        .iter()
+        .find(|(names, _)| names.iter().any(|w| name.contains(w)))
+        .map_or(400, |&(_, weight)| weight.min(900))
 }
 
 /// The CJK region whose glyph forms a document expects.
@@ -142,6 +180,14 @@ impl CjkRegion {
             "yugothic",
             "heisei",
             "ryumin",
+            // Adobe-Japan1's standard faces and Adobe's own Japanese fonts.
+            "gothicbbb",
+            "futogo",
+            "futomin",
+            "midashi",
+            "jun101",
+            "kozgo",
+            "kozmin",
         ]) {
             Some(CjkRegion::Japanese)
         } else if any(&["mingliu", "pmingliu", "msung", "mhei", "dfkai", "kaiu"]) {
@@ -230,6 +276,9 @@ impl CjkRegion {
 pub struct FallbackFont {
     style: FallbackStyle,
     region: Option<CjkRegion>,
+    /// Vertical writing: draw the face's vertical form of each glyph that
+    /// has one, as other viewers do.
+    vertical: bool,
 }
 
 impl FallbackFont {
@@ -240,12 +289,20 @@ impl FallbackFont {
         Some(FallbackFont {
             style,
             region: None,
+            vertical: false,
         })
     }
 
     /// Prefer this region's faces for Han characters.
     pub fn with_region(mut self, region: Option<CjkRegion>) -> FallbackFont {
         self.region = region;
+        self
+    }
+
+    /// Text runs down the page. Without vertical forms, its 、 and 。 sat in
+    /// the wrong corner of their cells and its brackets pointed sideways.
+    pub fn with_vertical(mut self, vertical: bool) -> FallbackFont {
+        self.vertical = vertical;
         self
     }
 
@@ -257,6 +314,11 @@ impl FallbackFont {
     /// for and the face that drew it is upright. `None` when no face has it.
     pub fn outline_for_char(&self, ch: char) -> Option<Path> {
         let (face, gid) = catalog().resolve(ch, self.style, self.region)?;
+        let gid = if self.vertical {
+            face.font.vertical_glyph(gid).unwrap_or(gid)
+        } else {
+            gid
+        };
         let outline = face.font.glyph_outline(gid)?;
         let scale = UNITS / face.font.units_per_em;
         let mut matrix = Matrix::scale(scale, scale);
@@ -303,7 +365,8 @@ enum Source {
 struct Candidate {
     source: Source,
     serif: bool,
-    bold: bool,
+    /// `usWeightClass`: 100 thin to 900 black.
+    weight: u16,
     italic: bool,
     monospace: bool,
     /// Family and PostScript names, lowercased, for region matching.
@@ -433,7 +496,7 @@ fn catalog() -> &'static Catalog {
             Candidate {
                 source: Source::Roboto { bold },
                 serif: false,
-                bold,
+                weight: if bold { 700 } else { 400 },
                 italic: false,
                 monospace: false,
                 names: "roboto".into(),
@@ -447,7 +510,7 @@ fn catalog() -> &'static Catalog {
             .map(|(index, entry)| Candidate {
                 source: Source::Bundled { index },
                 serif: entry.serif,
-                bold: false,
+                weight: 400,
                 italic: false,
                 monospace: false,
                 names: entry.name.to_ascii_lowercase(),
@@ -468,7 +531,7 @@ fn catalog() -> &'static Catalog {
 fn system_candidate(info: FaceInfo) -> Candidate {
     Candidate {
         serif: info.serif,
-        bold: info.weight >= 600,
+        weight: info.weight,
         italic: info.italic,
         monospace: info.monospace,
         names: format!(" {} {}", info.family, info.postscript).to_ascii_lowercase(),
@@ -588,6 +651,15 @@ impl Catalog {
                 return Some((Pick::Roboto(style.bold), face, gid));
             }
         }
+        // CJK characters, punctuation included, come from the device's CJK
+        // face ahead of the bundle: the bundled Yi and Mongolian faces also
+        // carry 、 and 。, but in their own design and without the vertical
+        // forms Japanese and Chinese text needs.
+        if cjk_need(ch).is_some() {
+            if let Some(found) = self.best_system(ch, style, region) {
+                return Some(found);
+            }
+        }
         // 2. Bundled scripts, symbols and mathematics.
         for (index, candidate) in self.bundled.iter().enumerate() {
             if candidate.covers(code) {
@@ -641,6 +713,8 @@ fn cjk_need(ch: char) -> Option<Option<CjkRegion>> {
         | 0x3400..=0x4DBF
         | 0x4E00..=0x9FFF
         | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE1F
+        | 0xFE30..=0xFE4F
         | 0xFF00..=0xFF65
         | 0x20000..=0x3FFFF => Some(None),
         _ => None,
@@ -661,9 +735,11 @@ fn score(c: &Candidate, style: FallbackStyle, region: Option<CjkRegion>) -> i64 
     if c.monospace == style.fixed_pitch {
         score += 10;
     }
-    if c.bold == style.bold {
-        score += 8;
-    }
+    // Nearest weight wins: up to 12 for an exact match, 3 less per 100 off.
+    // A bold/regular split alone let a family's lightest file (Hiragino Sans
+    // W0) stand in for a medium Gothic and draw headings as faint hairlines.
+    let off = i64::from(c.weight.abs_diff(style.weight)) / 100;
+    score += (12 - 3 * off).max(0);
     if c.italic == style.italic {
         score += 4;
     }
@@ -828,7 +904,48 @@ mod tests {
             italic,
             fixed_pitch,
             serif: false,
+            weight: if bold { 700 } else { 400 },
         }
+    }
+
+    #[test]
+    fn weights_come_from_style_words_and_japanese_grades() {
+        for (name, weight) in [
+            ("Helvetica", 400),
+            ("Helvetica-Bold", 700),
+            ("AAAAAA+Roboto-SemiBold", 600),
+            ("Ryumin-Light", 300),
+            ("GothicBBB-Medium", 500),
+            ("HiraginoSans-W6", 600),
+            ("GMALPM+DFHSMincho-W3G014", 300),
+            ("NotoSans-ExtraLight", 200),
+            ("Arial-Black", 900),
+        ] {
+            assert_eq!(FallbackStyle::detect(name, 0).weight, weight, "{name}");
+        }
+        // ForceBold lifts a regular name to bold.
+        assert_eq!(FallbackStyle::detect("Foo", 1 << 18).weight, 700);
+        assert!(FallbackStyle::detect("GothicBBB-Medium", 0).weight < 600);
+    }
+
+    #[test]
+    fn the_nearest_weight_of_a_family_is_preferred() {
+        let face = |weight: u16| Candidate {
+            source: Source::Roboto { bold: false },
+            serif: false,
+            weight,
+            italic: false,
+            monospace: false,
+            names: " hiragino sans".into(),
+            coverage: Vec::new(),
+            loaded: OnceLock::new(),
+        };
+        let medium = FallbackStyle::detect("GothicBBB-Medium", 0);
+        let region = Some(CjkRegion::Japanese);
+        // W0 (100) must lose to W5 (500) and W6 (600) for a medium Gothic.
+        assert!(score(&face(500), medium, region) > score(&face(100), medium, region));
+        assert!(score(&face(600), medium, region) > score(&face(100), medium, region));
+        assert!(score(&face(500), medium, region) > score(&face(800), medium, region));
     }
 
     fn sans() -> FallbackFont {
@@ -956,6 +1073,10 @@ mod tests {
             Some(CjkRegion::TraditionalChinese)
         );
         assert_eq!(CjkRegion::from_font_name("Batang"), Some(CjkRegion::Korean));
+        assert_eq!(
+            CjkRegion::from_font_name("GothicBBB-Medium-Identity-H"),
+            Some(CjkRegion::Japanese)
+        );
         assert_eq!(CjkRegion::from_font_name("Helvetica"), None);
     }
 
@@ -992,7 +1113,7 @@ mod tests {
         let candidate = |names: &str| Candidate {
             source: Source::Roboto { bold: false },
             serif: false,
-            bold: false,
+            weight: 400,
             italic: false,
             monospace: false,
             names: names.into(),
@@ -1014,5 +1135,10 @@ mod tests {
         assert_eq!(cjk_need('あ'), Some(Some(CjkRegion::Japanese)));
         assert_eq!(cjk_need('한'), Some(Some(CjkRegion::Korean)));
         assert_eq!(cjk_need('A'), None);
+        // CJK punctuation and its vertical presentation forms count as CJK,
+        // so they come from the same face as the text around them.
+        for ch in ['、', '。', '（', '︑', '︵'] {
+            assert_eq!(cjk_need(ch), Some(None), "{ch}");
+        }
     }
 }

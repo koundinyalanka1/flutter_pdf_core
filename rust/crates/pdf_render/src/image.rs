@@ -41,6 +41,18 @@ pub struct DecodedImage {
     /// True when this is a `/ImageMask` stencil: `alpha` selects where the
     /// current fill colour is painted and `rgb` is unused.
     pub is_stencil: bool,
+    /// Coverage from a `/Mask` or `/SMask` image of another size, kept at its
+    /// own resolution. A scanned book's text mask is often three times as
+    /// fine as the colour it reveals; squeezed onto the colour's grid, every
+    /// letter would blur. Applies on top of `alpha`.
+    pub mask: Option<AlphaPlane>,
+}
+
+/// Per-pixel coverage, 0-255, row-major from the top left.
+pub struct AlphaPlane {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u8>,
 }
 
 impl DecodedImage {
@@ -49,11 +61,16 @@ impl DecodedImage {
             return None;
         }
         let index = y * self.width + x;
-        let alpha = if self.alpha.is_empty() {
+        let mut alpha = if self.alpha.is_empty() {
             1.0
         } else {
             self.alpha[index] as f32 / 255.0
         };
+        if let Some(mask) = &self.mask {
+            let mx = (x * mask.width / self.width).min(mask.width - 1);
+            let my = (y * mask.height / self.height).min(mask.height - 1);
+            alpha *= f32::from(mask.data[my * mask.width + mx]) / 255.0;
+        }
         if self.is_stencil {
             return Some((Rgb::BLACK, alpha));
         }
@@ -181,11 +198,21 @@ fn decode_image_inner(
             _ => None,
         });
 
+    // `/Mask` as an array is colour-key masking, applied while decoding
+    // because it compares raw samples; as a stream it is applied below.
+    let color_key: Option<Vec<u32>> = match dict.get("Mask").map(|o| doc.resolve_value(o)) {
+        Some(PdfObject::Array(items)) if !is_stencil && !items.is_empty() => items
+            .iter()
+            .map(|v| u32::try_from(doc.resolve_value(v).as_i64()?).ok())
+            .collect(),
+        _ => None,
+    };
+
     let filters = filter_names(doc, dict);
     let data = defilter(doc, stream, &filters, width, height)?;
 
     let mut image = if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
-        decode_jpeg(&data, width, height)?
+        decode_jpeg(&data, width, height, color_key.as_deref())?
     } else if filters.iter().any(|f| f == "JPXDecode") {
         codecs::decode_jpx(doc, dict, &data, is_stencil, decode_array.as_deref())?
     } else if let Some(index) = filters.iter().position(|f| f == "JBIG2Decode") {
@@ -212,6 +239,7 @@ fn decode_image_inner(
             &ColorSpace::Gray,
             decode_array.as_deref(),
             is_stencil,
+            color_key.as_deref(),
         )?
     } else {
         let space = if is_stencil {
@@ -227,13 +255,14 @@ fn decode_image_inner(
             &space,
             decode_array.as_deref(),
             is_stencil,
+            color_key.as_deref(),
         )?
     };
 
     if is_stencil {
         image.is_stencil = true;
     } else {
-        apply_soft_mask(doc, dict, &mut image, &ancestors);
+        apply_masks(doc, dict, &mut image, &ancestors);
     }
     Some(image)
 }
@@ -391,7 +420,12 @@ fn parms_from_dict(doc: &PdfDocument, dict: &Dictionary) -> DecodeParms {
     }
 }
 
-fn decode_jpeg(data: &[u8], width: usize, height: usize) -> Option<DecodedImage> {
+fn decode_jpeg(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    color_key: Option<&[u32]>,
+) -> Option<DecodedImage> {
     let mut decoder = jpeg_decoder::Decoder::new(data);
     decoder.set_max_decoding_buffer_size(MAX_IMAGE_PIXELS * 4);
     decoder.read_info().ok()?;
@@ -434,15 +468,49 @@ fn decode_jpeg(data: &[u8], width: usize, height: usize) -> Option<DecodedImage>
 
     // Trust the JPEG's own dimensions over the dictionary's if they disagree.
     let _ = (width, height);
+    // Colour-key masking compares the samples as stored, which for a baseline
+    // JPEG are its 8-bit components.
+    let alpha = match (color_key, info.pixel_format) {
+        (Some(ranges), jpeg_decoder::PixelFormat::L8) => {
+            let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
+            key_alpha(&gray, 1, ranges)
+        }
+        (Some(ranges), jpeg_decoder::PixelFormat::RGB24) => key_alpha(&rgb, 3, ranges),
+        _ => Vec::new(),
+    };
     Some(DecodedImage {
         width: w,
         height: h,
         rgb,
-        alpha: Vec::new(),
+        alpha,
         is_stencil: false,
+        mask: None,
     })
 }
 
+/// Alpha for colour-key masking: transparent where every component of a
+/// pixel (`components` bytes) lies in its `[min, max]` range.
+fn key_alpha(samples: &[u8], components: usize, ranges: &[u32]) -> Vec<u8> {
+    if ranges.len() < components * 2 {
+        return Vec::new();
+    }
+    samples
+        .chunks_exact(components)
+        .map(|pixel| {
+            let keyed = pixel
+                .iter()
+                .enumerate()
+                .all(|(c, &v)| (ranges[c * 2]..=ranges[c * 2 + 1]).contains(&u32::from(v)));
+            if keyed {
+                0
+            } else {
+                255
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_raw(
     data: &[u8],
     width: usize,
@@ -451,6 +519,7 @@ fn decode_raw(
     space: &ColorSpace,
     decode_array: Option<&[f64]>,
     is_stencil: bool,
+    color_key: Option<&[u32]>,
 ) -> Option<DecodedImage> {
     let pixel_count = image_pixel_count(width, height)?;
     let components = space.components();
@@ -471,12 +540,15 @@ fn decode_raw(
         }
     }
 
+    // Colour-key masking (`/Mask` as `[min max ...]`): a pixel whose raw
+    // samples all fall in their ranges is transparent (ISO 32000-1, 8.9.6.4).
+    let key = color_key.filter(|ranges| !is_stencil && ranges.len() >= components * 2);
     let mut rgb = if is_stencil {
         Vec::new()
     } else {
         Vec::with_capacity(pixel_count.checked_mul(3)?)
     };
-    let mut alpha = if is_stencil {
+    let mut alpha = if is_stencil || key.is_some() {
         Vec::with_capacity(pixel_count)
     } else {
         Vec::new()
@@ -487,11 +559,15 @@ fn decode_raw(
         let row_start = y * row_bytes;
         for x in 0..width {
             let mut raw_first = 0u32;
+            let mut keyed = key.is_some();
             for c in 0..components {
                 let bit = (x * components + c) * bpc;
                 let raw = read_bits(data, row_start * 8 + bit, bpc).unwrap_or(0);
                 if c == 0 {
                     raw_first = raw;
+                }
+                if let Some(ranges) = key {
+                    keyed &= (ranges[c * 2]..=ranges[c * 2 + 1]).contains(&raw);
                 }
                 let mut value = raw as f64 / max_value;
                 // /Decode remaps each component's range.
@@ -518,6 +594,9 @@ fn decode_raw(
                 rgb.push((color.r.clamp(0.0, 1.0) * 255.0) as u8);
                 rgb.push((color.g.clamp(0.0, 1.0) * 255.0) as u8);
                 rgb.push((color.b.clamp(0.0, 1.0) * 255.0) as u8);
+                if key.is_some() {
+                    alpha.push(if keyed { 0 } else { 255 });
+                }
             }
         }
     }
@@ -528,40 +607,74 @@ fn decode_raw(
         rgb,
         alpha,
         is_stencil,
+        mask: None,
     })
 }
 
 /// Blend an `/SMask` grayscale image into the alpha channel.
-fn apply_soft_mask(
+/// Apply the image's mask: an `/SMask` (grey coverage), or else a `/Mask`
+/// image — an image mask whose painted samples show the image (explicit
+/// masking, ISO 32000-1 8.9.6.3). A colour-key `/Mask` array was applied
+/// while decoding.
+///
+/// Explicit masks were ignored, so scanned books built as a coloured layer
+/// shown through a sharp text mask — every Internet Archive scan — painted
+/// the whole layer: a grey page streaked with the smeared colour that layer
+/// carries between the letters.
+fn apply_masks(
     doc: &PdfDocument,
     dict: &Dictionary,
     image: &mut DecodedImage,
     ancestors: &[&PdfStream],
 ) {
-    let Some(entry) = dict.get("SMask") else {
-        return;
+    let decode_mask = |entry: &PdfObject| -> Option<DecodedImage> {
+        let PdfObject::Stream(mask_stream) = resolve_object(doc, entry)? else {
+            return None;
+        };
+        decode_image_inner(doc, mask_stream, ancestors)
     };
-    let Some(PdfObject::Stream(mask_stream)) = resolve_object(doc, entry) else {
-        return;
-    };
-    let Some(mask) = decode_image_inner(doc, mask_stream, ancestors) else {
-        return;
-    };
-    if mask.rgb.is_empty() {
-        return;
-    }
-
-    let mut alpha = Vec::with_capacity(image.width * image.height);
-    for y in 0..image.height {
-        // Soft masks may be a different resolution than the image.
-        let my = ((y as u64 * mask.height as u64) / image.height as u64) as usize;
-        for x in 0..image.width {
-            let mx = ((x as u64 * mask.width as u64) / image.width as u64) as usize;
-            let offset = (my.min(mask.height - 1) * mask.width + mx.min(mask.width - 1)) * 3;
-            alpha.push(mask.rgb.get(offset).copied().unwrap_or(255));
+    // A soft mask overrides /Mask (ISO 32000-1, Table 89).
+    if let Some(entry) = dict.get("SMask") {
+        if let Some(mask) = decode_mask(entry).filter(|m| !m.rgb.is_empty()) {
+            let coverage = mask.rgb.iter().step_by(3).copied().collect();
+            attach_mask(image, mask.width, mask.height, coverage);
         }
+        return;
     }
-    image.alpha = alpha;
+    if let Some(mask) = dict.get("Mask").and_then(decode_mask) {
+        let coverage = if mask.is_stencil {
+            // Already 255 where the mask paints, which is where the image shows.
+            mask.alpha
+        } else {
+            // Not marked /ImageMask, as the spec requires: read it as one.
+            mask.rgb.iter().step_by(3).map(|&gray| 255 - gray).collect()
+        };
+        attach_mask(image, mask.width, mask.height, coverage);
+    }
+}
+
+/// Combine `coverage` (`width` x `height`) with the image's own alpha. One the
+/// image's size merges into it; any other size stays at its own resolution
+/// and is sampled alongside the image when drawn.
+fn attach_mask(image: &mut DecodedImage, width: usize, height: usize, coverage: Vec<u8>) {
+    if width == 0 || height == 0 || coverage.len() != width * height {
+        return;
+    }
+    if width == image.width && height == image.height {
+        if image.alpha.len() == coverage.len() {
+            for (a, m) in image.alpha.iter_mut().zip(&coverage) {
+                *a = ((u16::from(*a) * u16::from(*m) + 127) / 255) as u8;
+            }
+        } else {
+            image.alpha = coverage;
+        }
+    } else {
+        image.mask = Some(AlphaPlane {
+            width,
+            height,
+            data: coverage,
+        });
+    }
 }
 
 fn color_space(doc: &PdfDocument, dict: &Dictionary) -> Option<ColorSpace> {
@@ -818,8 +931,18 @@ mod tests {
                 .insert("BitsPerComponent".into(), PdfObject::Integer(bpc));
             assert!(decode_image(&doc, &stream).is_none());
         }
-        assert!(decode_raw(&[0], usize::MAX, 2, 8, &ColorSpace::Gray, None, false).is_none());
-        assert!(decode_raw(&[0], 1, 1, 8, &ColorSpace::Tint(usize::MAX), None, false).is_none());
+        assert!(decode_raw(&[0], usize::MAX, 2, 8, &ColorSpace::Gray, None, false, None).is_none());
+        assert!(decode_raw(
+            &[0],
+            1,
+            1,
+            8,
+            &ColorSpace::Tint(usize::MAX),
+            None,
+            false,
+            None
+        )
+        .is_none());
         let space = ColorSpace::Indexed(Box::new(ColorSpace::Tint(usize::MAX)), Vec::new());
         let rgb = space.to_rgb(&[0.0], u32::MAX);
         assert_eq!((rgb.r, rgb.g, rgb.b), (0.0, 0.0, 0.0));
@@ -840,7 +963,7 @@ mod tests {
     fn gray_ramp_decodes_to_gray_pixels() {
         let space = ColorSpace::Gray;
         let data = vec![0x00, 0x80, 0xFF];
-        let image = decode_raw(&data, 3, 1, 8, &space, None, false).unwrap();
+        let image = decode_raw(&data, 3, 1, 8, &space, None, false, None).unwrap();
         assert_eq!(&image.rgb[0..3], &[0, 0, 0]);
         assert_eq!(&image.rgb[6..9], &[255, 255, 255]);
     }
@@ -850,14 +973,15 @@ mod tests {
         // Two-entry RGB palette: red then green.
         let space = ColorSpace::Indexed(Box::new(ColorSpace::Rgb), vec![255, 0, 0, 0, 255, 0]);
         // 1 bit per pixel: 0, 1 -> red, green (packed into one byte).
-        let image = decode_raw(&[0b0100_0000], 2, 1, 1, &space, None, false).unwrap();
+        let image = decode_raw(&[0b0100_0000], 2, 1, 1, &space, None, false, None).unwrap();
         assert_eq!(&image.rgb[0..3], &[255, 0, 0]);
         assert_eq!(&image.rgb[3..6], &[0, 255, 0]);
     }
 
     #[test]
     fn stencil_mask_paints_where_the_bit_is_zero() {
-        let image = decode_raw(&[0b0100_0000], 2, 1, 1, &ColorSpace::Gray, None, true).unwrap();
+        let image =
+            decode_raw(&[0b0100_0000], 2, 1, 1, &ColorSpace::Gray, None, true, None).unwrap();
         assert!(image.is_stencil);
         assert_eq!(image.alpha, vec![255, 0]);
     }
@@ -872,6 +996,7 @@ mod tests {
             &ColorSpace::Gray,
             Some(&[1.0, 0.0]),
             true,
+            None,
         )
         .unwrap();
         assert_eq!(image.alpha, vec![0, 255]);
@@ -880,7 +1005,17 @@ mod tests {
     #[test]
     fn cmyk_samples_convert_to_rgb() {
         // Pure cyan: C=1 M=0 Y=0 K=0.
-        let image = decode_raw(&[255, 0, 0, 0], 1, 1, 8, &ColorSpace::Cmyk, None, false).unwrap();
+        let image = decode_raw(
+            &[255, 0, 0, 0],
+            1,
+            1,
+            8,
+            &ColorSpace::Cmyk,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(&image.rgb[0..3], &[0, 255, 255]);
     }
 
