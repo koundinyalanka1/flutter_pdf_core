@@ -272,6 +272,7 @@ dependencies = [
  "anyhow",
  "pdf_ai",
  "pdf_core",
+ "pdf_edit",
  "pdf_ocr",
  "pdf_ops",
  "pdf_render",
@@ -295,12 +296,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf_edit"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "pdf_core",
+ "pdf_ops",
+ "pdf_text",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pdf_ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "pdf_ai",
  "pdf_core",
+ "pdf_edit",
  "pdf_ocr",
  "pdf_ops",
  "pdf_render",

@@ -244,6 +244,15 @@ class PdfBindings {
       _library.lookupFunction<_RenderRegionRgbaC, _RenderRegionRgbaDart>(
           'pdf_render_page_region_rgba'));
 
+  /// Optional: forms, annotations and stamps arrived with phase 8.
+  late final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)?
+      formFieldsJson = _optional(
+          () => _library.lookupFunction<_Str2C, _Str2C>('pdf_form_fields_json'));
+  late final _ExtractTextDart? annotationsJson = _optional(() => _library
+      .lookupFunction<_ExtractTextC, _ExtractTextDart>('pdf_annotations_json'));
+  late final _Op4Dart? applyEdits = _optional(
+      () => _library.lookupFunction<_Op4C, _Op4Dart>('pdf_apply_edits'));
+
   static T? _optional<T>(T Function() lookup) {
     try {
       return lookup();

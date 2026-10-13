@@ -9,6 +9,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [dependencies]
 pdf_core = { path = "../pdf_core" }
 pdf_ops = { path = "../pdf_ops" }
+pdf_edit = { path = "../pdf_edit" }
 pdf_text = { path = "../pdf_text" }
 pdf_render = { path = "../pdf_render" }
 pdf_ai = { path = "../pdf_ai" }

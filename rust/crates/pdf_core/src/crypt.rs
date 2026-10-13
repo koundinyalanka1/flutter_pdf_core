@@ -351,6 +351,56 @@ impl Decryptor {
     pub fn revision(&self) -> i64 {
         self.revision
     }
+
+    fn encrypt_bytes(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>> {
+        let key = self.object_key(id);
+        match self.cipher {
+            Cipher::Identity => Ok(data.to_vec()),
+            Cipher::Rc4 => Ok(rc4(&key, data)),
+            Cipher::Aes128 | Cipher::Aes256 => {
+                let iv: [u8; 16] = random_bytes()?;
+                aes_cbc_encrypt_padded(&key, &iv, data)
+            }
+        }
+    }
+
+    /// Encrypt an object with the file's own key, as `decrypt_object` would
+    /// read it back: for objects added to an encrypted file by an
+    /// incremental update, which keeps the file's password.
+    pub fn encrypt_object(&self, id: ObjectId, object: &mut PdfObject) -> Result<()> {
+        match object {
+            PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => {
+                *bytes = self.encrypt_bytes(id, bytes)?;
+            }
+            PdfObject::Array(items) => {
+                for item in items {
+                    self.encrypt_object(id, item)?;
+                }
+            }
+            PdfObject::Dictionary(dict) => {
+                for value in dict.values_mut() {
+                    self.encrypt_object(id, value)?;
+                }
+            }
+            PdfObject::Stream(stream) => {
+                let type_name = stream
+                    .dictionary
+                    .get("Type")
+                    .and_then(PdfObject::as_name)
+                    .map(str::to_owned);
+                let skip_data = type_name.as_deref() == Some("XRef")
+                    || (type_name.as_deref() == Some("Metadata") && !self.encrypt_metadata);
+                for value in stream.dictionary.values_mut() {
+                    self.encrypt_object(id, value)?;
+                }
+                if !skip_data {
+                    stream.data = self.encrypt_bytes(id, &stream.data)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn crypt_filter_method(encrypt: &Dictionary) -> Option<&str> {

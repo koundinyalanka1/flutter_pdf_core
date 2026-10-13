@@ -1422,6 +1422,97 @@ pub unsafe extern "C" fn pdf_apply_ocr_json(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8: forms, annotations, stamps
+// ---------------------------------------------------------------------------
+
+/// The document's form as JSON: `{fields:[{name,kind,value,values,options,
+/// states,readOnly,required,multiline,password,comb,combo,editable,
+/// multiSelect,maxLength,tooltip,widgets:[{page,rect,onState,fontSize}]}],
+/// xfa,signed}`. `kind` is text, checkbox, radio, choice, signature or
+/// button; rectangles are `[left, top, right, bottom]` in displayed page
+/// points and pages are 1-based. A document without a form gives no
+/// fields. Free with `pdf_free_string`; NULL means `pdf_last_error`.
+///
+/// # Safety
+/// See `pdf_page_count`.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_form_fields_json(
+    path: *const c_char,
+    password: *const c_char,
+) -> *mut c_char {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let doc = open_for_reading(path, password)?;
+        serde_json::to_string(&pdf_edit::fields(&doc))
+            .map_err(|e| PdfError::Structure(e.to_string()))
+    })
+}
+
+/// One page's annotations (1-based) as JSON: `[{id,subtype,rect,contents,
+/// author,color,ours}]`, `ours` marking those this app added. `id` is what
+/// `pdf_apply_edits` takes to remove one. Free with `pdf_free_string`.
+///
+/// # Safety
+/// See `pdf_page_count`.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_annotations_json(
+    path: *const c_char,
+    password: *const c_char,
+    page: c_int,
+) -> *mut c_char {
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let doc = open_for_reading(path, password)?;
+        let list = pdf_edit::annotations(&doc, page.saturating_sub(1))?;
+        serde_json::to_string(&list).map_err(|e| PdfError::Structure(e.to_string()))
+    })
+}
+
+/// Fill fields, add or remove annotations and draw marks onto pages, then
+/// write the result to `out_path` (which may be `path`) atomically.
+///
+/// The original bytes are kept and the changes appended as an incremental
+/// update, so signatures stay valid; an encrypted file keeps its password.
+/// `edits_json` is `{fields:[{name,value|checked|selected}],
+/// annotations:[{page,type,...}], delete:[{page,id}], marks:[...]}` (see
+/// `pdf_edit::model`). Returns 0, or -1 with `pdf_last_error`. What the
+/// caller should know (characters a standard font lacks, fields left as
+/// they were) is in `pdf_last_warnings`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_apply_edits(
+    path: *const c_char,
+    password: *const c_char,
+    edits_json: *const c_char,
+    out_path: *const c_char,
+) -> c_int {
+    let (Ok(path), Ok(password), Ok(json), Ok(out)) =
+        (cstr(path), cstr(password), cstr(edits_json), cstr(out_path))
+    else {
+        return -1;
+    };
+    set_warnings(&[]);
+    run_int(|| {
+        let edits: pdf_edit::Edits = serde_json::from_str(json)
+            .map_err(|e| PdfError::Structure(format!("edits: {e}")))?;
+        let bytes = std::fs::read(path)?;
+        let (result, warnings) = pdf_edit::apply(bytes, password, &edits)?;
+        pdf_core::writer::PdfWriter::write_bytes_atomic(&result, out)?;
+        set_warnings(&warnings);
+        Ok(0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2184,5 +2275,43 @@ mod tests {
         out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
         out.extend_from_slice(&[0xFF, 0xD9]);
         out
+    }
+
+    fn take(ptr: *mut c_char) -> String {
+        assert!(!ptr.is_null(), "{}", unsafe { CStr::from_ptr(pdf_last_error()) }.to_string_lossy());
+        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        unsafe { pdf_free_string(ptr) };
+        text
+    }
+
+    #[test]
+    fn edits_are_applied_listed_and_removed() {
+        let dir = scratch_dir("edits");
+        let path = dir.join("doc.pdf");
+        let original = include_bytes!("../../../fixtures/simple.pdf");
+        std::fs::write(&path, original).unwrap();
+        let (p, pw) = (c(path.to_str().unwrap()), c(""));
+        let edits = c(r##"{"annotations":[{"page":1,"type":"note","at":[20,20],"text":"Hi","color":"#FFC107"}],
+            "fields":[{"name":"missing","value":"x"}]}"##);
+        assert_eq!(unsafe { pdf_apply_edits(p.as_ptr(), pw.as_ptr(), edits.as_ptr(), p.as_ptr()) }, 0);
+        let warnings = unsafe { CStr::from_ptr(pdf_last_warnings()) }.to_string_lossy().into_owned();
+        assert!(warnings.contains("missing"), "{warnings}");
+        let saved = std::fs::read(&path).unwrap();
+        assert!(saved.starts_with(original));
+        let list: serde_json::Value = serde_json::from_str(&take(unsafe { pdf_annotations_json(p.as_ptr(), pw.as_ptr(), 1) })).unwrap();
+        assert_eq!(list[0]["subtype"], "Text");
+        assert_eq!(list[0]["contents"], "Hi");
+        assert_eq!(list[0]["ours"], true);
+        let form: serde_json::Value = serde_json::from_str(&take(unsafe { pdf_form_fields_json(p.as_ptr(), pw.as_ptr()) })).unwrap();
+        assert_eq!(form["fields"].as_array().unwrap().len(), 0);
+        let delete = c(&format!(r#"{{"delete":[{{"page":1,"id":"{}"}}]}}"#, list[0]["id"].as_str().unwrap()));
+        assert_eq!(unsafe { pdf_apply_edits(p.as_ptr(), pw.as_ptr(), delete.as_ptr(), p.as_ptr()) }, 0);
+        let list: serde_json::Value = serde_json::from_str(&take(unsafe { pdf_annotations_json(p.as_ptr(), pw.as_ptr(), 1) })).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+        let bad = c(r#"{"annotations":[{"page":9,"type":"note","at":[0,0],"text":""}]}"#);
+        assert_eq!(unsafe { pdf_apply_edits(p.as_ptr(), pw.as_ptr(), bad.as_ptr(), p.as_ptr()) }, -1);
+        let error = unsafe { CStr::from_ptr(pdf_last_error()) }.to_string_lossy().into_owned();
+        assert!(error.starts_with("PAGE_OUT_OF_RANGE"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

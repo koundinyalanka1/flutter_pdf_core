@@ -1,5 +1,26 @@
 ## Unreleased
 
+* Fill forms, annotate, sign and stamp pages (`pdf_edit`;
+  `pdf_form_fields_json`, `pdf_annotations_json`, `pdf_apply_edits`; Dart
+  `PdfCore.formFields`, `annotations`, `applyEdits`).
+  * Forms: text (single and multi-line, comb, password, maximum length),
+    check boxes, radio groups (by state or by `/Opt` value), drop-downs and
+    lists, with appearances drawn for the new values in the form's own font
+    when it is a standard one, Helvetica otherwise. Read-only fields are left
+    alone; XFA is removed from a filled form. Checked against the IRS W-9,
+    W-4 and 1040 and pdf.js's form tests, in poppler and pypdf.
+  * Annotations: highlight, underline, strike-out, squiggly, ink, rectangle,
+    ellipse, line, arrow, text box, typed text, sticky note, picture and drawn
+    signature, each with an appearance stream; listing a page's annotations
+    and removing them. Any of them can be flattened into the page.
+  * Marks: text or a picture on many pages, such as "Page {page} of {pages}",
+    headers, footers and watermarks, upright on rotated pages.
+  * Saving appends an incremental update, so signatures stay valid; files
+    with cross-reference streams get one in the update; encrypted files keep
+    their password (`Decryptor::encrypt_object`); a recovered file is written
+    whole.
+  * `pdf_cli fields`, `annots` and `edit`.
+
 * Pages render about twice as fast on a phone, and zooming in again on a
   page already shown is many times faster, for every kind of document.
   Measured on a Motorola edge 70 fusion at its screen width: an AutoCAD

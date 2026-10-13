@@ -8,6 +8,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import 'bindings.dart';
+import 'pdf_edit.dart';
 
 /// Thrown when a native PDF operation fails.
 class PdfException implements Exception {
@@ -1055,6 +1056,62 @@ class PdfCore {
   static PdfException _ocrUnavailable() => PdfException(
         'OCR_UNAVAILABLE',
         'OCR is unavailable in this version of the PDF engine.',
+      );
+
+  // -- forms, annotations, stamps (phase 8) ---------------------------------
+
+  /// The document's form fields; an empty form when it has none.
+  static PdfForm formFields(String path, {String password = ''}) {
+    final read = _b.formFieldsJson;
+    if (read == null) throw _editUnavailable();
+    final json = _str2(read, path, password);
+    return PdfForm.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// The annotations on a page (1-based).
+  static List<PdfAnnotationInfo> annotations(String path, int page,
+      {String password = ''}) {
+    final read = _b.annotationsJson;
+    if (read == null) throw _editUnavailable();
+    final json = _withUtf8([path, password],
+        (args) => _takeString(read(args[0], args[1], page)));
+    return [
+      for (final a in jsonDecode(json) as List)
+        PdfAnnotationInfo.fromJson(a as Map<String, dynamic>),
+    ];
+  }
+
+  /// Fill fields, add or remove annotations and draw marks, writing the
+  /// result to [outPath] (which may be [path]). The original bytes are
+  /// kept and the changes appended, so signatures stay valid and an
+  /// encrypted file keeps its password. Returns what the caller should
+  /// tell the user: characters the standard fonts lack, fields that were
+  /// left as they were.
+  static List<String> applyEdits(String path, PdfEdits edits, String outPath,
+      {String password = ''}) {
+    final apply = _b.applyEdits;
+    if (apply == null) throw _editUnavailable();
+    final json = jsonEncode(edits.toJson());
+    final status = _withUtf8([path, password, json, outPath],
+        (args) => apply(args[0], args[1], args[2], args[3]));
+    if (status < 0) throw _lastError();
+    return _lastWarnings();
+  }
+
+  static Future<PdfForm> formFieldsAsync(String path, {String password = ''}) =>
+      Isolate.run(() => formFields(path, password: password));
+
+  static Future<List<PdfAnnotationInfo>> annotationsAsync(String path, int page,
+          {String password = ''}) =>
+      Isolate.run(() => annotations(path, page, password: password));
+
+  static Future<List<String>> applyEditsAsync(
+          String path, PdfEdits edits, String outPath, {String password = ''}) =>
+      Isolate.run(() => applyEdits(path, edits, outPath, password: password));
+
+  static PdfException _editUnavailable() => PdfException(
+        'UNSUPPORTED',
+        'Filling and annotating need a newer PDF engine.',
       );
 
   // -- pinned documents ------------------------------------------------------

@@ -14,6 +14,10 @@ A lightweight PDF toolkit for Flutter, **built from scratch in Rust** — no thi
   selection/search geometry as born-digital pages
 * CPU raster rendering to PNG or RGBA, with warnings for approximate/skipped content;
   whole pages or just a region of one (for sharp zoom without huge bitmaps)
+* Fill forms (text, check boxes, radio buttons, lists), annotate (highlight,
+  underline, strike-out, ink, shapes, text boxes, notes), sign with a drawn or
+  pictured signature, and draw page numbers, headers and watermarks onto pages,
+  saved as an incremental update that keeps signatures valid and passwords on
 * JPEG-to-PDF composition with page-size, fit and margin controls
 * AI-ready JSON/NDJSON export (paragraph-aware chunks with overlap) for feeding local models
 * AES-256 password protection; opens RC4/AES-128/AES-256 encrypted files
@@ -158,6 +162,44 @@ fonts and public-domain text.
 * Not yet handled: text inside photographs, white-on-black text, and tables,
   which read column by column.
 
+## Filling, annotating and stamping
+
+`applyEdits` takes everything one save changes: field values, annotations to
+add or remove, and marks drawn onto pages. Positions are displayed page points
+with a top-left origin, as `pageTextLayout` gives them, so a selection becomes
+a highlight as it is, also on pages with `/Rotate`.
+
+```dart
+final form = await PdfCore.formFieldsAsync('/form.pdf');
+final warnings = await PdfCore.applyEditsAsync(
+  '/form.pdf',
+  PdfEdits(
+    fields: [PdfFieldValue.text('name', 'Ada'), PdfFieldValue.checked('agree', true)],
+    annotations: [
+      PdfAnnotationEdit.markup(PdfAnnotationType.highlight,
+          page: 1, rects: [PdfBox(72, 100, 300, 114)]),
+      PdfAnnotationEdit.note(page: 1, at: (500, 40), text: 'Check this'),
+    ],
+    marks: [PdfPageMark.pageNumbers(format: 'Page {page} of {pages}')],
+  ),
+  '/form.pdf',
+);
+```
+
+* The original bytes are kept and the changes appended as an incremental
+  update (with a cross-reference stream when the file uses them), so existing
+  digital signatures still verify and nothing the engine does not understand is
+  lost. A file whose index had to be rebuilt is written out whole instead.
+* An encrypted file stays encrypted: what the update adds is encrypted with the
+  file's own key (RC4, AES-128 or AES-256).
+* Every annotation, and every filled field, gets an appearance stream, so any
+  reader shows it as the app drew it. Filling a form that also has an XFA
+  description removes the XFA, so readers show the values written here.
+* Text is set in the standard PDF fonts (WinAnsi); characters outside them are
+  written as "?" and reported in the warnings.
+* `flatten` draws an annotation into the page instead, where it can no longer
+  be moved or removed.
+
 ## Building the native core
 
 ```bash
@@ -179,6 +221,8 @@ cargo run -p pdf_cli -- encrypt some.pdf user-pw owner-pw locked.pdf
 cargo run --release -p pdf_cli -- ocr scan.pdf                  # recognized text
 cargo run --release -p pdf_cli -- searchable scan.pdf out.pdf   # invisible text layer
 cargo run --release -p pdf_cli -- ocr-eval text.pdf             # accuracy vs. real text
+cargo run --release -p pdf_cli -- fields form.pdf                # form fields as JSON
+cargo run --release -p pdf_cli -- edit form.pdf edits.json out.pdf
 ```
 
 ## Project layout
@@ -191,6 +235,7 @@ cargo run --release -p pdf_cli -- ocr-eval text.pdf             # accuracy vs. r
 | `rust/crates/pdf_render` | CPU rasterizer, fonts, images, paints, annotations |
 | `rust/crates/pdf_ai` | chunking + JSON/NDJSON export for local AI models |
 | `rust/crates/pdf_ocr` | OCR: page analysis, recognizer inference, invisible text layers |
+| `rust/crates/pdf_edit` | forms, annotations, signatures and page marks; incremental saves |
 | `rust/crates/pdf_ffi` | the FFI layer (Rust, `extern "C"` exports) consumed by `dart:ffi` |
 | `rust/crates/pdf_cli` | developer CLI |
 | `tools/ocr_train` | offline training of the OCR model (Python, not shipped) |

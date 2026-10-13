@@ -31,7 +31,10 @@ const USAGE: &str = "usage: pdf_cli <command> ...
   searchable <in> <out> [password]             add invisible OCR text to scanned pages
   ocr-eval   <in> [dpi] [password]             OCR rendered pages of a text PDF and
                                                score them against its real text
-  ocr-image  <in.pgm>                          recognize a binary (P5) greyscale image";
+  ocr-image  <in.pgm>                          recognize a binary (P5) greyscale image
+  fields    <in> [password]                    form fields as JSON
+  annots    <in> <page-1-based> [password]     a page's annotations as JSON
+  edit      <in> <edits.json> <out> [password] fill, annotate, stamp (incremental save)";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +43,27 @@ fn main() -> Result<()> {
     let rest: Vec<&str> = it.collect();
 
     match command {
+        "fields" => {
+            let doc = open(&rest, 0, 1)?;
+            println!("{}", serde_json::to_string_pretty(&pdf_edit::fields(&doc))?);
+        }
+        "annots" => {
+            let doc = open(&rest, 0, 2)?;
+            let page: usize = arg(&rest, 1)?.parse().context("bad page number")?;
+            let list = pdf_edit::annotations(&doc, page.saturating_sub(1))?;
+            println!("{}", serde_json::to_string_pretty(&list)?);
+        }
+        "edit" => {
+            let bytes = std::fs::read(arg(&rest, 0)?)?;
+            let edits: pdf_edit::Edits = serde_json::from_str(&std::fs::read_to_string(arg(&rest, 1)?)?)?;
+            let password = rest.get(3).copied().unwrap_or("");
+            let (out, warnings) = pdf_edit::apply(bytes, password, &edits)?;
+            std::fs::write(arg(&rest, 2)?, out)?;
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+            println!("wrote {}", arg(&rest, 2)?);
+        }
         "inspect" => {
             let doc = open(&rest, 0, 1)?;
             print_inspect(&doc);
