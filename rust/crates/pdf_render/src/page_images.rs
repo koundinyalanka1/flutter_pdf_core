@@ -17,12 +17,33 @@ const AXIS_TOLERANCE: f64 = 0.25;
 
 impl Renderer<'_> {
     /// Paint an image into the unit square mapped by the CTM.
-    pub(super) fn draw_image(&mut self, stream: &PdfStream, state: &GraphicsState) {
+    /// Draw an image XObject (`id` is the object, shared between the bands
+    /// of a render) or an inline image.
+    pub(super) fn draw_image(
+        &mut self,
+        stream: &PdfStream,
+        state: &GraphicsState,
+        id: Option<ObjectId>,
+    ) {
         if !self.visible {
             return;
         }
+        // An image wholly off the canvas, as most are from a zoomed-in
+        // region of a long page, is not even decoded.
+        let mut extent = Path::new();
+        extent.rect(0.0, 0.0, 1.0, 1.0);
+        if self.off_canvas(&extent.transform(&state.ctm), 0.0) {
+            return;
+        }
         self.configure_canvas(state);
-        let Some(image) = decode_image(self.doc, stream) else {
+        let doc = self.doc;
+        let image = match id {
+            Some(id) => self
+                .recent
+                .image(id, || self.shared.image(id, || decode_image(doc, stream))),
+            None => decode_image(doc, stream).map(Arc::new),
+        };
+        let Some(image) = image else {
             let codec = image_codec_name(self.doc, stream);
             self.warn(format!(
                 "image skipped: {codec} is unsupported or its data is damaged"
@@ -280,6 +301,10 @@ impl<'a> Source<'a> {
                     .map_or(1.0, |&a| f32::from(a) / 255.0);
                 if image.is_stencil {
                     return [0.0, 0.0, 0.0, alpha];
+                }
+                if image.gray {
+                    let value = f32::from(image.rgb[index]) / 255.0 * alpha;
+                    return [value, value, value, alpha];
                 }
                 let rgb = &image.rgb[index * 3..index * 3 + 3];
                 [

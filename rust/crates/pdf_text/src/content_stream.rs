@@ -1,12 +1,12 @@
 //! Milestone 8 (part 1): content stream operator parsing.
 
 use pdf_core::error::Result;
-use pdf_core::lexer::{is_delimiter, is_ws, Lexer, Token};
+use pdf_core::lexer::{is_delimiter, is_ws, Keyword, Lexer, Token, KNOWN_KEYWORDS};
 use pdf_core::object::{Dictionary, PdfObject};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Operation {
-    pub operator: String,
+    pub operator: Keyword,
     pub operands: Vec<PdfObject>,
 }
 
@@ -20,8 +20,23 @@ pub struct Operation {
 /// costs the reader that token, not the page. The function therefore always
 /// succeeds; it returns whatever it could make sense of.
 pub fn parse_content(data: &[u8]) -> Result<Vec<Operation>> {
-    let mut lexer = Lexer::new(data);
     let mut operations = Vec::new();
+    parse_into(data, |operator, operands| {
+        // Moved out at their exact size; the buffer is kept for the next
+        // operator's operands.
+        operations.push(Operation {
+            operator,
+            operands: operands.drain(..).collect(),
+        })
+    });
+    Ok(operations)
+}
+
+/// The parser behind [`parse_content`] and [`Content::parse`]: hands each
+/// operator to `emit` with its operands, which `emit` takes (leaving the
+/// buffer empty for the next).
+fn parse_into(data: &[u8], mut emit: impl FnMut(Keyword, &mut Vec<PdfObject>)) {
+    let mut lexer = Lexer::new(data);
     let mut operands: Vec<PdfObject> = Vec::new();
     // Stack of partially-built containers: arrays and dictionaries.
     enum Frame {
@@ -78,6 +93,13 @@ pub fn parse_content(data: &[u8]) -> Result<Vec<Operation>> {
                 continue;
             }
         };
+        // An unmatched `)`, `>`, `{` or `}` comes back as an empty keyword
+        // without the lexer moving; taken as an operator it repeated forever
+        // and filled memory until the app was killed.
+        if lexer.position() <= spanned.offset {
+            lexer.set_position(spanned.offset + 1);
+            continue;
+        }
 
         match spanned.token {
             Token::Null => push_value(&mut stack, &mut operands, PdfObject::Null),
@@ -129,22 +151,253 @@ pub fn parse_content(data: &[u8]) -> Result<Vec<Operation>> {
                 }
                 if word == "BI" {
                     let image = read_inline_image(&mut lexer, data);
-                    operations.push(Operation {
-                        operator: "BI".into(),
-                        operands: image.into_iter().map(PdfObject::Stream).collect(),
-                    });
+                    operands.clear();
+                    operands.extend(image.map(PdfObject::Stream));
+                    emit(word, &mut operands);
                     operands.clear();
                     continue;
                 }
-                operations.push(Operation {
-                    operator: word,
-                    operands: std::mem::take(&mut operands),
-                });
+                emit(word, &mut operands);
+                operands.clear();
             }
         }
     }
+}
 
-    Ok(operations)
+/// A content stream parsed for drawing: its operators and their operands in
+/// three flat arrays, without an allocation per operator. A drawing's stream
+/// is hundreds of thousands of operators; held as [`Operation`]s, a plan's
+/// 725,000 took 106 MB and half a second to parse and free on a phone. This
+/// way they take 16 MB — about 12 bytes an operator and 8 an operand — parse
+/// faster, free at once, and can be kept for the next render of the page.
+#[derive(Debug, Default, Clone)]
+pub struct Content {
+    ops: Vec<Op>,
+    /// Operands, each a number or the index of an entry in `objects`.
+    slots: Vec<u64>,
+    /// Operands other than numbers: names, strings, arrays, dictionaries
+    /// and inline images.
+    objects: Vec<PdfObject>,
+    /// Operators PDF does not define, which `ops` refer to by index.
+    unknown: Vec<Keyword>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Op {
+    /// A position in [`KNOWN_KEYWORDS`], or [`UNKNOWN`] plus one in
+    /// `unknown`.
+    operator: u32,
+    first: u32,
+    count: u32,
+}
+
+const UNKNOWN: u32 = 1 << 31;
+
+// Operand slots: a real number is its own `f64` bits. Integers and object
+// indices are boxed in NaN bit patterns, which no parsed number produces (a
+// NaN real goes to `objects` instead).
+const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+const INTEGER_TAG: u64 = 0xFFF9_0000_0000_0000;
+const OBJECT_TAG: u64 = 0xFFFA_0000_0000_0000;
+const PAYLOAD: u64 = !TAG_MASK;
+/// Integers within 48 bits are boxed; larger ones are kept as objects.
+const BOXED_INTEGERS: std::ops::Range<i64> = -(1 << 47)..(1 << 47);
+
+impl Content {
+    /// Parse a decoded content stream, recovering from damage exactly as
+    /// [`parse_content`] does.
+    pub fn parse(data: &[u8]) -> Self {
+        let mut content = Content::default();
+        parse_into(data, |operator, operands| content.push(operator, operands));
+        content.ops.shrink_to_fit();
+        content.slots.shrink_to_fit();
+        content.objects.shrink_to_fit();
+        content
+    }
+
+    fn push(&mut self, operator: Keyword, operands: &mut Vec<PdfObject>) {
+        let operator = match operator.known_index() {
+            Some(index) => u32::from(index),
+            None => {
+                self.unknown.push(operator);
+                UNKNOWN | (self.unknown.len() - 1) as u32
+            }
+        };
+        let first = self.slots.len() as u32;
+        for value in operands.drain(..) {
+            let slot = match value {
+                PdfObject::Integer(v) if BOXED_INTEGERS.contains(&v) => {
+                    INTEGER_TAG | (v as u64 & PAYLOAD)
+                }
+                PdfObject::Real(v) if !v.is_nan() => v.to_bits(),
+                other => {
+                    self.objects.push(other);
+                    OBJECT_TAG | (self.objects.len() - 1) as u64
+                }
+            };
+            self.slots.push(slot);
+        }
+        self.ops.push(Op {
+            operator,
+            first,
+            count: self.slots.len() as u32 - first,
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Operation `index`.
+    pub fn get(&self, index: usize) -> Option<ContentOp<'_>> {
+        let op = self.ops.get(index)?;
+        let operator = if op.operator & UNKNOWN == 0 {
+            KNOWN_KEYWORDS[op.operator as usize]
+        } else {
+            self.unknown[(op.operator & !UNKNOWN) as usize].as_str()
+        };
+        let first = op.first as usize;
+        Some(ContentOp {
+            operator,
+            operands: Operands {
+                slots: &self.slots[first..first + op.count as usize],
+                objects: &self.objects,
+            },
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ContentOp<'_>> {
+        (0..self.len()).filter_map(|index| self.get(index))
+    }
+
+    /// Roughly the memory this holds, for budgeting a cache of it.
+    pub fn byte_size(&self) -> usize {
+        self.ops.capacity() * std::mem::size_of::<Op>()
+            + self.slots.capacity() * 8
+            + self.objects.capacity() * std::mem::size_of::<PdfObject>()
+            + self.objects.iter().map(heap_size).sum::<usize>()
+    }
+}
+
+fn heap_size(object: &PdfObject) -> usize {
+    match object {
+        PdfObject::Name(name) => name.len(),
+        PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => bytes.len(),
+        PdfObject::Array(items) => {
+            items.len() * std::mem::size_of::<PdfObject>()
+                + items.iter().map(heap_size).sum::<usize>()
+        }
+        PdfObject::Dictionary(dict) => dict
+            .iter()
+            .map(|(key, value)| key.len() + std::mem::size_of::<PdfObject>() + heap_size(value))
+            .sum(),
+        PdfObject::Stream(stream) => stream.data.len() + 64 * stream.dictionary.len(),
+        _ => 0,
+    }
+}
+
+/// One operation of a [`Content`].
+#[derive(Debug, Clone, Copy)]
+pub struct ContentOp<'a> {
+    pub operator: &'a str,
+    pub operands: Operands<'a>,
+}
+
+/// The operands of a [`ContentOp`].
+#[derive(Debug, Clone, Copy)]
+pub struct Operands<'a> {
+    slots: &'a [u64],
+    objects: &'a [PdfObject],
+}
+
+impl<'a> Operands<'a> {
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<Operand<'a>> {
+        let slot = *self.slots.get(index)?;
+        Some(match slot & TAG_MASK {
+            INTEGER_TAG => Operand::Integer(((slot << 16) as i64) >> 16),
+            OBJECT_TAG => Operand::Object(&self.objects[(slot & PAYLOAD) as usize]),
+            _ => Operand::Real(f64::from_bits(slot)),
+        })
+    }
+
+    pub fn first(&self) -> Option<Operand<'a>> {
+        self.get(0)
+    }
+
+    pub fn last(&self) -> Option<Operand<'a>> {
+        self.get(self.len().checked_sub(1)?)
+    }
+
+    /// Operand `index` as a number, when it is one.
+    pub fn number(&self, index: usize) -> Option<f64> {
+        self.get(index)?.number()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Operand<'a>> + 'a {
+        let operands = *self;
+        (0..operands.len()).filter_map(move |index| operands.get(index))
+    }
+}
+
+/// An operand of a [`ContentOp`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Operand<'a> {
+    Integer(i64),
+    Real(f64),
+    Object(&'a PdfObject),
+}
+
+impl<'a> Operand<'a> {
+    pub fn number(self) -> Option<f64> {
+        match self {
+            Self::Integer(v) => Some(v as f64),
+            Self::Object(PdfObject::Integer(v)) => Some(*v as f64),
+            Self::Real(v) => Some(v),
+            Self::Object(PdfObject::Real(v)) => Some(*v),
+            Self::Object(_) => None,
+        }
+    }
+
+    /// The operand as an integer, when it was written as one.
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            Self::Integer(v) => Some(v),
+            Self::Object(object) => object.as_i64(),
+            Self::Real(_) => None,
+        }
+    }
+
+    pub fn as_name(self) -> Option<&'a str> {
+        self.object()?.as_name()
+    }
+
+    /// The operand when it is not a number.
+    pub fn object(self) -> Option<&'a PdfObject> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    pub fn to_object(self) -> PdfObject {
+        match self {
+            Self::Integer(v) => PdfObject::Integer(v),
+            Self::Real(v) => PdfObject::Real(v),
+            Self::Object(object) => object.clone(),
+        }
+    }
 }
 
 /// Parse the small inline dictionary before touching binary bytes. For raw
@@ -440,6 +693,53 @@ mod tests {
         let ops = parse_content(b"q BI /W 20 /H 20 /CS /G /BPC 8 ID short").unwrap();
         assert_eq!(ops[1].operator, "BI");
         assert!(ops[1].operands.is_empty());
+    }
+
+    /// `Content` holds every operator and operand `parse_content` finds.
+    fn assert_compact_matches(data: &[u8]) {
+        let operations = parse_content(data).unwrap();
+        let content = Content::parse(data);
+        assert_eq!(
+            content.len(),
+            operations.len(),
+            "{:?}",
+            String::from_utf8_lossy(data)
+        );
+        for (operation, compact) in operations.iter().zip(content.iter()) {
+            assert_eq!(operation.operator.as_str(), compact.operator);
+            let operands: Vec<PdfObject> =
+                compact.operands.iter().map(Operand::to_object).collect();
+            assert_eq!(operation.operands, operands);
+        }
+    }
+
+    #[test]
+    fn compact_content_holds_what_parse_content_does() {
+        for data in [
+            &b"q 1 0 0 1 5.5 -7 cm /F1 12 Tf (hi) Tj [(a) -120 (b)] TJ Q"[..],
+            b"0 -140737488355328 140737488355327 140737488355328 -9223372036854775808 x1",
+            b"-0 0.0 -.5 -0.0 3.25 99999999999999999999 re",
+            b"/Span << /ActualText (hi) >> BDC EMC 1 2 foo 3 bar",
+            b"q BI /W 3 /H 2 /IM true ID \x80\x40 EI Q",
+            b"q ) 1 0 0 1 5 5 cm } > Q [1 2",
+        ] {
+            assert_compact_matches(data);
+        }
+        let content = Content::parse(b"7 2.5 /N x1 Tr");
+        let op = content.get(0).unwrap();
+        assert_eq!(op.operator, "x1");
+        assert_eq!(op.operands.get(0), Some(Operand::Integer(7)));
+        assert_eq!(op.operands.number(1), Some(2.5));
+        assert_eq!(op.operands.get(1).and_then(Operand::as_i64), None);
+        assert_eq!(op.operands.last().and_then(Operand::as_name), Some("N"));
+        assert!(content.get(1).unwrap().operands.is_empty());
+    }
+
+    #[test]
+    fn stray_closing_delimiters_are_skipped() {
+        let ops = parse_content(b"q ) 1 0 0 1 5 5 cm } > Q").unwrap();
+        let names: Vec<&str> = ops.iter().map(|o| o.operator.as_str()).collect();
+        assert_eq!(names, ["q", "cm", "Q"]);
     }
 
     #[test]

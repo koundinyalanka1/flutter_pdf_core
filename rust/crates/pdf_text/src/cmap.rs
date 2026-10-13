@@ -189,6 +189,12 @@ pub fn parse(data: &[u8]) -> ParsedCMap {
     let mut array: Option<Vec<Vec<u8>>> = None;
 
     while let Ok(Some(spanned)) = lexer.next_token() {
+        // An unmatched delimiter comes back as an empty keyword without the
+        // lexer moving; skip the byte rather than read it forever.
+        if lexer.position() <= spanned.offset {
+            lexer.set_position(spanned.offset + 1);
+            continue;
+        }
         let token = spanned.token;
         if let Some(items) = array.as_mut() {
             match token {
@@ -938,6 +944,14 @@ endbfrange",
         let start = MAGIC.len() + reader.position;
         let body = pdf_core::filter::flate_decode(&bundle[start..start + length]).unwrap();
         assert_eq!(decode_entry(&body), Some(entry));
+    }
+
+    #[test]
+    fn a_stray_delimiter_does_not_stall_parsing() {
+        let parsed =
+            parse(b"/CMapName /Stray def ) } 1 begincodespacerange <00> <FF> endcodespacerange");
+        assert_eq!(parsed.name, "Stray");
+        assert_eq!(parsed.codespace, [(1, 0, 0xFF)]);
     }
 
     #[test]

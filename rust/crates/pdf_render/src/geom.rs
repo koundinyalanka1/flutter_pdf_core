@@ -114,13 +114,29 @@ pub enum FillRule {
 
 /// A path already flattened to polylines. Curves are subdivided at
 /// construction time, which keeps the rasterizer free of curve maths.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Path {
     pub subpaths: Vec<SubPath>,
     current: Option<Point>,
     start: Option<Point>,
     /// Device-space tolerance used when flattening curves.
     tolerance: f64,
+    /// Point buffers of subpaths dropped by [`Path::clear`], reused by
+    /// [`Path::move_to`]: a content stream builds its paths one after another
+    /// in the same `Path`, a hundred thousand of them in a plan.
+    spare: Vec<Vec<Point>>,
+}
+
+impl Clone for Path {
+    fn clone(&self) -> Self {
+        Self {
+            subpaths: self.subpaths.clone(),
+            current: self.current,
+            start: self.start,
+            tolerance: self.tolerance,
+            spare: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -144,6 +160,19 @@ impl Path {
         }
     }
 
+    /// Empty the path for reuse, keeping its buffers.
+    pub fn clear(&mut self) {
+        for subpath in self.subpaths.drain(..) {
+            let mut points = subpath.points;
+            if self.spare.len() < 64 {
+                points.clear();
+                self.spare.push(points);
+            }
+        }
+        self.current = None;
+        self.start = None;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.subpaths.iter().all(|s| s.points.len() < 2)
     }
@@ -154,8 +183,11 @@ impl Path {
 
     pub fn move_to(&mut self, x: f64, y: f64) {
         let point = Point::new(x, y);
+        // Most subpaths are a rectangle or a short run of lines.
+        let mut points = self.spare.pop().unwrap_or_else(|| Vec::with_capacity(4));
+        points.push(point);
         self.subpaths.push(SubPath {
-            points: vec![point],
+            points,
             closed: false,
         });
         self.current = Some(point);
@@ -252,6 +284,7 @@ impl Path {
             current: None,
             start: None,
             tolerance: self.tolerance,
+            spare: Vec::new(),
         }
     }
 

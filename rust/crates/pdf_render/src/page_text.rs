@@ -70,6 +70,11 @@ impl Renderer<'_> {
     ) {
         let fill = matches!(state.render_mode, 0 | 2 | 4 | 6) && !state.fill_marks_nothing();
         let stroke = matches!(state.render_mode, 1 | 2 | 5 | 6) && !state.stroke_marks_nothing();
+        // Off the canvas, as most of a page is from a zoomed-in region. The
+        // glyph still joins a text clip; that is collected by the caller.
+        if self.off_canvas(device, if stroke { stroke_reach(state) } else { 0.0 }) {
+            return;
+        }
         // Combined fill/stroke is itself one knockout object (11.7.4.4),
         // independently of TK. Inside the text's knockout group, painting
         // these two parts directly uses the same initial backdrop and is

@@ -9,7 +9,7 @@ pub enum Token {
     Name(String),
     LiteralString(Vec<u8>),
     HexString(Vec<u8>),
-    Keyword(String),
+    Keyword(Keyword),
     ArrayStart,
     ArrayEnd,
     DictStart,
@@ -343,8 +343,195 @@ impl<'a> Lexer<'a> {
             "null" => Token::Null,
             "true" => Token::Bool(true),
             "false" => Token::Bool(false),
-            _ => Token::Keyword(word.to_owned()),
+            _ => Token::Keyword(Keyword::from_word(word)),
         })
+    }
+}
+
+/// A bare word: an operator in a content stream, or `obj`, `R` and the like
+/// in the file's structure. The words PDF defines are held as a small index
+/// rather than a string — a drawing's content stream is hundreds of thousands
+/// of them — which a renderer can also store and look up directly.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Keyword(Word);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Word {
+    Known(u8),
+    Other(String),
+}
+
+/// The content stream operators (ISO 32000-1, Annex A) and the file
+/// structure's keywords. [`Keyword::known_index`] is a position here.
+pub const KNOWN_KEYWORDS: [&str; 81] = [
+    "b",
+    "B",
+    "b*",
+    "B*",
+    "BDC",
+    "BI",
+    "BMC",
+    "BT",
+    "BX",
+    "c",
+    "cm",
+    "CS",
+    "cs",
+    "d",
+    "d0",
+    "d1",
+    "Do",
+    "DP",
+    "EI",
+    "EMC",
+    "ET",
+    "EX",
+    "f",
+    "F",
+    "f*",
+    "G",
+    "g",
+    "gs",
+    "h",
+    "i",
+    "ID",
+    "j",
+    "J",
+    "K",
+    "k",
+    "l",
+    "m",
+    "M",
+    "MP",
+    "n",
+    "q",
+    "Q",
+    "re",
+    "RG",
+    "rg",
+    "ri",
+    "s",
+    "S",
+    "SC",
+    "sc",
+    "SCN",
+    "scn",
+    "sh",
+    "T*",
+    "Tc",
+    "Td",
+    "TD",
+    "Tf",
+    "Tj",
+    "TJ",
+    "TL",
+    "Tm",
+    "Tr",
+    "Ts",
+    "Tw",
+    "Tz",
+    "v",
+    "w",
+    "W",
+    "W*",
+    "y",
+    "'",
+    "\"",
+    "obj",
+    "endobj",
+    "stream",
+    "endstream",
+    "R",
+    "xref",
+    "trailer",
+    "startxref",
+];
+
+/// The index of `word` in [`KNOWN_KEYWORDS`]: candidates are found by first
+/// byte, so a lookup compares against a handful of words, not all of them.
+fn known_index(word: &[u8]) -> Option<u8> {
+    static BY_FIRST_BYTE: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let table = BY_FIRST_BYTE.get_or_init(|| {
+        let mut table = vec![Vec::new(); 256];
+        for (index, known) in KNOWN_KEYWORDS.iter().enumerate() {
+            table[usize::from(known.as_bytes()[0])].push(index as u8);
+        }
+        table
+    });
+    table[usize::from(*word.first()?)]
+        .iter()
+        .copied()
+        .find(|&index| KNOWN_KEYWORDS[usize::from(index)].as_bytes() == word)
+}
+
+impl Keyword {
+    pub fn from_word(word: &str) -> Self {
+        Self(match known_index(word.as_bytes()) {
+            Some(index) => Word::Known(index),
+            None => Word::Other(word.to_owned()),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            Word::Known(index) => KNOWN_KEYWORDS[usize::from(*index)],
+            Word::Other(word) => word,
+        }
+    }
+
+    /// The keyword's position in [`KNOWN_KEYWORDS`], when PDF defines it.
+    pub fn known_index(&self) -> Option<u8> {
+        match self.0 {
+            Word::Known(index) => Some(index),
+            Word::Other(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for Keyword {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for Keyword {
+    fn from(word: &str) -> Self {
+        Self::from_word(word)
+    }
+}
+
+impl From<String> for Keyword {
+    fn from(word: String) -> Self {
+        match known_index(word.as_bytes()) {
+            Some(index) => Self(Word::Known(index)),
+            None => Self(Word::Other(word)),
+        }
+    }
+}
+
+impl PartialEq<str> for Keyword {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Keyword {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Debug for Keyword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for Keyword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

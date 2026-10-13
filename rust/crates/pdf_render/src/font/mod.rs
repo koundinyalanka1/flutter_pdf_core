@@ -14,10 +14,12 @@ pub mod truetype;
 pub mod type1;
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use pdf_core::document::PdfDocument;
 use pdf_core::object::{Dictionary, PdfObject};
 use pdf_core::stream::PdfStream;
+use pdf_text::content_stream::Content;
 use pdf_text::font::{load_font, Font as TextFont};
 
 use crate::geom::{Matrix, Path};
@@ -52,7 +54,7 @@ pub struct Type3Glyphs {
     /// fixed 1/1000 scale; TeX bitmap fonts in particular use odd values.
     pub font_matrix: Matrix,
     /// Glyph name → its content stream.
-    char_procs: HashMap<String, PdfStream>,
+    char_procs: HashMap<String, Type3Procedure>,
     /// The font's own `/Resources`, for procedures that name images, fonts
     /// or colour spaces. Absent means "use the page's", as PDF 1.1 allowed.
     pub resources: Option<Dictionary>,
@@ -86,7 +88,13 @@ impl Type3Glyphs {
         let char_procs = procs
             .iter()
             .filter_map(|(name, value)| match doc.resolve_value(value) {
-                PdfObject::Stream(stream) => Some((name.clone(), stream)),
+                PdfObject::Stream(stream) => Some((
+                    name.clone(),
+                    Type3Procedure {
+                        stream,
+                        parsed: OnceLock::new(),
+                    },
+                )),
                 _ => None,
             })
             .collect();
@@ -103,9 +111,25 @@ impl Type3Glyphs {
 
     /// The procedure that draws `code`, found through the encoding's glyph
     /// name — the only way Type3 glyphs are addressed.
-    pub fn procedure(&self, code: u32, text: &TextFont) -> Option<&PdfStream> {
+    pub fn procedure(&self, code: u32, text: &TextFont) -> Option<&Type3Procedure> {
         let name = text.glyph_names.get(&u8::try_from(code).ok()?)?;
         self.char_procs.get(name)
+    }
+}
+
+/// A Type3 glyph's drawing procedure. A page of Type3 text draws each glyph
+/// many times; its content is parsed the first time and kept with the font.
+pub struct Type3Procedure {
+    stream: PdfStream,
+    parsed: OnceLock<Option<Content>>,
+}
+
+impl Type3Procedure {
+    /// The procedure's content, or `None` when its stream cannot be decoded.
+    pub fn content(&self, doc: &PdfDocument) -> Option<&Content> {
+        self.parsed
+            .get_or_init(|| Some(Content::parse(&doc.stream_data(&self.stream).ok()?)))
+            .as_ref()
     }
 }
 

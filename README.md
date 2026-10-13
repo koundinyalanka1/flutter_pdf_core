@@ -17,7 +17,7 @@ A lightweight PDF toolkit for Flutter, **built from scratch in Rust** — no thi
 * JPEG-to-PDF composition with page-size, fit and margin controls
 * AI-ready JSON/NDJSON export (paragraph-aware chunks with overlap) for feeding local models
 * AES-256 password protection; opens RC4/AES-128/AES-256 encrypted files
-* Hand-written C ABI + `dart:ffi` — no codegen, no heavy runtime, small binaries
+* Hand-written FFI layer in Rust (`extern "C"` exports, the calling convention `dart:ffi` uses; no C code) — no codegen, no heavy runtime, small binaries
 
 ## Quick start (Dart)
 
@@ -191,7 +191,7 @@ cargo run --release -p pdf_cli -- ocr-eval text.pdf             # accuracy vs. r
 | `rust/crates/pdf_render` | CPU rasterizer, fonts, images, paints, annotations |
 | `rust/crates/pdf_ai` | chunking + JSON/NDJSON export for local AI models |
 | `rust/crates/pdf_ocr` | OCR: page analysis, recognizer inference, invisible text layers |
-| `rust/crates/pdf_ffi` | the C ABI consumed by `dart:ffi` |
+| `rust/crates/pdf_ffi` | the FFI layer (Rust, `extern "C"` exports) consumed by `dart:ffi` |
 | `rust/crates/pdf_cli` | developer CLI |
 | `tools/ocr_train` | offline training of the OCR model (Python, not shipped) |
 

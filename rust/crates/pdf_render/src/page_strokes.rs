@@ -37,11 +37,16 @@ impl Renderer<'_> {
         state: &GraphicsState,
         adjust: bool,
     ) {
-        let dashed = match dash_path(path, &state.dash, state.dash_phase) {
-            Some(path) => path,
-            None => {
-                self.warn("stroke dash detail exceeds renderer limit; stroke skipped");
-                return;
+        // Most strokes are solid: they are stroked as they are, not copied.
+        let dashed = if state.dash.is_empty() {
+            std::borrow::Cow::Borrowed(path)
+        } else {
+            match dash_path(path, &state.dash, state.dash_phase) {
+                Some(path) => std::borrow::Cow::Owned(path),
+                None => {
+                    self.warn("stroke dash detail exceeds renderer limit; stroke skipped");
+                    return;
+                }
             }
         };
         let ctm = &state.ctm;
@@ -92,7 +97,8 @@ impl Renderer<'_> {
 fn snap_axis_strokes(path: &Path, width: f64) -> Option<Path> {
     // Lines a PDF draws straight are straight to within rounding noise.
     const STRAIGHT: f64 = 1e-3;
-    let snap = |value: f64| (value - width / 2.0).round() + width / 2.0;
+    // Halves round up, the same at any whole-pixel shift (see `snap_rect_fill`).
+    let snap = |value: f64| (value - width / 2.0 + 0.5).floor() + width / 2.0;
     let mut snapped = path.clone();
     for (subpath, out) in path.subpaths.iter().zip(snapped.subpaths.iter_mut()) {
         let points = &subpath.points;
@@ -100,9 +106,9 @@ fn snap_axis_strokes(path: &Path, width: f64) -> Option<Path> {
         if count < 2 {
             continue;
         }
-        let mut snap_x = vec![false; count];
-        let mut snap_y = vec![false; count];
         let segments = if subpath.closed { count } else { count - 1 };
+        // Judged on the original points; snapping a point twice is the same
+        // as snapping it once, so a corner shared by two segments is fine.
         for i in 0..segments {
             let (a, b) = (points[i], points[(i + 1) % count]);
             let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
@@ -112,22 +118,15 @@ fn snap_axis_strokes(path: &Path, width: f64) -> Option<Path> {
             if dx < 1e-12 && dy < 1e-12 {
                 continue;
             }
+            let next = (i + 1) % count;
             if dy <= STRAIGHT {
-                snap_y[i] = true;
-                snap_y[(i + 1) % count] = true;
+                out.points[i].y = snap(points[i].y);
+                out.points[next].y = snap(points[next].y);
             } else if dx <= STRAIGHT {
-                snap_x[i] = true;
-                snap_x[(i + 1) % count] = true;
+                out.points[i].x = snap(points[i].x);
+                out.points[next].x = snap(points[next].x);
             } else {
                 return None;
-            }
-        }
-        for (i, point) in out.points.iter_mut().enumerate() {
-            if snap_x[i] {
-                point.x = snap(point.x);
-            }
-            if snap_y[i] {
-                point.y = snap(point.y);
             }
         }
     }

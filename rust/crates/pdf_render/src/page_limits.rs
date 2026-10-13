@@ -4,6 +4,11 @@ use crate::canvas::Mask;
 
 pub(super) const MAX_TEMPORARY_BYTES: usize = 128 * 1024 * 1024;
 
+/// Tiling-pattern work a page may take, as tiles times canvas pixels: each
+/// tile is clipped by a canvas-sized mask, and tiny steps in an untrusted
+/// file would otherwise stall a phone.
+pub(super) const MAX_PATTERN_WORK: f64 = 256_000_000.0;
+
 impl Renderer<'_> {
     fn live_mask_bytes(&mut self) -> usize {
         self.mask_allocations
@@ -51,16 +56,30 @@ impl Renderer<'_> {
 mod tests {
     use super::*;
     fn run(content: &str, limit: usize) -> (Canvas, Vec<String>, usize) {
+        run_with(content, &Dictionary::new(), limit)
+    }
+
+    fn run_with(
+        content: &str,
+        resources: &Dictionary,
+        limit: usize,
+    ) -> (Canvas, Vec<String>, usize) {
         let doc = PdfDocument::new_empty("1.7");
         let mut canvas = Canvas::new(10, 10);
+        let shared = super::super::bands::Shared::default();
+        let recent = super::super::bands::Recent::default();
         let (warnings, retained) = {
             let mut renderer = Renderer {
                 doc: &doc,
                 canvas: &mut canvas,
+                shared: &shared,
+                recent: &recent,
                 fonts: HashMap::new(),
                 tint_transforms: HashMap::new(),
                 depth: 0,
                 pattern_pixels: 0.0,
+                origin: (0.0, 0.0),
+                region: (0.0, 0.0, 10.0, 10.0),
                 temporary_bytes: 0,
                 mask_allocations: Vec::new(),
                 temporary_limit: limit,
@@ -70,9 +89,9 @@ mod tests {
                 type3_depth: 0,
             };
             renderer
-                .run(
-                    content.as_bytes(),
-                    &Dictionary::new(),
+                .run_operations(
+                    &Content::parse(content.as_bytes()),
+                    resources,
                     &mut GraphicsState::new(Matrix::IDENTITY),
                 )
                 .unwrap();
@@ -102,6 +121,28 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(retained, 0);
         assert!(canvas.pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn an_opaque_graphics_state_in_text_needs_no_offscreen_buffer() {
+        // AutoCAD sets an opaque state inside every text object. Only a
+        // state that adds transparency needs the page-sized knockout buffer.
+        let resources = match pdf_core::parser::Parser::new(
+            b"<< /ExtGState << /Opaque << /ca 1 /CA 1 /BM /Normal >> /Half << /ca 0.5 >> >> >>",
+        )
+        .parse_object()
+        .unwrap()
+        {
+            PdfObject::Dictionary(dict) => dict,
+            _ => unreachable!(),
+        };
+        let (_, warnings, _) = run_with("BT /Opaque gs ET", &resources, 10);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, warnings, _) = run_with("BT /Half gs ET", &resources, 10);
+        assert!(
+            warnings.iter().any(|w| w.contains("memory limit")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

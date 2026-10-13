@@ -13,7 +13,7 @@ mod blending;
 pub use blending::lum as luminosity;
 pub use blending::BlendMode;
 
-use crate::geom::{FillRule, Path, Point};
+use crate::geom::{FillRule, Path, Point, SubPath};
 
 /// Sub-scanlines sampled per pixel row. Coverage across a nearly horizontal
 /// edge comes in steps of 1/16, too fine to see; with 4, hairline horizontal
@@ -114,6 +114,10 @@ pub struct Canvas {
     /// Reusable coverage row so filling does not allocate per scanline.
     coverage: Vec<f32>,
     crossings: Vec<(f64, i32)>,
+    /// Edge and active-edge lists, kept between fills: a drawing of a
+    /// hundred thousand short lines otherwise allocates them every time.
+    edges: Vec<Edge>,
+    active: Vec<usize>,
     pub blend_mode: BlendMode,
     pub blend_color_space: BlendColorSpace,
     pub paint_suppressed: bool,
@@ -134,6 +138,8 @@ impl Canvas {
             pixels: vec![255; width * height * 4],
             coverage: vec![0.0; width + 2],
             crossings: Vec::with_capacity(64),
+            edges: Vec::new(),
+            active: Vec::new(),
             blend_mode: BlendMode::Normal,
             blend_color_space: BlendColorSpace::DeviceRgb,
             paint_suppressed: false,
@@ -246,17 +252,34 @@ impl Canvas {
 
     /// Shared scanline walk. Calls `emit(self, y, coverage_row, span)` per
     /// pixel row that the path touches; only `span` of the row holds coverage.
-    fn scan<F>(&mut self, path: &Path, rule: FillRule, mut emit: F)
+    fn scan<F>(&mut self, path: &Path, rule: FillRule, emit: F)
     where
         F: FnMut(&mut Canvas, usize, &[f32], std::ops::Range<usize>),
     {
-        let mut edges = collect_edges(path);
+        let mut edges = std::mem::take(&mut self.edges);
+        let mut active = std::mem::take(&mut self.active);
+        collect_edges(path, &mut edges);
+        active.clear();
+        self.scan_edges(&mut edges, &mut active, rule, emit);
+        self.edges = edges;
+        self.active = active;
+    }
+
+    fn scan_edges<F>(
+        &mut self,
+        edges: &mut [Edge],
+        active: &mut Vec<usize>,
+        rule: FillRule,
+        mut emit: F,
+    ) where
+        F: FnMut(&mut Canvas, usize, &[f32], std::ops::Range<usize>),
+    {
         if edges.is_empty() {
             return;
         }
 
         let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
-        for edge in &edges {
+        for edge in edges.iter() {
             min_y = min_y.min(edge.y_min);
             max_y = max_y.max(edge.y_max);
         }
@@ -268,7 +291,6 @@ impl Canvas {
         // Edges join the active list as the walk reaches their top, so each
         // row only looks at the few edges that actually cross it.
         edges.sort_unstable_by(|a, b| a.y_min.total_cmp(&b.y_min));
-        let mut active: Vec<usize> = Vec::new();
         let mut next = 0;
 
         let width = self.width;
@@ -292,7 +314,7 @@ impl Canvas {
             for sub in 0..SUB_SAMPLES {
                 let sample_y = top + (sub as f64 + 0.5) / SUB_SAMPLES as f64;
                 self.crossings.clear();
-                for &index in &active {
+                for &index in active.iter() {
                     let edge = &edges[index];
                     if sample_y >= edge.y_min && sample_y < edge.y_max {
                         self.crossings
@@ -524,10 +546,11 @@ struct Edge {
     winding: i32,
 }
 
-/// Turn the flattened path into non-horizontal directed edges. Open subpaths
-/// are implicitly closed, which is what PDF fill operators do.
-fn collect_edges(path: &Path) -> Vec<Edge> {
-    let mut edges = Vec::new();
+/// Turn the flattened path into non-horizontal directed edges, replacing what
+/// `edges` held. Open subpaths are implicitly closed, which is what PDF fill
+/// operators do.
+fn collect_edges(path: &Path, edges: &mut Vec<Edge>) {
+    edges.clear();
     for subpath in &path.subpaths {
         let points = &subpath.points;
         if points.len() < 2 {
@@ -540,10 +563,9 @@ fn collect_edges(path: &Path) -> Vec<Edge> {
             } else {
                 points[0]
             };
-            push_edge(&mut edges, start, end);
+            push_edge(edges, start, end);
         }
     }
-    edges
 }
 
 fn push_edge(edges: &mut Vec<Edge>, start: Point, end: Point) {
@@ -590,6 +612,13 @@ pub fn stroke_outline_styled(
     if !half.is_finite() || half <= 0.0 {
         return out;
     }
+    // A quad per segment and a piece per join or cap.
+    out.subpaths.reserve(
+        path.subpaths
+            .iter()
+            .map(|subpath| 2 * subpath.points.len() + 2)
+            .sum(),
+    );
     for subpath in &path.subpaths {
         let mut points = subpath.points.clone();
         points.dedup();
@@ -683,6 +712,7 @@ pub fn stroke_outline_styled(
 }
 
 // All component polygons have the same winding so overlaps form a union.
+// Each is pushed whole, one allocation apiece: a stroke is made of many.
 fn polygon(path: &mut Path, points: &[Point]) {
     if points.len() < 3 {
         return;
@@ -693,34 +723,34 @@ fn polygon(path: &mut Path, points: &[Point]) {
         .take(points.len())
         .map(|(a, b)| a.x * b.y - b.x * a.y)
         .sum();
-    path.move_to(points[0].x, points[0].y);
+    let mut ordered = Vec::with_capacity(points.len());
+    ordered.push(points[0]);
     if area > 0.0 {
-        for point in points[1..].iter().rev() {
-            path.line_to(point.x, point.y);
-        }
+        ordered.extend(points[1..].iter().rev());
     } else {
-        for point in &points[1..] {
-            path.line_to(point.x, point.y);
-        }
+        ordered.extend_from_slice(&points[1..]);
     }
-    path.close();
+    path.subpaths.push(SubPath {
+        points: ordered,
+        closed: true,
+    });
 }
 
 fn push_disc(path: &mut Path, center: Point, radius: f64) {
     let segments = ((radius * std::f64::consts::TAU / 0.5).ceil() as usize).clamp(12, 128);
-    for i in 0..segments {
-        let angle = -(i as f64) / segments as f64 * std::f64::consts::TAU;
-        let (x, y) = (
-            center.x + radius * angle.cos(),
-            center.y + radius * angle.sin(),
-        );
-        if i == 0 {
-            path.move_to(x, y);
-        } else {
-            path.line_to(x, y);
-        }
-    }
-    path.close();
+    let points = (0..segments)
+        .map(|i| {
+            let angle = -(i as f64) / segments as f64 * std::f64::consts::TAU;
+            Point::new(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            )
+        })
+        .collect();
+    path.subpaths.push(SubPath {
+        points,
+        closed: true,
+    });
 }
 
 /// Shared clip state. `None` means "no clipping". Reference counted because

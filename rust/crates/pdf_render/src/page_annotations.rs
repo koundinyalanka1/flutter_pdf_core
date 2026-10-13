@@ -384,7 +384,7 @@ impl Renderer<'_> {
                 } else {
                     resources
                 };
-                self.draw_form(&stream, appearance_resources, &state);
+                self.draw_form(&stream, appearance_resources, &state, None);
                 continue;
             }
             let color = color_from(&numbers(self.doc, annotation.get("C")))
@@ -545,6 +545,7 @@ impl Renderer<'_> {
         if let Some(color) = appearance.and_then(|d| color_from(&numbers(self.doc, d.get("BC")))) {
             let mut border_state = self.annotation_state(field, ctm);
             border_state.clip = state.clip.clone();
+            border_state.clip_bounds = state.clip_bounds;
             border_state.stroke = color;
             self.draw_annotation_border(field, rect, &border_state);
         }
@@ -731,7 +732,7 @@ impl Renderer<'_> {
                             .first()
                             .and_then(PdfObject::as_name)
                             .map(str::to_owned);
-                        size = number(&op, 1);
+                        size = op.operands.get(1).and_then(as_number).unwrap_or(0.0);
                     }
                     "g" | "rg" | "k" => {
                         if let Some(c) = color_from(
@@ -946,7 +947,7 @@ impl Renderer<'_> {
             FillRule::NonZero,
             &mut icon_state,
         );
-        self.draw_form(icon, &Dictionary::new(), &icon_state);
+        self.draw_form(icon, &Dictionary::new(), &icon_state, None);
     }
 
     fn draw_link_border(

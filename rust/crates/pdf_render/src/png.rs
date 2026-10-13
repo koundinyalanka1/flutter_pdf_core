@@ -60,7 +60,11 @@ pub fn encode_rgba_as_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8
         previous.copy_from_slice(&row);
     }
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+    // These PNGs only carry pixels to the app's own image decoder, a moment
+    // later. Level 1 is five times faster than the default 6 on a phone
+    // (60 ms rather than 320 for a zoomed region of a drawing) and the
+    // output is a third larger, which does not matter in memory.
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&raw).ok()?;
     let compressed = encoder.finish().ok()?;
 

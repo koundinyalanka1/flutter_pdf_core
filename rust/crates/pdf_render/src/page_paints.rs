@@ -19,8 +19,8 @@ pub(super) fn scalar_function_table(doc: &PdfDocument, object: &PdfObject) -> Op
 }
 
 impl Renderer<'_> {
-    pub(super) fn is_pattern_space(&self, op: &Operation, resources: &Dictionary) -> bool {
-        let Some(name) = op.operands.first().and_then(PdfObject::as_name) else {
+    pub(super) fn is_pattern_space(&self, op: &ContentOp, resources: &Dictionary) -> bool {
+        let Some(name) = op.operands.first().and_then(Operand::as_name) else {
             return false;
         };
         if name == "Pattern" {
@@ -135,6 +135,19 @@ impl Renderer<'_> {
             None => mask,
         };
         state.clip = Some(self.register_mask(mask));
+        if let Some((x0, y0, x1, y1)) = path.bounds() {
+            let (dx, dy) = self.origin;
+            let new = (x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+            state.clip_bounds = Some(match state.clip_bounds {
+                Some(old) => (
+                    old.0.max(new.0),
+                    old.1.max(new.1),
+                    old.2.min(new.2),
+                    old.3.min(new.3),
+                ),
+                None => new,
+            });
+        }
         self.temporary_bytes -= bytes;
     }
 
@@ -159,6 +172,34 @@ impl Renderer<'_> {
             self.warn("tiling pattern skipped: singular transform");
             return;
         };
+        // Each tile needs an independent clip; bound both tile count and work
+        // rather than allowing untrusted tiny steps to stall a phone. Judged
+        // for the whole region rendered, from the clip's box in it, and for
+        // this pattern alone: every band of a page then decides alike, where
+        // a band that drew a pattern its neighbour skipped would leave a seam,
+        // whatever else each band skipped as off its canvas.
+        let (rx0, ry0, rx1, ry1) = self.region;
+        let (cx0, cy0, cx1, cy1) = state.clip_bounds.unwrap_or(self.region);
+        let (ox, oy) = self.origin;
+        let page_visible = bounds(
+            inverse,
+            (
+                cx0.max(rx0) - ox,
+                cy0.max(ry0) - oy,
+                cx1.min(rx1) - ox,
+                cy1.min(ry1) - oy,
+            ),
+        );
+        let tiles = |v: (f64, f64, f64, f64)| {
+            (((v.2 - bbox.0) / xstep).ceil() - ((v.0 - bbox.2) / xstep).floor() + 1.0)
+                * (((v.3 - bbox.1) / ystep).ceil() - ((v.1 - bbox.3) / ystep).floor() + 1.0)
+        };
+        let count = tiles(page_visible).max(0.0);
+        let work = count * (rx1 - rx0) * (ry1 - ry0);
+        if !count.is_finite() || count > 8192.0 || work > limits::MAX_PATTERN_WORK {
+            self.warn("tiling pattern skipped: tile density exceeds renderer limit");
+            return;
+        }
         let Some(clip) = state.clip.as_deref() else {
             return;
         };
@@ -185,22 +226,22 @@ impl Renderer<'_> {
         let ix1 = ((visible.2 - bbox.0) / xstep).ceil();
         let iy0 = ((visible.1 - bbox.3) / ystep).floor();
         let iy1 = ((visible.3 - bbox.1) / ystep).ceil();
-        let count = (ix1 - ix0 + 1.0) * (iy1 - iy0 + 1.0);
-        // Each tile needs an independent clip; bound both tile count and work
-        // rather than allowing untrusted tiny steps to stall a phone.
-        if !count.is_finite()
-            || count > 8192.0
-            || self.pattern_pixels + count * self.canvas.width as f64 * self.canvas.height as f64
-                > 256_000_000.0
-        {
+        // What this band will do, a canvas-sized clip a tile, across all of a
+        // page's patterns. Only a hostile file comes near four patterns' worth
+        // of the limit; it is stopped there.
+        let band_work =
+            (ix1 - ix0 + 1.0) * (iy1 - iy0 + 1.0) * (self.canvas.width * self.canvas.height) as f64;
+        if self.pattern_pixels + band_work > 4.0 * limits::MAX_PATTERN_WORK {
             self.warn("tiling pattern skipped: tile density exceeds renderer limit");
             return;
         }
-        self.pattern_pixels += count * self.canvas.width as f64 * self.canvas.height as f64;
+        self.pattern_pixels += band_work;
         let Ok(data) = self.doc.stream_data(stream) else {
             self.warn("tiling pattern skipped: content cannot be decoded");
             return;
         };
+        // Parsed once for every tile, not once a tile.
+        let content = Content::parse(&data);
         let local_resources = dict
             .get("Resources")
             .and_then(|o| self.doc.resolve_dict(o))
@@ -216,7 +257,7 @@ impl Renderer<'_> {
                 let mut path = Path::new();
                 path.rect(bbox.0, bbox.1, bbox.2 - bbox.0, bbox.3 - bbox.1);
                 self.clip_path(&path.transform(&tile.ctm), FillRule::NonZero, &mut tile);
-                let _ = self.run(&data, &local_resources, &mut tile);
+                let _ = self.run_operations(&content, &local_resources, &mut tile);
             }
         }
         self.depth -= 1;

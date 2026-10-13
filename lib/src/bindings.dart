@@ -67,6 +67,33 @@ typedef _RenderRegionPngC = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>
 typedef _RenderRegionPngDart = Pointer<Uint8> Function(Pointer<Utf8>,
     Pointer<Utf8>, int, int, int, int, int, int, int, Pointer<Int32>);
 
+typedef _RenderRegionRgbaC = Pointer<Uint8> Function(
+    Pointer<Utf8>,
+    Pointer<Utf8>,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Pointer<Int32>,
+    Pointer<Int32>,
+    Pointer<Int32>);
+typedef _RenderRegionRgbaDart = Pointer<Uint8> Function(
+    Pointer<Utf8>,
+    Pointer<Utf8>,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    Pointer<Int32>,
+    Pointer<Int32>,
+    Pointer<Int32>);
+
 typedef _RenderRgbaC = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
     Int32, Int32, Int32, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>);
 typedef _RenderRgbaDart = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Utf8>,
@@ -211,6 +238,11 @@ class PdfBindings {
   late final _RenderRegionPngDart? renderPageRegionPng = _optional(() =>
       _library.lookupFunction<_RenderRegionPngC, _RenderRegionPngDart>(
           'pdf_render_page_region_png'));
+
+  /// Optional: raw-pixel regions arrived after PNG ones.
+  late final _RenderRegionRgbaDart? renderPageRegionRgba = _optional(() =>
+      _library.lookupFunction<_RenderRegionRgbaC, _RenderRegionRgbaDart>(
+          'pdf_render_page_region_rgba'));
 
   static T? _optional<T>(T Function() lookup) {
     try {

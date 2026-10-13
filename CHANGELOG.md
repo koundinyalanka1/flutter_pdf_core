@@ -1,5 +1,82 @@
 ## Unreleased
 
+* Pages render about twice as fast on a phone, and zooming in again on a
+  page already shown is many times faster, for every kind of document.
+  Measured on a Motorola edge 70 fusion at its screen width: an AutoCAD
+  parking plan (155,000 paths) 2.4 s → 1.1 s for the page and 1.7 s →
+  0.8 s for a zoomed region before the document cache below; a scanned
+  letter 325 → 190 ms and 400 → 205 ms. Over the 958 pages of the test
+  corpus on a Mac: 30.7 s on one thread, 14.6 s in bands, 6.5 s rendering
+  again from a kept document. Where the time went:
+  * A render is cut into horizontal bands drawn on up to four threads
+    (`RenderOptions::threads`; 0, the default, uses the device's cores up
+    to four, 1 draws on the caller's thread). The bands share the page's
+    parsed content, its fonts and its decoded images, so a full-page scan
+    is decoded once, not once per band, and a render keeps the images it
+    has used for its later bands; they split the scratch-memory budget one
+    render had. More than four threads made dense drawings slower on both
+    phones measured.
+  * A document can keep what its renders derive from it —
+    `PdfDocument::derived`, a `pdf_core::derived::DerivedCache`, off unless
+    enabled and only for a document no longer changed. `pdf_document_open`
+    enables it for the documents the app pins while they are open, so the
+    next render of a page, zoomed in further, decodes no image and parses
+    nothing again: a zoomed region of a scanned page 36 → 6 ms on a Mac, of
+    an Internet Archive book page 660 → 20 ms. Bounded: 64 MB of decoded
+    images, 32 MB of parsed pages, 16 MB of parsed forms, the least
+    recently used let go first.
+  * Content streams are parsed into `pdf_text::content_stream::Content`:
+    operators and operands in a few flat arrays, 12 bytes an operator and 8
+    an operand, without an allocation per operator. The plan's stream
+    (725,000 operators) took about 106 MB as `Operation`s; it takes 16,
+    parses faster and frees at once. `parse_content` is unchanged for text extraction; both share one
+    parser and recover from damage alike.
+  * Gray images are held at a byte a pixel rather than as RGB
+    (`DecodedImage::gray`): a scanned book page with its text mask 101 MB →
+    49 MB, decoded and sampled faster.
+  * Nothing is parsed twice in one render: a tiling pattern's content once
+    for all its tiles, not once a tile; a Type3 glyph's procedure the first
+    time the glyph is drawn, kept with its font; a form XObject once, kept
+    by object.
+  * Paths, glyphs, forms and images wholly outside the canvas are skipped
+    before any work: a path from the corners of its bounds before it is
+    transformed, a glyph from a box four ems around it before its outline
+    is built, a form before its clip is made or its content parsed, an
+    image before it is decoded. A zoomed-in region costs what is in it, not
+    the whole page.
+  * Far fewer allocations, which on Android's allocator are slow and
+    contend between threads: 7.5 million → 3.5 million for the plan even
+    before compact content. Edge and active-edge lists are reused between
+    fills; stroke pieces are pushed whole; solid strokes are not copied; a
+    content stream's paths reuse their point buffers; the operators PDF
+    defines are held as an index (`pdf_core::lexer::Keyword`, now the type
+    of `Token::Keyword` and `Operation::operator`), found by first byte
+    rather than compared against all of them.
+  * Rendered PNGs use zlib level 1 rather than 6: five times faster (60
+    rather than 320 ms for a zoomed region of the plan), a third larger,
+    and they only cross to the app's own decoder. A zoomed-in region need
+    not be PNG at all: `pdf_render_page_region_rgba`
+    (`PdfCore.renderPageRegionRgbaWithWarnings`,
+    `PdfCore.canRenderRegionPixels`) returns its raw pixels.
+  * Bands produce the same pixels as one thread, and a kept document the
+    same as a fresh one: all 958 corpus pages compared four ways, identical
+    but for one pdf.js test page whose tiling pattern one thread now gives
+    up on and bands draw. A tiling pattern is judged against the work limit
+    on its own, for the whole region; across a page's patterns each band is
+    stopped at four times that.
+* A text object with a `gs` inside it is drawn through a page-sized
+  knockout buffer only when that `gs` makes it transparent. AutoCAD sets an
+  opaque state inside every text object; at large sizes the buffers ran
+  past the memory limit and the text was left out.
+* A content stream or CMap with an unmatched `)`, `>`, `{` or `}` no longer
+  hangs: the lexer returned an empty keyword without moving on, which the
+  content parser took as an operator forever, filling memory until the
+  process was killed (a fuzzed pdf.js test file did so in under a second).
+* Rectangle and stroke snapping rounds halves up rather than away from
+  zero, so a zoomed-in region or a band, whose coordinates are the page's
+  shifted by whole pixels, snaps exactly as the whole page does. The
+  tiling-pattern work limit is judged for the whole region, from a new
+  record of the clip's bounds, so every band of a page decides alike.
 * Gradients whose colour space is `ICCBased`, `CalRGB` or `CalGray` are
   drawn; they were skipped, so a gradient in a page written by macOS
   (Quartz) was missing.

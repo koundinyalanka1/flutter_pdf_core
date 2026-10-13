@@ -7,7 +7,7 @@
 │   lib/src/pdf_core_api.dart     sync + isolate-async       │
 │   lib/src/bindings.dart         raw dart:ffi               │
 └──────────────────────────┬─────────────────────────────────┘
-                           │ C ABI (UTF-8 strings, int status,
+                           │ extern "C" Rust exports (UTF-8 strings, int status,
                            │ pdf_last_error / pdf_free_string)
 ┌──────────────────────────┴─────────────────────────────────┐
 │ rust/crates                                                │
@@ -28,7 +28,7 @@
 
 ## Design choices
 
-**From scratch, lightweight.** No PDF crates. External crates are small, widely-audited primitives only: `flate2` (zlib), `aes`/`cbc`/`md-5`/`sha2` (RustCrypto), `getrandom`, `serde`/`serde_json`, `thiserror`. The FFI layer is hand-written instead of flutter_rust_bridge — zero codegen, zero extra runtime, smaller binaries.
+**From scratch, lightweight.** No PDF crates. External crates are small, widely-audited primitives only: `flate2` (zlib), `aes`/`cbc`/`md-5`/`sha2` (RustCrypto), `getrandom`, `serde`/`serde_json`, `thiserror`. The FFI layer is hand-written Rust (`extern "C"` exports, no C code) instead of flutter_rust_bridge — zero codegen, zero extra runtime, smaller binaries.
 
 **Immutable-ish core, explicit ops.** `PdfDocument` holds a `BTreeMap<ObjectId, IndirectObject>` plus the trailer. Operations in `pdf_ops` either mutate in place (`delete_pages`, `rotate_page`, `write_metadata`) and rely on `garbage_collect()`, or build fresh documents via the closure-copy engine in `split.rs` (used by both split and merge) which renumbers objects compactly and rewrites references.
 
@@ -53,6 +53,6 @@ extraction, selection geometry, AI export, and other viewers.
 
 ## Testing
 
-* Unit tests live next to each module (`cargo test --workspace` — parser, xref-stream and `/Prev` chains, predictors, page-tree inheritance, split/merge round-trips, text extraction against synthetic content streams, chunker invariants, RC4/AES vectors, full encrypt→reopen cycles, and an end-to-end FFI smoke test through the real C ABI).
+* Unit tests live next to each module (`cargo test --workspace` — parser, xref-stream and `/Prev` chains, predictors, page-tree inheritance, split/merge round-trips, text extraction against synthetic content streams, chunker invariants, RC4/AES vectors, full encrypt→reopen cycles, and an end-to-end FFI smoke test through the real exported functions).
 * Dart unit tests cover the pure-Dart layer; `example/integration_test` exercises the FFI on a device.
 * CI (`.github/workflows/ci.yml`) runs fmt + clippy (warnings deny) + tests + an Android cross-build on every push.

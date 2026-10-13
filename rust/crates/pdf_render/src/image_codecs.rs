@@ -138,10 +138,11 @@ fn decode_jpx_inner(
     }
     let alpha_mode = dict_int(doc, dict, "SMaskInData", "SMaskInData").unwrap_or(0);
     let use_alpha = has_alpha && matches!(alpha_mode, 1 | 2);
+    let gray = !is_stencil && channels == 1 && matches!(space, ColorSpace::Gray);
     let mut rgb = if is_stencil {
         Vec::new()
     } else {
-        Vec::with_capacity(pixels * 3)
+        Vec::with_capacity(pixels * if gray { 1 } else { 3 })
     };
     let mut alpha = if use_alpha || is_stencil {
         Vec::with_capacity(pixels)
@@ -180,7 +181,12 @@ fn decode_jpx_inner(
             color.g /= opacity as f32;
             color.b /= opacity as f32;
         }
-        rgb.extend([color.r, color.g, color.b].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if gray {
+            rgb.push(byte(color.r));
+        } else {
+            rgb.extend([color.r, color.g, color.b].map(byte));
+        }
         if use_alpha {
             alpha.push((opacity * 255.0).round() as u8);
         }
@@ -189,6 +195,7 @@ fn decode_jpx_inner(
         width,
         height,
         rgb,
+        gray,
         alpha,
         is_stencil,
         mask: None,
@@ -465,10 +472,9 @@ mod tests {
         let doc = PdfDocument::new_empty("1.7");
         let code = jpx_codestream(PALETTE).unwrap();
         let image = decode_image(&doc, &stream(code, "JPXDecode")).unwrap();
-        assert_eq!(
-            image.rgb,
-            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]
-        );
+        // Gray: a sample a pixel.
+        assert!(image.gray);
+        assert_eq!(image.rgb, [0, 1, 2, 3, 4, 5]);
         let hex: String = PALETTE.iter().map(|b| format!("{b:02x}")).collect();
         let mut stream = stream(format!("{hex}>").as_bytes(), "JPXDecode");
         stream.dictionary.insert(
@@ -518,7 +524,7 @@ mod tests {
             for x in 0..399 {
                 let black = reference[62 + (399 - y) * 52 + x / 8] & (128 >> (x % 8)) != 0;
                 assert_eq!(
-                    image.rgb[(y * 399 + x) * 3],
+                    image.rgb[y * 399 + x],
                     if black { 0 } else { 255 },
                     "at {x},{y}"
                 );

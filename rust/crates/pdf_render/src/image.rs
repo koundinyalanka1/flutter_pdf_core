@@ -34,8 +34,14 @@ fn image_pixel_count(width: usize, height: usize) -> Option<usize> {
 pub struct DecodedImage {
     pub width: usize,
     pub height: usize,
-    /// RGB triples, row-major, top-left origin. Empty for a stencil mask.
+    /// RGB triples, row-major, top-left origin — or, when [`Self::gray`] is
+    /// set, one gray sample a pixel. Empty for a stencil mask.
     pub rgb: Vec<u8>,
+    /// The samples are gray, one byte a pixel. A scanned book is gray or
+    /// black and white; held as RGB, a page's scan took three times the
+    /// memory — 70 MB rather than 23 for an Internet Archive page — and too
+    /// much to keep between renders.
+    pub gray: bool,
     /// Per-pixel alpha (0-255). Empty means fully opaque.
     pub alpha: Vec<u8>,
     /// True when this is a `/ImageMask` stencil: `alpha` selects where the
@@ -46,6 +52,22 @@ pub struct DecodedImage {
     /// fine as the colour it reveals; squeezed onto the colour's grid, every
     /// letter would blur. Applies on top of `alpha`.
     pub mask: Option<AlphaPlane>,
+}
+
+impl DecodedImage {
+    /// Bytes a pixel takes in `rgb`.
+    pub fn channels(&self) -> usize {
+        if self.gray {
+            1
+        } else {
+            3
+        }
+    }
+
+    /// Memory held by the decoded samples.
+    pub fn byte_size(&self) -> usize {
+        self.rgb.len() + self.alpha.len() + self.mask.as_ref().map_or(0, |mask| mask.data.len())
+    }
 }
 
 /// Per-pixel coverage, 0-255, row-major from the top left.
@@ -73,6 +95,9 @@ impl DecodedImage {
         }
         if self.is_stencil {
             return Some((Rgb::BLACK, alpha));
+        }
+        if self.gray {
+            return Some((Rgb::gray(f32::from(self.rgb[index]) / 255.0), alpha));
         }
         let offset = index * 3;
         Some((
@@ -437,16 +462,14 @@ fn decode_jpeg(
     image_pixel_count(w, h)?;
     let pixels = decoder.decode().ok()?;
 
+    let gray = matches!(
+        info.pixel_format,
+        jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::L16
+    );
     let rgb = match info.pixel_format {
-        jpeg_decoder::PixelFormat::RGB24 => pixels,
-        jpeg_decoder::PixelFormat::L8 => pixels.iter().flat_map(|&v| [v, v, v]).collect(),
-        jpeg_decoder::PixelFormat::L16 => pixels
-            .chunks_exact(2)
-            .flat_map(|c| {
-                let v = c[1]; // take the high byte
-                [v, v, v]
-            })
-            .collect(),
+        jpeg_decoder::PixelFormat::RGB24 | jpeg_decoder::PixelFormat::L8 => pixels,
+        // The high byte of each sample.
+        jpeg_decoder::PixelFormat::L16 => pixels.chunks_exact(2).map(|c| c[1]).collect(),
         jpeg_decoder::PixelFormat::CMYK32 => pixels
             .chunks_exact(4)
             .flat_map(|c| {
@@ -471,10 +494,7 @@ fn decode_jpeg(
     // Colour-key masking compares the samples as stored, which for a baseline
     // JPEG are its 8-bit components.
     let alpha = match (color_key, info.pixel_format) {
-        (Some(ranges), jpeg_decoder::PixelFormat::L8) => {
-            let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
-            key_alpha(&gray, 1, ranges)
-        }
+        (Some(ranges), jpeg_decoder::PixelFormat::L8) => key_alpha(&rgb, 1, ranges),
         (Some(ranges), jpeg_decoder::PixelFormat::RGB24) => key_alpha(&rgb, 3, ranges),
         _ => Vec::new(),
     };
@@ -482,6 +502,7 @@ fn decode_jpeg(
         width: w,
         height: h,
         rgb,
+        gray,
         alpha,
         is_stencil: false,
         mask: None,
@@ -543,10 +564,11 @@ fn decode_raw(
     // Colour-key masking (`/Mask` as `[min max ...]`): a pixel whose raw
     // samples all fall in their ranges is transparent (ISO 32000-1, 8.9.6.4).
     let key = color_key.filter(|ranges| !is_stencil && ranges.len() >= components * 2);
+    let gray = !is_stencil && matches!(space, ColorSpace::Gray);
     let mut rgb = if is_stencil {
         Vec::new()
     } else {
-        Vec::with_capacity(pixel_count.checked_mul(3)?)
+        Vec::with_capacity(pixel_count.checked_mul(if gray { 1 } else { 3 })?)
     };
     let mut alpha = if is_stencil || key.is_some() {
         Vec::with_capacity(pixel_count)
@@ -592,8 +614,10 @@ fn decode_raw(
                 };
                 let color = space.to_rgb(&pixel, index);
                 rgb.push((color.r.clamp(0.0, 1.0) * 255.0) as u8);
-                rgb.push((color.g.clamp(0.0, 1.0) * 255.0) as u8);
-                rgb.push((color.b.clamp(0.0, 1.0) * 255.0) as u8);
+                if !gray {
+                    rgb.push((color.g.clamp(0.0, 1.0) * 255.0) as u8);
+                    rgb.push((color.b.clamp(0.0, 1.0) * 255.0) as u8);
+                }
                 if key.is_some() {
                     alpha.push(if keyed { 0 } else { 255 });
                 }
@@ -605,6 +629,7 @@ fn decode_raw(
         width,
         height,
         rgb,
+        gray,
         alpha,
         is_stencil,
         mask: None,
@@ -636,7 +661,7 @@ fn apply_masks(
     // A soft mask overrides /Mask (ISO 32000-1, Table 89).
     if let Some(entry) = dict.get("SMask") {
         if let Some(mask) = decode_mask(entry).filter(|m| !m.rgb.is_empty()) {
-            let coverage = mask.rgb.iter().step_by(3).copied().collect();
+            let coverage = mask.rgb.iter().step_by(mask.channels()).copied().collect();
             attach_mask(image, mask.width, mask.height, coverage);
         }
         return;
@@ -647,7 +672,11 @@ fn apply_masks(
             mask.alpha
         } else {
             // Not marked /ImageMask, as the spec requires: read it as one.
-            mask.rgb.iter().step_by(3).map(|&gray| 255 - gray).collect()
+            mask.rgb
+                .iter()
+                .step_by(mask.channels())
+                .map(|&gray| 255 - gray)
+                .collect()
         };
         attach_mask(image, mask.width, mask.height, coverage);
     }
@@ -826,7 +855,7 @@ mod tests {
             .dictionary
             .insert("DecodeParms".into(), PdfObject::Dictionary(parms.clone()));
         let image = decode_image(&doc, &stream).unwrap();
-        assert_eq!(image.rgb, [255, 255, 255]);
+        assert_eq!(image.rgb, [255]);
 
         parms.insert("Rows".into(), PdfObject::Integer(0));
         assert_eq!(ccitt_params(&doc, Some(&parms), 1, 1).unwrap().rows, 1);
@@ -849,7 +878,7 @@ mod tests {
             panic!()
         };
         let image = decode_image(&doc, stream).unwrap();
-        assert_eq!(image.rgb, [80, 80, 80]);
+        assert_eq!(image.rgb, [80]);
         assert!(image.alpha.is_empty());
     }
 
@@ -964,8 +993,10 @@ mod tests {
         let space = ColorSpace::Gray;
         let data = vec![0x00, 0x80, 0xFF];
         let image = decode_raw(&data, 3, 1, 8, &space, None, false, None).unwrap();
-        assert_eq!(&image.rgb[0..3], &[0, 0, 0]);
-        assert_eq!(&image.rgb[6..9], &[255, 255, 255]);
+        // One byte a pixel, and sampled back as gray.
+        assert!(image.gray);
+        assert_eq!(image.rgb, [0, 128, 255]);
+        assert_eq!(image.sample(1, 0).unwrap().0, Rgb::gray(128.0 / 255.0));
     }
 
     #[test]

@@ -23,6 +23,8 @@
 
 #[path = "page_annotations.rs"]
 mod annotations;
+#[path = "page_bands.rs"]
+mod bands;
 #[path = "page_forms.rs"]
 mod forms;
 #[path = "page_images.rs"]
@@ -40,12 +42,13 @@ mod text;
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use pdf_core::document::PdfDocument;
 use pdf_core::error::{PdfError, Result};
 use pdf_core::object::{Dictionary, ObjectId, PdfObject};
 use pdf_ops::page_tree::effective_page_dict;
-use pdf_text::content_stream::{parse_content, Operation};
+use pdf_text::content_stream::{parse_content, Content, ContentOp, Operand};
 
 use crate::canvas::{stroke_outline, BlendMode, Canvas, ClipMask, Rgb};
 use crate::font::RenderFont;
@@ -74,6 +77,11 @@ pub struct RenderOptions {
     /// full-page bitmap of hundreds of megapixels; `max_pixels` then bounds
     /// the region rather than the page. Clipped to the page.
     pub region: Option<PixelRegion>,
+    /// Threads to draw with, the caller's among them: the page is cut into
+    /// horizontal bands drawn side by side. 0 uses the device's cores (up
+    /// to 4) for renders large enough to gain from them; 1 draws on the
+    /// calling thread alone.
+    pub threads: usize,
 }
 
 /// A rectangle of a rendered page, in its output pixels.
@@ -92,6 +100,7 @@ impl Default for RenderOptions {
             background: Rgb::new(1.0, 1.0, 1.0),
             max_pixels: 32_000_000,
             region: None,
+            threads: 0,
         }
     }
 }
@@ -151,9 +160,6 @@ pub fn render_page(
     };
     let (out_w, out_h) = (region.width as usize, region.height as usize);
 
-    let mut canvas = Canvas::new(out_w, out_h);
-    canvas.fill_background(options.background);
-
     // PDF user space is y-up with the origin at the crop box's lower-left;
     // the canvas is y-down from the top-left. Translate, flip, then rotate.
     let flip = Matrix::new(1.0, 0.0, 0.0, -1.0, -box_rect.0, box_rect.3);
@@ -164,29 +170,39 @@ pub fn render_page(
         _ => Matrix::IDENTITY,
     };
     let device_scale = Matrix::scale(page_px_w as f64 / display_w, page_px_h as f64 / display_h);
-    // A region is the same page shifted so the region's corner is the origin.
-    let base_ctm = flip
-        .then(&rotation)
-        .then(&device_scale)
-        .then(&Matrix::translate(
-            -f64::from(region.x),
-            -f64::from(region.y),
-        ));
+    // A region, or a band of one, is the same page shifted so its corner is
+    // the origin.
+    let page_ctm = flip.then(&rotation).then(&device_scale);
 
     let resources = page
         .get("Resources")
         .map(|o| doc.resolve_value(o))
         .and_then(|o| doc.resolve_dict(&o).cloned())
         .unwrap_or_default();
-    let content = page_content(doc, &page)?;
+    // A document the app keeps open keeps what its renders derive from it:
+    // the next render of this page, zoomed in further, parses nothing and
+    // decodes no image again. Otherwise the bands of this render share it.
+    let kept = doc.derived.get_or_init(bands::Shared::default);
+    let fresh;
+    let shared = match &kept {
+        Some(shared) => shared.as_ref(),
+        None => {
+            fresh = bands::Shared::default();
+            &fresh
+        }
+    };
+    let parsed = shared
+        .page(page_id, || Some(ParsedPage::load(doc, &page)))
+        .ok_or_else(|| PdfError::Structure("page content could not be read".into()))?;
 
     // Every content stream failed to decode, so there is nothing to draw and
     // no honest way to call the result a render. Returning white pixels here
     // is what made unsupported filters look like empty documents; the caller
     // needs the reason so it can say what actually went wrong.
-    if content.streams > 0 && content.failed == content.streams {
-        let reason = content
+    if parsed.streams > 0 && parsed.failed == parsed.streams {
+        let reason = parsed
             .first_error
+            .clone()
             .unwrap_or_else(|| "content stream could not be decoded".to_owned());
         return Err(PdfError::Filter(format!(
             "page {} has no decodable content: {reason}",
@@ -194,35 +210,21 @@ pub fn render_page(
         )));
     }
 
-    let mut renderer = Renderer {
+    let frame = bands::Frame {
         doc,
-        canvas: &mut canvas,
-        fonts: HashMap::new(),
-        tint_transforms: HashMap::new(),
-        depth: 0,
-        pattern_pixels: 0.0,
-        temporary_bytes: 0,
-        mask_allocations: Vec::new(),
-        temporary_limit: limits::MAX_TEMPORARY_BYTES,
-        render_stopped: false,
-        warnings: doc.recovery_warnings.clone(),
-        visible: true,
-        type3_depth: 0,
+        page: &page,
+        resources: &resources,
+        content: &parsed.content,
+        recent: bands::Recent::default(),
+        page_ctm,
+        background: options.background,
+        shared,
     };
-    let mut state = GraphicsState::new(base_ctm);
-    // Parsing recovers from damage rather than failing, so this only errors
-    // in cases the renderer genuinely cannot proceed from; the page
-    // background is still a better answer than no page at all.
-    let _ = renderer.run(&content.data, &resources, &mut state);
-
-    renderer.configure_canvas(&GraphicsState::new(base_ctm));
-    renderer.draw_annotations(&page, &resources, base_ctm);
-
-    let mut warnings = renderer.warnings;
-    if content.failed > 0 {
+    let (pixels, mut warnings) = frame.draw_region(region, bands::worker_count(options.threads));
+    if parsed.failed > 0 {
         warnings.push(format!(
             "{} of {} content streams could not be decoded",
-            content.failed, content.streams
+            parsed.failed, parsed.streams
         ));
     }
     warnings.sort();
@@ -231,7 +233,7 @@ pub fn render_page(
     Ok(RenderedPage {
         width: out_w as u32,
         height: out_h as u32,
-        pixels: canvas.pixels,
+        pixels,
         warnings,
     })
 }
@@ -385,7 +387,10 @@ struct GraphicsState {
     soft_mask: ClipMask,
     alpha_is_shape: bool,
     clip: ClipMask,
-    font: Option<Rc<RenderFont>>,
+    /// The clip's bounding box in pixels of the whole rendered page, the same
+    /// in every band of it, where `clip` only covers the band.
+    clip_bounds: Option<(f64, f64, f64, f64)>,
+    font: Option<Arc<RenderFont>>,
     font_size: f64,
     char_spacing: f64,
     word_spacing: f64,
@@ -439,6 +444,7 @@ impl GraphicsState {
             soft_mask: None,
             alpha_is_shape: false,
             clip: None,
+            clip_bounds: None,
             font: None,
             font_size: 0.0,
             char_spacing: 0.0,
@@ -457,19 +463,27 @@ impl GraphicsState {
 /// The outer scope's name-keyed caches, held while a nested content stream
 /// runs with its own resources.
 struct ResourceScope {
-    fonts: HashMap<String, Rc<RenderFont>>,
+    fonts: HashMap<String, Arc<RenderFont>>,
     tint_transforms: HashMap<String, Option<Rc<TintTransform>>>,
 }
 
 struct Renderer<'a> {
     doc: &'a PdfDocument,
     canvas: &'a mut Canvas,
-    fonts: HashMap<String, Rc<RenderFont>>,
+    /// Fonts and images shared with the other bands of the same render.
+    shared: &'a bands::Shared,
+    /// The images this render used last, kept for its bands.
+    recent: &'a bands::Recent,
+    fonts: HashMap<String, Arc<RenderFont>>,
     /// Tint transforms by `/ColorSpace` resource name; `None` records a space
     /// that needs none, so it is not re-examined on every `cs`.
     tint_transforms: HashMap<String, Option<Rc<TintTransform>>>,
     depth: usize,
     pattern_pixels: f64,
+    /// This renderer's canvas within the whole rendered page: where its
+    /// band starts, and the region of the page all the bands make up.
+    origin: (f64, f64),
+    region: (f64, f64, f64, f64),
     temporary_bytes: usize,
     mask_allocations: Vec<std::rc::Weak<crate::canvas::Mask>>,
     temporary_limit: usize,
@@ -502,13 +516,12 @@ impl Renderer<'_> {
         self.warnings.push(message);
     }
 
-    fn run(
+    fn run_operations(
         &mut self,
-        content: &[u8],
+        content: &Content,
         resources: &Dictionary,
         state: &mut GraphicsState,
     ) -> Result<()> {
-        let operations = parse_content(content)?;
         let mut stack: Vec<GraphicsState> = Vec::new();
         let mut skipped_saves = 0usize;
         let mut path = Path::with_tolerance(0.25);
@@ -518,12 +531,12 @@ impl Renderer<'_> {
         let inherited_visibility = self.visible;
         let mut marked_visibility = Vec::new();
 
-        for (operation_index, op) in operations.iter().enumerate() {
+        for (operation_index, op) in content.iter().enumerate() {
             if self.render_stopped {
                 break;
             }
             if skipped_saves != 0 {
-                match op.operator.as_str() {
+                match op.operator {
                     "q" => skipped_saves += 1,
                     "Q" => skipped_saves -= 1,
                     _ => {}
@@ -533,11 +546,11 @@ impl Renderer<'_> {
             // Inside an uncoloured (d1) Type3 glyph the colour belongs to the
             // text being shown, so the glyph's own colour operators are
             // ignored (ISO 32000-1, 9.6.5) — it is a stencil, not a picture.
-            if state.color_locked && is_color_operator(&op.operator) {
+            if state.color_locked && is_color_operator(op.operator) {
                 continue;
             }
-            let n = |i: usize| number(op, i);
-            match op.operator.as_str() {
+            let n = |i: usize| op.operands.number(i).unwrap_or(0.0);
+            match op.operator {
                 // -- Type3 glyph metrics ---------------------------------------
                 // `d0` declares a coloured glyph, `d1` an uncoloured one. Both
                 // also give the advance, which /Widths already supplied.
@@ -567,8 +580,12 @@ impl Renderer<'_> {
                 "w" => state.line_width = n(0),
                 "J" => state.line_cap = n(0) as i64,
                 "j" => state.line_join = n(0) as i64,
-                "d" => self.set_dash(&op.operands, state),
-                "gs" => self.apply_ext_gstate(op, resources, state),
+                "d" => {
+                    let values: Vec<PdfObject> =
+                        op.operands.iter().map(Operand::to_object).collect();
+                    self.set_dash(&values, state)
+                }
+                "gs" => self.apply_ext_gstate(&op, resources, state),
 
                 // -- path construction ---------------------------------------
                 "m" => path.move_to(n(0), n(1)),
@@ -590,8 +607,8 @@ impl Renderer<'_> {
 
                 // -- path painting --------------------------------------------
                 "n" | "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" => {
-                    self.paint(&op.operator, &mut path, resources, state, &mut pending_clip);
-                    path = Path::with_tolerance(0.25);
+                    self.paint(op.operator, &mut path, resources, state, &mut pending_clip);
+                    path.clear();
                 }
 
                 // -- colour ----------------------------------------------------
@@ -639,9 +656,9 @@ impl Renderer<'_> {
                     state.stroke_components = 4;
                 }
                 "cs" | "CS" => {
-                    let components = self.space_components(op, resources);
-                    let pattern = self.is_pattern_space(op, resources);
-                    let tint = self.space_tint_transform(op, resources);
+                    let components = self.space_components(&op, resources);
+                    let pattern = self.is_pattern_space(&op, resources);
+                    let tint = self.space_tint_transform(&op, resources);
                     // Setting a space resets the colour to its initial value,
                     // which is black in every device and CIE space.
                     let black = Rgb::BLACK;
@@ -664,14 +681,14 @@ impl Renderer<'_> {
                     let pattern = op
                         .operands
                         .last()
-                        .and_then(PdfObject::as_name)
+                        .and_then(Operand::as_name)
                         .map(str::to_owned);
                     if is_fill {
                         state.fill_pattern = pattern;
                     } else {
                         state.stroke_pattern = pattern;
                     }
-                    let values: Vec<f64> = op.operands.iter().filter_map(as_number).collect();
+                    let values: Vec<f64> = op.operands.iter().filter_map(Operand::number).collect();
                     let tint = if is_fill {
                         state.fill_tint.as_ref()
                     } else {
@@ -702,15 +719,18 @@ impl Renderer<'_> {
                     state.text_matrix = Matrix::IDENTITY;
                     state.line_matrix = Matrix::IDENTITY;
                     // Opaque Normal text needs no offscreen buffer. A gs in
-                    // the object may change transparency after its first
+                    // the object may make it transparent after its first
                     // glyph, so retain the original backdrop in that case.
-                    let changes_graphics_state = operations[operation_index + 1..]
-                        .iter()
-                        .take_while(|operation| !matches!(operation.operator.as_str(), "BT" | "ET"))
-                        .any(|operation| operation.operator == "gs");
-                    if state.text_knockout
-                        && (self.text_needs_group(state) || changes_graphics_state)
-                    {
+                    // AutoCAD repeats an opaque gs in every text object, and
+                    // a page-sized buffer for each made a plan take seconds.
+                    let turns_transparent = (operation_index + 1..content.len())
+                        .filter_map(|index| content.get(index))
+                        .take_while(|operation| !matches!(operation.operator, "BT" | "ET"))
+                        .any(|operation| {
+                            operation.operator == "gs"
+                                && self.ext_gstate_adds_transparency(&operation, resources)
+                        });
+                    if state.text_knockout && (self.text_needs_group(state) || turns_transparent) {
                         text_group = self.begin_text_group(state);
                     }
                 }
@@ -724,7 +744,7 @@ impl Renderer<'_> {
                 }
                 "Tf" => {
                     state.font_size = n(1);
-                    if let Some(PdfObject::Name(name)) = op.operands.first() {
+                    if let Some(name) = op.operands.first().and_then(Operand::as_name) {
                         state.font = self.load_font(name, resources);
                     }
                 }
@@ -750,12 +770,12 @@ impl Renderer<'_> {
                 "Tz" => state.horizontal_scale = n(0) / 100.0,
                 "Ts" => state.rise = n(0),
                 "Tr" => {
-                    state.render_mode = op.operands.first().and_then(PdfObject::as_i64).unwrap_or(0)
+                    state.render_mode = op.operands.first().and_then(Operand::as_i64).unwrap_or(0)
                 }
                 "Tj" => {
-                    if let Some(bytes) = string_operand(op, 0) {
+                    if let Some(bytes) = string_operand(&op, 0) {
                         self.show_text(
-                            &bytes,
+                            bytes,
                             resources,
                             state,
                             &mut text_clip,
@@ -765,9 +785,9 @@ impl Renderer<'_> {
                 }
                 "'" => {
                     next_line(state);
-                    if let Some(bytes) = string_operand(op, 0) {
+                    if let Some(bytes) = string_operand(&op, 0) {
                         self.show_text(
-                            &bytes,
+                            bytes,
                             resources,
                             state,
                             &mut text_clip,
@@ -779,9 +799,9 @@ impl Renderer<'_> {
                     state.word_spacing = n(0);
                     state.char_spacing = n(1);
                     next_line(state);
-                    if let Some(bytes) = string_operand(op, 2) {
+                    if let Some(bytes) = string_operand(&op, 2) {
                         self.show_text(
-                            &bytes,
+                            bytes,
                             resources,
                             state,
                             &mut text_clip,
@@ -790,7 +810,9 @@ impl Renderer<'_> {
                     }
                 }
                 "TJ" => {
-                    if let Some(PdfObject::Array(items)) = op.operands.first() {
+                    if let Some(PdfObject::Array(items)) =
+                        op.operands.first().and_then(Operand::object)
+                    {
                         for item in items {
                             match item {
                                 PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => {
@@ -826,13 +848,13 @@ impl Renderer<'_> {
 
                 // -- XObjects ---------------------------------------------------
                 "Do" => {
-                    if let Some(PdfObject::Name(name)) = op.operands.first() {
+                    if let Some(name) = op.operands.first().and_then(Operand::as_name) {
                         self.draw_xobject(name, resources, state);
                     }
                 }
 
                 "sh" if self.visible => {
-                    if let Some(name) = op.operands.first().and_then(PdfObject::as_name) {
+                    if let Some(name) = op.operands.first().and_then(Operand::as_name) {
                         if let Some(shading) = self.resource_object(resources, "Shading", name) {
                             self.draw_shading(&shading, resources, state, false);
                         } else {
@@ -841,10 +863,12 @@ impl Renderer<'_> {
                     }
                 }
                 "BI" => {
-                    if let Some(PdfObject::Stream(stream)) = op.operands.first() {
+                    if let Some(PdfObject::Stream(stream)) =
+                        op.operands.first().and_then(Operand::object)
+                    {
                         let mut stream = stream.clone();
                         self.resolve_inline_color_space(&mut stream, resources);
-                        self.draw_image(&stream, state);
+                        self.draw_image(&stream, state, None);
                     } else {
                         self.warn("inline image skipped: malformed or truncated image data");
                     }
@@ -853,17 +877,17 @@ impl Renderer<'_> {
                 "BMC" | "BDC" => {
                     marked_visibility.push(self.visible);
                     if op.operator == "BDC"
-                        && op.operands.first().and_then(PdfObject::as_name) == Some("OC")
+                        && op.operands.first().and_then(Operand::as_name) == Some("OC")
                     {
                         let property = op.operands.get(1).and_then(|value| {
-                            if let PdfObject::Name(name) = value {
+                            if let Some(name) = value.as_name() {
                                 resources
                                     .get("Properties")
                                     .and_then(|v| self.doc.resolve_dict(v))
                                     .and_then(|d| d.get(name))
                                     .cloned()
                             } else {
-                                Some(value.clone())
+                                Some(value.to_object())
                             }
                         });
                         if let Some(property) = property {
@@ -900,17 +924,24 @@ impl Renderer<'_> {
         if operator.starts_with('b') || operator == "s" {
             path.close();
         }
-        let device = path.transform(&state.ctm);
-
         let fills = matches!(operator, "f" | "F" | "f*" | "B" | "B*" | "b" | "b*");
         let strokes = matches!(operator, "S" | "s" | "B" | "B*" | "b" | "b*");
+        let reach = if strokes { stroke_reach(state) } else { 0.0 };
+        // Judged from the corners of the path's own bounds, so a path off the
+        // canvas is not even transformed.
+        let shows = !self.off_canvas_box(path, &state.ctm, reach);
+        if !shows && pending_clip.is_none() {
+            return;
+        }
+        let device = path.transform(&state.ctm);
+
         let rule = if operator.ends_with('*') {
             FillRule::EvenOdd
         } else {
             FillRule::NonZero
         };
 
-        if fills && self.visible && !device.is_empty() && !state.fill_marks_nothing() {
+        if fills && shows && self.visible && !device.is_empty() && !state.fill_marks_nothing() {
             // A filled rectangle on its own — a table border, an underline, a
             // cell background — lands on whole pixels, as PDFium and
             // Acrobat draw it.
@@ -932,7 +963,7 @@ impl Renderer<'_> {
                 state,
             );
         }
-        if strokes && self.visible && !device.is_empty() && !state.stroke_marks_nothing() {
+        if strokes && shows && self.visible && !device.is_empty() && !state.stroke_marks_nothing() {
             self.paint_stroke(path, resources, state, true);
         }
 
@@ -952,11 +983,11 @@ impl Renderer<'_> {
 
     fn apply_ext_gstate(
         &mut self,
-        op: &Operation,
+        op: &ContentOp,
         resources: &Dictionary,
         state: &mut GraphicsState,
     ) {
-        let Some(PdfObject::Name(name)) = op.operands.first() else {
+        let Some(name) = op.operands.first().and_then(Operand::as_name) else {
             return;
         };
         let Some(dict) = self.resource(resources, "ExtGState", name) else {
@@ -985,16 +1016,7 @@ impl Renderer<'_> {
             state.stroke_alpha = value.clamp(0.0, 1.0) as f32;
         }
         if let Some(mode) = dict.get("BM").map(|v| self.doc.resolve_value(v)) {
-            let selected = match mode {
-                PdfObject::Name(name) => BlendMode::from_name(&name),
-                PdfObject::Array(items) => items.iter().find_map(|v| {
-                    self.doc
-                        .resolve_value(v)
-                        .as_name()
-                        .and_then(BlendMode::from_name)
-                }),
-                _ => None,
-            };
+            let selected = self.blend_mode(mode);
             state.blend_mode = selected.unwrap_or(BlendMode::Normal);
             if selected.is_none() {
                 self.warn("unknown blend mode; Normal is used");
@@ -1037,15 +1059,134 @@ impl Renderer<'_> {
                     .as_ref()
                     .and_then(as_number),
             ) {
-                state.font = Some(Rc::new(RenderFont::load(doc, font)));
+                state.font = Some(Arc::new(RenderFont::load(doc, font)));
                 state.font_size = size;
             }
         }
     }
 
-    fn space_components(&self, op: &Operation, resources: &Dictionary) -> usize {
-        match op.operands.first() {
-            Some(PdfObject::Name(name)) => match name.as_str() {
+    /// Whether painting `device` (a path in device space) can change no pixel:
+    /// its bounds, grown by `reach` for a stroke, lie wholly off the canvas.
+    /// A region of a zoomed-in page then pays for what is in it, not for
+    /// every path on the page — a plan with 150,000 strokes took as long for
+    /// a corner as for the whole sheet.
+    pub(super) fn off_canvas(&self, device: &Path, reach: f64) -> bool {
+        device
+            .bounds()
+            .is_some_and(|bounds| self.bounds_off_canvas(bounds, reach))
+    }
+
+    /// [`Renderer::off_canvas`] for device-space bounds.
+    fn bounds_off_canvas(&self, (x0, y0, x1, y1): (f64, f64, f64, f64), reach: f64) -> bool {
+        if ![x0, y0, x1, y1, reach].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        // Anti-aliasing and snapping to whole pixels reach a little further.
+        let reach = reach + 2.0;
+        x1 + reach < 0.0
+            || y1 + reach < 0.0
+            || x0 - reach > self.canvas.width as f64
+            || y0 - reach > self.canvas.height as f64
+    }
+
+    /// Whether a glyph advancing `advance` (text space) lies so far off the
+    /// canvas that none of it can show, judged from a box four ems around it
+    /// — further than any real glyph strays from its origin — before its
+    /// outline is built. Most glyphs of a page are off a zoomed-in region,
+    /// or off a band. Text that clips needs every outline, so it never is.
+    fn glyph_off_canvas(&self, state: &GraphicsState, advance: f64) -> bool {
+        if state.render_mode >= 4 {
+            return false;
+        }
+        let em = 4.0
+            * state
+                .font_size
+                .abs()
+                .max((state.font_size * state.horizontal_scale).abs());
+        if !(em.is_finite() && em > 0.0) {
+            return false;
+        }
+        let matrix = state.text_matrix.then(&state.ctm);
+        let (x0, x1) = (advance.min(0.0) - em, advance.max(0.0) + em);
+        let (y0, y1) = (state.rise - em, state.rise + em);
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| matrix.apply(x, y));
+        let (mut left, mut top) = (f64::INFINITY, f64::INFINITY);
+        let (mut right, mut bottom) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (x, y) in corners {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+        let reach = if matches!(state.render_mode, 1 | 2) {
+            stroke_reach(state)
+        } else {
+            0.0
+        };
+        self.bounds_off_canvas((left, top, right, bottom), reach)
+    }
+
+    /// [`Renderer::off_canvas`] for `path` (user space) drawn through `ctm`,
+    /// judged from the corners of its bounds without transforming it.
+    fn off_canvas_box(&self, path: &Path, ctm: &Matrix, reach: f64) -> bool {
+        let Some((x0, y0, x1, y1)) = path.bounds() else {
+            return false;
+        };
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| ctm.apply(x, y));
+        let (mut left, mut top) = (f64::INFINITY, f64::INFINITY);
+        let (mut right, mut bottom) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (x, y) in corners {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+        self.bounds_off_canvas((left, top, right, bottom), reach)
+    }
+
+    /// The blend mode a `/BM` value selects: a name, or the first name in an
+    /// array this renderer knows.
+    fn blend_mode(&self, mode: PdfObject) -> Option<BlendMode> {
+        match mode {
+            PdfObject::Name(name) => BlendMode::from_name(&name),
+            PdfObject::Array(items) => items.iter().find_map(|v| {
+                self.doc
+                    .resolve_value(v)
+                    .as_name()
+                    .and_then(BlendMode::from_name)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the graphics state a `gs` names can make what follows
+    /// transparent: an alpha below 1, a blend mode other than Normal, or a
+    /// soft mask.
+    fn ext_gstate_adds_transparency(&self, op: &ContentOp, resources: &Dictionary) -> bool {
+        let Some(name) = op.operands.first().and_then(Operand::as_name) else {
+            return false;
+        };
+        let Some(dict) = self.resource(resources, "ExtGState", name) else {
+            return false;
+        };
+        let value = |key: &str| dict.get(key).map(|v| self.doc.resolve_value(v));
+        let below_one = |key: &str| {
+            value(key)
+                .as_ref()
+                .and_then(as_number)
+                .is_some_and(|alpha| alpha < 1.0)
+        };
+        below_one("ca")
+            || below_one("CA")
+            || value("BM")
+                .and_then(|mode| self.blend_mode(mode))
+                .is_some_and(|mode| mode != BlendMode::Normal)
+            || value("SMask").is_some_and(|mask| mask.as_name() != Some("None"))
+    }
+
+    fn space_components(&self, op: &ContentOp, resources: &Dictionary) -> usize {
+        match op.operands.first().and_then(Operand::as_name) {
+            Some(name) => match name {
                 "DeviceGray" | "G" | "CalGray" | "Pattern" => 1,
                 "DeviceCMYK" | "CMYK" => 4,
                 "DeviceRGB" | "RGB" | "CalRGB" => 3,
@@ -1081,14 +1222,14 @@ impl Renderer<'_> {
     /// times.
     fn space_tint_transform(
         &mut self,
-        op: &Operation,
+        op: &ContentOp,
         resources: &Dictionary,
     ) -> Option<Rc<TintTransform>> {
-        let Some(PdfObject::Name(name)) = op.operands.first() else {
+        let Some(name) = op.operands.first().and_then(Operand::as_name) else {
             return None;
         };
         if matches!(
-            name.as_str(),
+            name,
             "DeviceGray"
                 | "G"
                 | "CalGray"
@@ -1101,25 +1242,29 @@ impl Renderer<'_> {
         ) {
             return None;
         }
-        if let Some(cached) = self.tint_transforms.get(name.as_str()) {
+        if let Some(cached) = self.tint_transforms.get(name) {
             return cached.clone();
         }
         let loaded = self
             .resource_object(resources, "ColorSpace", name)
             .and_then(|object| TintTransform::load(self.doc, &object))
             .map(Rc::new);
-        self.tint_transforms.insert(name.clone(), loaded.clone());
+        self.tint_transforms.insert(name.to_owned(), loaded.clone());
         loaded
     }
 
-    fn load_font(&mut self, name: &str, resources: &Dictionary) -> Option<Rc<RenderFont>> {
+    fn load_font(&mut self, name: &str, resources: &Dictionary) -> Option<Arc<RenderFont>> {
         // Cache per resource name — a page typically reuses a handful.
         if let Some(font) = self.fonts.get(name) {
-            return Some(Rc::clone(font));
+            return Some(Arc::clone(font));
         }
         let dict = self.resource(resources, "Font", name)?;
-        let font = Rc::new(RenderFont::load(self.doc, &dict));
-        self.fonts.insert(name.to_owned(), Rc::clone(&font));
+        // A font object is loaded once for all the bands of a render.
+        let font = match self.resource_id(resources, "Font", name) {
+            Some(id) => self.shared.font(id, || RenderFont::load(self.doc, &dict)),
+            None => Arc::new(RenderFont::load(self.doc, &dict)),
+        };
+        self.fonts.insert(name.to_owned(), Arc::clone(&font));
         Some(font)
     }
 
@@ -1169,7 +1314,10 @@ impl Renderer<'_> {
                         self.draw_type3_glyph(procedure, glyph_resources, glyph_ctm, state);
                     }
                 }
-            } else if !invisible && font.can_draw_glyphs() {
+            } else if !invisible
+                && font.can_draw_glyphs()
+                && !self.glyph_off_canvas(state, width * state.font_size * state.horizontal_scale)
+            {
                 if let Some(outline) = font.outline(code) {
                     // Glyph space -> text space -> user space -> device.
                     let scale = Matrix::scale(
@@ -1228,7 +1376,7 @@ impl Renderer<'_> {
     /// changes do not leak into the text that follows.
     fn draw_type3_glyph(
         &mut self,
-        procedure: &pdf_core::stream::PdfStream,
+        procedure: &crate::font::Type3Procedure,
         resources: &Dictionary,
         glyph_ctm: Matrix,
         state: &GraphicsState,
@@ -1237,7 +1385,8 @@ impl Renderer<'_> {
             self.warn("Type3 glyph skipped: recursive content exceeds renderer limit");
             return;
         }
-        let Ok(data) = self.doc.stream_data(procedure) else {
+        // Parsed the first time the glyph is drawn, then kept with the font.
+        let Some(content) = procedure.content(self.doc) else {
             self.warn("Type3 glyph skipped: its procedure cannot be decoded");
             return;
         };
@@ -1247,7 +1396,7 @@ impl Renderer<'_> {
         let outer = self.enter_resource_scope();
         self.depth += 1;
         self.type3_depth += 1;
-        if self.run(&data, resources, &mut inner).is_err() {
+        if self.run_operations(content, resources, &mut inner).is_err() {
             self.warn("Type3 glyph skipped: malformed procedure");
         }
         self.type3_depth -= 1;
@@ -1284,8 +1433,14 @@ impl Renderer<'_> {
             .unwrap_or("");
 
         match subtype {
-            "Image" => self.draw_image(&stream, state),
-            "Form" => self.draw_form(&stream, resources, state),
+            "Image" => {
+                let id = self.resource_id(resources, "XObject", name);
+                self.draw_image(&stream, state, id);
+            }
+            "Form" => {
+                let id = self.resource_id(resources, "XObject", name);
+                self.draw_form(&stream, resources, state, id);
+            }
             _ => {}
         }
     }
@@ -1293,6 +1448,15 @@ impl Renderer<'_> {
     fn resource(&self, resources: &Dictionary, category: &str, name: &str) -> Option<Dictionary> {
         let object = self.resource_object(resources, category, name)?;
         self.doc.resolve_dict(&object).cloned()
+    }
+
+    /// The object a named resource refers to, when it is a reference.
+    fn resource_id(&self, resources: &Dictionary, category: &str, name: &str) -> Option<ObjectId> {
+        let group = self.doc.resolve_value(resources.get(category)?);
+        match self.doc.resolve_dict(&group)?.get(name)? {
+            PdfObject::Reference(id) => Some(*id),
+            _ => None,
+        }
     }
 
     fn resource_object(
@@ -1360,6 +1524,21 @@ fn axis_aligned_rect(path: &Path) -> Option<(f64, f64, f64, f64)> {
     Some((left, top, right, bottom))
 }
 
+/// How far, in device pixels, a stroke can reach from its path: half its
+/// width (never under a pixel wide), further at mitred corners and square
+/// caps.
+fn stroke_reach(state: &GraphicsState) -> f64 {
+    let ctm = &state.ctm;
+    let scale = ctm.a.hypot(ctm.b).max(ctm.c.hypot(ctm.d));
+    let half = (state.line_width.abs() * scale).max(1.0) / 2.0;
+    let corner = if state.line_join == 0 {
+        state.miter_limit.max(std::f64::consts::SQRT_2)
+    } else {
+        std::f64::consts::SQRT_2
+    };
+    half * corner
+}
+
 /// A filled rectangle on whole pixels, as Acrobat draws it: its size rounded
 /// to the nearest whole number of pixels (never none), centred where it was.
 /// A sliver that would anti-alias to a faint grey line becomes one solid
@@ -1373,7 +1552,10 @@ fn snap_rect_fill(path: &Path) -> Option<Path> {
     }
     let snap = |low: f64, high: f64| {
         let size = (high - low).round().max(1.0);
-        let start = ((low + high) / 2.0 - size / 2.0).round();
+        // Halves round up, not away from zero, so a band or region of the
+        // page — shifted by whole pixels, often to negative coordinates —
+        // snaps exactly as the whole page does.
+        let start = ((low + high) / 2.0 - size / 2.0 + 0.5).floor();
         (start, start + size)
     };
     let (x0, x1) = snap(left, right);
@@ -1541,6 +1723,31 @@ fn image_codec_name(doc: &PdfDocument, stream: &pdf_core::stream::PdfStream) -> 
 }
 
 /// A page's concatenated content streams, plus what it cost to get them.
+/// A page's content streams decoded, joined and parsed: what every render of
+/// the page starts from, kept with the document when it may be.
+struct ParsedPage {
+    content: Content,
+    /// How many content streams were present, and how many would not decode.
+    streams: usize,
+    failed: usize,
+    /// Why the first failure happened, for the error message.
+    first_error: Option<String>,
+}
+
+impl ParsedPage {
+    fn load(doc: &PdfDocument, page: &Dictionary) -> Self {
+        // Parsing recovers from damage rather than failing; whatever it can
+        // make of the content is drawn, with the annotations over it.
+        let raw = page_content(doc, page);
+        Self {
+            content: Content::parse(&raw.data),
+            streams: raw.streams,
+            failed: raw.failed,
+            first_error: raw.first_error,
+        }
+    }
+}
+
 struct PageContent {
     data: Vec<u8>,
     /// How many content streams were present, and how many would not decode.
@@ -1550,7 +1757,7 @@ struct PageContent {
     first_error: Option<String>,
 }
 
-fn page_content(doc: &PdfDocument, page: &Dictionary) -> Result<PageContent> {
+fn page_content(doc: &PdfDocument, page: &Dictionary) -> PageContent {
     let mut content = PageContent {
         data: Vec::new(),
         streams: 0,
@@ -1558,7 +1765,7 @@ fn page_content(doc: &PdfDocument, page: &Dictionary) -> Result<PageContent> {
         first_error: None,
     };
     let Some(entry) = page.get("Contents") else {
-        return Ok(content);
+        return content;
     };
 
     let take = |content: &mut PageContent, stream: &pdf_core::stream::PdfStream| {
@@ -1588,7 +1795,7 @@ fn page_content(doc: &PdfDocument, page: &Dictionary) -> Result<PageContent> {
         }
         _ => {}
     }
-    Ok(content)
+    content
 }
 
 fn rect(doc: &PdfDocument, page: &Dictionary, key: &str) -> Option<(f64, f64, f64, f64)> {
@@ -1615,10 +1822,6 @@ fn array_rect(doc: &PdfDocument, dict: &Dictionary, key: &str) -> Option<(f64, f
     ))
 }
 
-fn number(op: &Operation, index: usize) -> f64 {
-    op.operands.get(index).and_then(as_number).unwrap_or(0.0)
-}
-
 fn as_number(object: &PdfObject) -> Option<f64> {
     match object {
         PdfObject::Integer(v) => Some(*v as f64),
@@ -1627,9 +1830,9 @@ fn as_number(object: &PdfObject) -> Option<f64> {
     }
 }
 
-fn string_operand(op: &Operation, index: usize) -> Option<Vec<u8>> {
-    match op.operands.get(index)? {
-        PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => Some(bytes.clone()),
+fn string_operand<'a>(op: &ContentOp<'a>, index: usize) -> Option<&'a [u8]> {
+    match op.operands.get(index)?.object()? {
+        PdfObject::LiteralString(bytes) | PdfObject::HexString(bytes) => Some(bytes),
         _ => None,
     }
 }

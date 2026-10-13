@@ -5,11 +5,14 @@ use crate::canvas::{luminosity, BlendColorSpace, Mask};
 use pdf_core::stream::PdfStream;
 
 impl Renderer<'_> {
+    /// Draw a form XObject; `id`, when it has one, keys its parsed content
+    /// in the cache shared with the render's other bands and later renders.
     pub(super) fn draw_form(
         &mut self,
         stream: &PdfStream,
         resources: &Dictionary,
         state: &GraphicsState,
+        id: Option<ObjectId>,
     ) {
         if self.depth >= 12 {
             self.warn("form skipped: recursive content exceeds renderer limit");
@@ -21,7 +24,13 @@ impl Renderer<'_> {
         if let Some(bbox) = array_rect(self.doc, &stream.dictionary, "BBox") {
             let mut p = Path::new();
             p.rect(bbox.0, bbox.1, bbox.2 - bbox.0, bbox.3 - bbox.1);
-            self.clip_path(&p.transform(&inner.ctm), FillRule::NonZero, &mut inner);
+            let device = p.transform(&inner.ctm);
+            // A form wholly off the canvas draws nothing; it is not parsed,
+            // nor its clip made.
+            if self.off_canvas(&device, 0.0) {
+                return;
+            }
+            self.clip_path(&device, FillRule::NonZero, &mut inner);
         }
         if self.render_stopped {
             return;
@@ -44,7 +53,13 @@ impl Renderer<'_> {
             .and_then(|o| self.doc.resolve_dict(o))
             .cloned()
             .unwrap_or_else(|| resources.clone());
-        let Ok(data) = self.doc.stream_data(stream) else {
+        let doc = self.doc;
+        let parse = || Some(Content::parse(&doc.stream_data(stream).ok()?));
+        let content = match id {
+            Some(id) => self.shared.form(id, parse),
+            None => parse().map(Arc::new),
+        };
+        let Some(content) = content else {
             self.warn("form or annotation appearance skipped: content cannot be decoded");
             return;
         };
@@ -79,7 +94,10 @@ impl Renderer<'_> {
         }
         let outer = self.enter_resource_scope();
         self.depth += 1;
-        if self.run(&data, &inner_resources, &mut inner).is_err() {
+        if self
+            .run_operations(&content, &inner_resources, &mut inner)
+            .is_err()
+        {
             self.warn("form or annotation appearance skipped: malformed content stream");
         }
         self.depth -= 1;
@@ -187,7 +205,8 @@ impl Renderer<'_> {
         inner.stroke_alpha = 1.0;
         inner.soft_mask = None;
         inner.clip = None;
-        self.draw_form(&form, resources, &inner);
+        inner.clip_bounds = None;
+        self.draw_form(&form, resources, &inner, None);
         let rendered = std::mem::replace(self.canvas, parent);
         self.configure_canvas(state);
         if self.render_stopped {

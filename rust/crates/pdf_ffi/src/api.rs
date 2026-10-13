@@ -1,4 +1,5 @@
-//! Milestone 11: a hand-written C ABI for Flutter's `dart:ffi`.
+//! Milestone 11: a hand-written FFI layer in Rust for Flutter's `dart:ffi`
+//! (`extern "C"` is only the calling convention; there is no C code).
 //!
 //! Conventions
 //! -----------
@@ -302,7 +303,11 @@ pub unsafe extern "C" fn pdf_document_open(
             }
         }
         // Parse without holding the lock, so other documents stay usable.
-        let doc = Arc::new(open(path, password)?);
+        let mut doc = open(path, password)?;
+        // Shared and never changed from here on, so its renders may keep
+        // what they derive from it: decoded images, parsed pages, fonts.
+        doc.derived = pdf_core::derived::DerivedCache::enabled();
+        let doc = Arc::new(doc);
         let pages = doc.page_count().unwrap_or(0) as i64;
         let Some(stamp) = stamp else {
             // Readable but not statable: nothing reliable to pin against.
@@ -938,23 +943,124 @@ pub unsafe extern "C" fn pdf_render_page_region_png(
         return std::ptr::null_mut();
     };
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, PdfError> {
-        let doc = open_for_reading(path, password)?;
-        let options = pdf_render::RenderOptions {
-            region: Some(pdf_render::PixelRegion {
-                x: region_x as u32,
-                y: region_y as u32,
-                width: region_width as u32,
-                height: region_height as u32,
-            }),
-            ..render_options(page_width, page_height)
-        };
-        let rendered = pdf_render::render_page(&doc, page, options)?;
+        let rendered = render_region(
+            path,
+            password,
+            page,
+            (page_width, page_height),
+            (region_x, region_y, region_width, region_height),
+        )?;
         set_warnings(&rendered.warnings);
         pdf_render::encode_rgba_as_png(&rendered.pixels, rendered.width, rendered.height)
             .ok_or_else(|| PdfError::Structure("could not encode PNG".into()))
     }));
     match result {
         Ok(Ok(data)) => release_buffer(data, out_len),
+        Ok(Err(err)) => {
+            set_pdf_error(&err);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_error("PANIC: internal error");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Part of a page, laid out at `page_size` pixels: what the region renders
+/// share once their arguments are checked.
+fn render_region(
+    path: &str,
+    password: &str,
+    page: usize,
+    (page_width, page_height): (i32, i32),
+    (x, y, width, height): (i32, i32, i32, i32),
+) -> Result<pdf_render::RenderedPage, PdfError> {
+    let doc = open_for_reading(path, password)?;
+    let options = pdf_render::RenderOptions {
+        region: Some(pdf_render::PixelRegion {
+            x: x as u32,
+            y: y as u32,
+            width: width as u32,
+            height: height as u32,
+        }),
+        ..render_options(page_width, page_height)
+    };
+    pdf_render::render_page(&doc, page, options)
+}
+
+/// As [`pdf_render_page_region_png`], but the region comes back as raw RGBA8
+/// with its size in `out_width`/`out_height`, as [`pdf_render_page_rgba`]
+/// returns a page. A zoomed-in region is drawn once and shown at once: on a
+/// phone, encoding it as PNG and decoding that again took longer than
+/// drawing a scanned page's region did.
+///
+/// Free the result with `pdf_free_buffer`. All non-null output parameters are
+/// set to zero on failure.
+///
+/// # Safety
+/// As [`pdf_render_page_png`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pdf_render_page_region_rgba(
+    path: *const c_char,
+    password: *const c_char,
+    page: i32,
+    page_width: i32,
+    page_height: i32,
+    region_x: i32,
+    region_y: i32,
+    region_width: i32,
+    region_height: i32,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_len: *mut i32,
+) -> *mut u8 {
+    set_warnings(&[]);
+    for output in [out_width, out_height, out_len] {
+        if !output.is_null() {
+            *output = 0;
+        }
+    }
+    if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+        set_error("ERROR: null out parameter");
+        return std::ptr::null_mut();
+    }
+    let Ok(page) = non_negative_page(page) else {
+        return std::ptr::null_mut();
+    };
+    if page_width <= 0
+        || page_height <= 0
+        || region_x < 0
+        || region_y < 0
+        || region_width <= 0
+        || region_height <= 0
+    {
+        set_error("ERROR: render sizes must be positive and the region must start on the page");
+        return std::ptr::null_mut();
+    }
+    let (Ok(path), Ok(password)) = (cstr(path), cstr(password)) else {
+        return std::ptr::null_mut();
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        render_region(
+            path,
+            password,
+            page,
+            (page_width, page_height),
+            (region_x, region_y, region_width, region_height),
+        )
+    }));
+    match result {
+        Ok(Ok(rendered)) => {
+            let buffer = release_buffer(rendered.pixels, out_len);
+            if !buffer.is_null() {
+                *out_width = rendered.width as i32;
+                *out_height = rendered.height as i32;
+                set_warnings(&rendered.warnings);
+            }
+            buffer
+        }
         Ok(Err(err)) => {
             set_pdf_error(&err);
             std::ptr::null_mut()
@@ -1706,6 +1812,42 @@ mod tests {
             );
             pdf_free_buffer(region, len);
 
+            // The same region as raw pixels.
+            let (mut w, mut h) = (0, 0);
+            let pixels = pdf_render_page_region_rgba(
+                path.as_ptr(),
+                empty.as_ptr(),
+                0,
+                200,
+                4000,
+                150,
+                10,
+                100,
+                30,
+                &mut w,
+                &mut h,
+                &mut len,
+            );
+            assert!(!pixels.is_null(), "{}", last_error());
+            assert_eq!((w, h, len), (50, 30, 50 * 30 * 4));
+            pdf_free_buffer(pixels, len);
+            let pixels = pdf_render_page_region_rgba(
+                path.as_ptr(),
+                empty.as_ptr(),
+                0,
+                200,
+                4000,
+                -1,
+                0,
+                10,
+                10,
+                &mut w,
+                &mut h,
+                &mut len,
+            );
+            assert!(pixels.is_null());
+            assert_eq!((w, h, len), (0, 0, 0));
+
             for (x, y, w, h) in [
                 (-1, 0, 10, 10),
                 (0, 0, 0, 10),
@@ -1873,7 +2015,7 @@ mod tests {
 
     #[test]
     fn ffi_round_trip_on_fixture() {
-        // Write the fixture to a temp file, then exercise the C ABI.
+        // Write the fixture to a temp file, then exercise the exported functions.
         let dir = std::env::temp_dir().join("pdf_ffi_test");
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("simple.pdf");

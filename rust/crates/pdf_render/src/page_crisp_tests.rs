@@ -182,6 +182,51 @@ fn a_region_is_the_same_pixels_as_a_full_render() {
 }
 
 #[test]
+fn a_region_snaps_rectangles_exactly_as_the_page_does() {
+    // At 5.76 pixels a point this square's edges snap from x.5: in a region
+    // lower down the page the same edge is at a negative half, which rounding
+    // away from zero sent a row the other way.
+    let doc = doc_with_content("0 g 10 10 80 80 re f", [0, 0, 200, 100]);
+    let size = RenderSize::FitBox {
+        width: 1152,
+        height: 576,
+    };
+    let full = render_page(
+        &doc,
+        0,
+        RenderOptions {
+            size,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let region = PixelRegion {
+        x: 0,
+        y: 512,
+        width: 1152,
+        height: 64,
+    };
+    let part = render_page(
+        &doc,
+        0,
+        RenderOptions {
+            size,
+            region: Some(region),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for y in 0..64 {
+        assert_eq!(
+            pixel(&part, 300, y),
+            pixel(&full, 300, y + 512),
+            "row {}",
+            y + 512
+        );
+    }
+}
+
+#[test]
 fn regions_are_clipped_to_the_page_and_budgeted_on_their_own() {
     let doc = doc_with_content("0 g 0 0 100 40 re f", [0, 0, 100, 40]);
     // The page at this size is four gigapixels; the region is all that is

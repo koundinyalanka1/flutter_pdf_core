@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::crypt::Decryptor;
+use crate::derived::DerivedCache;
 use crate::error::{PdfError, Result};
 use crate::filter::decode_with_dict;
 use crate::object::{Dictionary, IndirectObject, ObjectId, PdfObject};
@@ -20,6 +21,9 @@ pub struct PdfDocument {
     pub was_encrypted: bool,
     /// Reported to callers/renderers when a damaged index was reconstructed.
     pub recovery_warnings: Vec<String>,
+    /// What renderers derived from this document, when it may be kept: see
+    /// [`DerivedCache`]. Off for a document as parsed.
+    pub derived: DerivedCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +154,7 @@ impl PdfDocument {
             } else {
                 Vec::new()
             },
+            derived: DerivedCache::default(),
         };
         if recovered && document.page_count().unwrap_or(0) == 0 {
             return Err(PdfError::structure("damaged PDF has no recoverable pages"));
@@ -346,6 +351,7 @@ impl PdfDocument {
             objects: BTreeMap::new(),
             was_encrypted: false,
             recovery_warnings: Vec::new(),
+            derived: DerivedCache::default(),
         }
     }
 }
