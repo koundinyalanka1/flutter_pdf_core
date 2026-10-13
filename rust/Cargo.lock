@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pdf_ai",
+ "pdf_compress",
  "pdf_core",
  "pdf_edit",
  "pdf_ocr",
@@ -278,6 +279,17 @@ dependencies = [
  "pdf_render",
  "pdf_text",
  "serde_json",
+]
+
+[[package]]
+name = "pdf_compress"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "jpeg-decoder",
+ "pdf_core",
+ "pdf_render",
+ "serde",
 ]
 
 [[package]]
@@ -314,6 +326,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pdf_ai",
+ "pdf_compress",
  "pdf_core",
  "pdf_edit",
  "pdf_ocr",

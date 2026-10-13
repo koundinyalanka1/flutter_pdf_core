@@ -196,16 +196,20 @@ class PdfFormField {
 
 /// A document's form.
 class PdfForm {
-  const PdfForm({this.fields = const [], this.xfa = false, this.signed = false});
+  const PdfForm({
+    this.fields = const [],
+    this.xfa = false,
+    this.signed = false,
+  });
 
   factory PdfForm.fromJson(Map<String, dynamic> json) => PdfForm(
-        fields: [
-          for (final f in (json['fields'] as List? ?? const []))
-            PdfFormField.fromJson(f as Map<String, dynamic>),
-        ],
-        xfa: json['xfa'] == true,
-        signed: json['signed'] == true,
-      );
+    fields: [
+      for (final f in (json['fields'] as List? ?? const []))
+        PdfFormField.fromJson(f as Map<String, dynamic>),
+    ],
+    xfa: json['xfa'] == true,
+    signed: json['signed'] == true,
+  );
 
   final List<PdfFormField> fields;
 
@@ -224,17 +228,17 @@ class PdfForm {
 class PdfFieldValue {
   /// Text, a drop-down's choice, or a radio group's state (or option).
   const PdfFieldValue.text(this.name, String this.value)
-      : checked = null,
-        selected = null;
+    : checked = null,
+      selected = null;
 
   const PdfFieldValue.checked(this.name, bool this.checked)
-      : value = null,
-        selected = null;
+    : value = null,
+      selected = null;
 
   /// The chosen options of a list.
   const PdfFieldValue.selected(this.name, List<String> this.selected)
-      : value = null,
-        checked = null;
+    : value = null,
+      checked = null;
 
   final String name;
   final String? value;
@@ -242,11 +246,11 @@ class PdfFieldValue {
   final List<String>? selected;
 
   Map<String, Object?> toJson() => {
-        'name': name,
-        if (value != null) 'value': value,
-        if (checked != null) 'checked': checked,
-        if (selected != null) 'selected': selected,
-      };
+    'name': name,
+    if (value != null) 'value': value,
+    if (checked != null) 'checked': checked,
+    if (selected != null) 'selected': selected,
+  };
 }
 
 // -- annotations ---------------------------------------------------------------
@@ -289,24 +293,22 @@ class PdfAnnotationInfo {
 
   /// Comments people make; links and form widgets are not.
   bool get isMarkup => !const {
-        'Link',
-        'Widget',
-        'Popup',
-        'Movie',
-        'Screen',
-        'PrinterMark',
-        'TrapNet',
-        'Watermark',
-        '3D',
-      }.contains(subtype);
+    'Link',
+    'Widget',
+    'Popup',
+    'Movie',
+    'Screen',
+    'PrinterMark',
+    'TrapNet',
+    'Watermark',
+    '3D',
+  }.contains(subtype);
 }
 
 /// A picture for an image annotation or mark: a JPEG file as it is, or a
 /// file of raw RGBA pixels (straight alpha, `ImageByteFormat.rawStraightRgba`).
 class PdfImageSource {
-  const PdfImageSource.jpeg(this.path)
-      : width = 0,
-        height = 0;
+  const PdfImageSource.jpeg(this.path) : width = 0, height = 0;
 
   const PdfImageSource.rgba(this.path, this.width, this.height);
 
@@ -315,10 +317,10 @@ class PdfImageSource {
   final int height;
 
   Map<String, Object> toJson() => {
-        'path': path,
-        if (width > 0) 'width': width,
-        if (height > 0) 'height': height,
-      };
+    'path': path,
+    if (width > 0) 'width': width,
+    if (height > 0) 'height': height,
+  };
 }
 
 enum PdfAnnotationType {
@@ -340,8 +342,9 @@ enum PdfAnnotationType {
 
 typedef PdfPoint = (double, double);
 
-List<List<double>> _points(List<PdfPoint> points) =>
-    [for (final p in points) [p.$1, p.$2]];
+List<List<double>> _points(List<PdfPoint> points) => [
+  for (final p in points) [p.$1, p.$2],
+];
 
 /// One annotation to add. With [flatten] it is drawn into the page for
 /// good instead.
@@ -377,12 +380,14 @@ class PdfAnnotationEdit {
     String contents = '',
     String author = '',
   }) {
-    assert(const {
-      PdfAnnotationType.highlight,
-      PdfAnnotationType.underline,
-      PdfAnnotationType.strikeOut,
-      PdfAnnotationType.squiggly,
-    }.contains(type));
+    assert(
+      const {
+        PdfAnnotationType.highlight,
+        PdfAnnotationType.underline,
+        PdfAnnotationType.strikeOut,
+        PdfAnnotationType.squiggly,
+      }.contains(type),
+    );
     return PdfAnnotationEdit._(
       page: page,
       type: type,
@@ -403,17 +408,16 @@ class PdfAnnotationEdit {
     double opacity = 1,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: PdfAnnotationType.ink,
-        strokes: strokes,
-        color: color,
-        width: width,
-        opacity: opacity,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: PdfAnnotationType.ink,
+    strokes: strokes,
+    color: color,
+    width: width,
+    opacity: opacity,
+    author: author,
+    flatten: flatten,
+  );
 
   /// A rectangle or an ellipse in [box].
   factory PdfAnnotationEdit.shape({
@@ -426,18 +430,17 @@ class PdfAnnotationEdit {
     double opacity = 1,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: ellipse ? PdfAnnotationType.ellipse : PdfAnnotationType.rectangle,
-        box: box,
-        color: color,
-        fill: fill,
-        width: width,
-        opacity: opacity,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: ellipse ? PdfAnnotationType.ellipse : PdfAnnotationType.rectangle,
+    box: box,
+    color: color,
+    fill: fill,
+    width: width,
+    opacity: opacity,
+    author: author,
+    flatten: flatten,
+  );
 
   /// A line, with an arrowhead at [to] when [arrow].
   factory PdfAnnotationEdit.line({
@@ -450,18 +453,17 @@ class PdfAnnotationEdit {
     double opacity = 1,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: arrow ? PdfAnnotationType.arrow : PdfAnnotationType.line,
-        from: from,
-        to: to,
-        color: color,
-        width: width,
-        opacity: opacity,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: arrow ? PdfAnnotationType.arrow : PdfAnnotationType.line,
+    from: from,
+    to: to,
+    color: color,
+    width: width,
+    opacity: opacity,
+    author: author,
+    flatten: flatten,
+  );
 
   /// A text box. Without a [border] it is typed text, as when filling in a
   /// form that has no fields.
@@ -475,19 +477,18 @@ class PdfAnnotationEdit {
     double border = 1,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: border > 0 ? PdfAnnotationType.freeText : PdfAnnotationType.text,
-        box: box,
-        text: text,
-        fontSize: fontSize,
-        color: color,
-        fill: fill,
-        width: border,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: border > 0 ? PdfAnnotationType.freeText : PdfAnnotationType.text,
+    box: box,
+    text: text,
+    fontSize: fontSize,
+    color: color,
+    fill: fill,
+    width: border,
+    author: author,
+    flatten: flatten,
+  );
 
   /// A sticky note whose icon's top-left corner is [at].
   factory PdfAnnotationEdit.note({
@@ -496,15 +497,14 @@ class PdfAnnotationEdit {
     required String text,
     int color = 0xFFFFC107,
     String author = '',
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: PdfAnnotationType.note,
-        from: at,
-        text: text,
-        color: color,
-        author: author,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: PdfAnnotationType.note,
+    from: at,
+    text: text,
+    color: color,
+    author: author,
+  );
 
   /// A picture in [box]: a photo, a scanned signature, a stamp.
   factory PdfAnnotationEdit.image({
@@ -514,16 +514,15 @@ class PdfAnnotationEdit {
     double opacity = 1,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: PdfAnnotationType.image,
-        box: box,
-        image: image,
-        opacity: opacity,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: PdfAnnotationType.image,
+    box: box,
+    image: image,
+    opacity: opacity,
+    author: author,
+    flatten: flatten,
+  );
 
   /// A drawn signature, its strokes in page points.
   factory PdfAnnotationEdit.signature({
@@ -534,17 +533,16 @@ class PdfAnnotationEdit {
     double width = 2,
     String author = '',
     bool flatten = false,
-  }) =>
-      PdfAnnotationEdit._(
-        page: page,
-        type: PdfAnnotationType.signature,
-        box: box,
-        strokes: strokes,
-        color: color,
-        width: width,
-        author: author,
-        flatten: flatten,
-      );
+  }) => PdfAnnotationEdit._(
+    page: page,
+    type: PdfAnnotationType.signature,
+    box: box,
+    strokes: strokes,
+    color: color,
+    width: width,
+    author: author,
+    flatten: flatten,
+  );
 
   final int page;
   final PdfAnnotationType type;
@@ -661,12 +659,7 @@ class PdfPageMark {
     PdfMarkPosition position = PdfMarkPosition.bottomCenter,
     double fontSize = 10,
     List<int> pages = const [],
-  }) : this(
-          text: format,
-          position: position,
-          fontSize: fontSize,
-          pages: pages,
-        );
+  }) : this(text: format, position: position, fontSize: fontSize, pages: pages);
 
   /// A large, faint word across the middle of each page.
   const PdfPageMark.watermark(
@@ -677,15 +670,15 @@ class PdfPageMark {
     double rotation = 45,
     List<int> pages = const [],
   }) : this(
-          text: text,
-          position: PdfMarkPosition.center,
-          color: color,
-          opacity: opacity,
-          fontSize: fontSize,
-          rotation: rotation,
-          bold: true,
-          pages: pages,
-        );
+         text: text,
+         position: PdfMarkPosition.center,
+         color: color,
+         opacity: opacity,
+         fontSize: fontSize,
+         rotation: rotation,
+         bold: true,
+         pages: pages,
+       );
 
   /// 1-based; empty means every page.
   final List<int> pages;
@@ -708,19 +701,19 @@ class PdfPageMark {
   final double margin;
 
   Map<String, Object?> toJson() => {
-        if (pages.isNotEmpty) 'pages': pages,
-        if (text.isNotEmpty) 'text': text,
-        if (image != null) 'image': image!.toJson(),
-        if (size != null) 'size': [size!.$1, size!.$2],
-        'position': position.name,
-        'fontSize': fontSize,
-        'font': font.name,
-        'bold': bold,
-        'color': _hex(color),
-        'opacity': opacity,
-        'rotation': rotation,
-        'margin': margin,
-      };
+    if (pages.isNotEmpty) 'pages': pages,
+    if (text.isNotEmpty) 'text': text,
+    if (image != null) 'image': image!.toJson(),
+    if (size != null) 'size': [size!.$1, size!.$2],
+    'position': position.name,
+    'fontSize': fontSize,
+    'font': font.name,
+    'bold': bold,
+    'color': _hex(color),
+    'opacity': opacity,
+    'rotation': rotation,
+    'margin': margin,
+  };
 }
 
 /// Everything one save changes.
@@ -741,10 +734,66 @@ class PdfEdits {
       fields.isEmpty && annotations.isEmpty && remove.isEmpty && marks.isEmpty;
 
   Map<String, Object> toJson() => {
-        if (fields.isNotEmpty) 'fields': [for (final f in fields) f.toJson()],
-        if (annotations.isNotEmpty)
-          'annotations': [for (final a in annotations) a.toJson()],
-        if (remove.isNotEmpty) 'delete': [for (final r in remove) r.toJson()],
-        if (marks.isNotEmpty) 'marks': [for (final m in marks) m.toJson()],
-      };
+    if (fields.isNotEmpty) 'fields': [for (final f in fields) f.toJson()],
+    if (annotations.isNotEmpty)
+      'annotations': [for (final a in annotations) a.toJson()],
+    if (remove.isNotEmpty) 'delete': [for (final r in remove) r.toJson()],
+    if (marks.isNotEmpty) 'marks': [for (final m in marks) m.toJson()],
+  };
 }
+
+// -- compression and page pictures ---------------------------------------------
+
+/// What compressing a PDF did.
+class PdfCompressReport {
+  const PdfCompressReport({
+    required this.images,
+    required this.recompressed,
+    required this.streams,
+    required this.bytesBefore,
+    required this.bytesAfter,
+  });
+
+  factory PdfCompressReport.fromJson(Map<String, dynamic> json) =>
+      PdfCompressReport(
+        images: json['images'] as int,
+        recompressed: json['recompressed'] as int,
+        streams: json['streams'] as int,
+        bytesBefore: json['bytesBefore'] as int,
+        bytesAfter: json['bytesAfter'] as int,
+      );
+
+  /// Pictures in the document, and how many were re-encoded smaller.
+  final int images;
+  final int recompressed;
+
+  /// Other streams compressed.
+  final int streams;
+  final int bytesBefore;
+  final int bytesAfter;
+
+  /// The copy is smaller than the original.
+  bool get shrank => bytesAfter < bytesBefore;
+
+  /// How much smaller, 0-1.
+  double get saving => bytesBefore == 0 ? 0 : 1 - bytesAfter / bytesBefore;
+}
+
+/// How hard to compress: the resolution pictures keep, and JPEG quality.
+enum PdfCompressLevel {
+  /// Print quality: 220 dpi, quality 85.
+  light(220, 85),
+
+  /// Screen quality: 150 dpi, quality 70.
+  recommended(150, 70),
+
+  /// As small as possible: 96 dpi, quality 50.
+  strong(96, 50);
+
+  const PdfCompressLevel(this.dpi, this.quality);
+
+  final double dpi;
+  final int quality;
+}
+
+enum PdfPageImageFormat { png, jpeg }

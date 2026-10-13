@@ -1513,6 +1513,122 @@ pub unsafe extern "C" fn pdf_apply_edits(
     })
 }
 
+/// Compression options as JSON; every field optional:
+/// `{"dpi":150,"quality":70}`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct CompressJson {
+    dpi: Option<f64>,
+    quality: Option<u8>,
+}
+
+/// Make a smaller copy of a PDF at `out_path`: pictures scaled to `dpi`
+/// and re-encoded as JPEG at `quality`, streams compressed, the file
+/// written compactly. An encrypted file keeps its password. When nothing
+/// helps, the copy is the original. Returns JSON `{images, recompressed,
+/// streams, bytesBefore, bytesAfter}`; free with `pdf_free_string`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_compress_json(
+    path: *const c_char,
+    password: *const c_char,
+    options_json: *const c_char,
+    out_path: *const c_char,
+) -> *mut c_char {
+    let (Ok(path), Ok(password), Ok(json), Ok(out)) =
+        (cstr(path), cstr(password), cstr(options_json), cstr(out_path))
+    else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let parsed: CompressJson = if json.trim().is_empty() {
+            CompressJson::default()
+        } else {
+            serde_json::from_str(json).map_err(|e| PdfError::Structure(format!("options: {e}")))?
+        };
+        let defaults = pdf_compress::Options::default();
+        let options = pdf_compress::Options {
+            dpi: parsed.dpi.unwrap_or(defaults.dpi),
+            quality: parsed.quality.unwrap_or(defaults.quality).clamp(1, 100),
+        };
+        let bytes = std::fs::read(path)?;
+        let (result, report) = pdf_compress::compress_bytes(&bytes, password, &options)?;
+        pdf_core::writer::PdfWriter::write_bytes_atomic(&result, out)?;
+        Ok(serde_json::json!({
+            "images": report.images,
+            "recompressed": report.recompressed,
+            "streams": report.streams,
+            "bytesBefore": bytes.len(),
+            "bytesAfter": result.len(),
+        })
+        .to_string())
+    })
+}
+
+/// Page-picture options as JSON; every field optional:
+/// `{"format":"png"|"jpeg","dpi":150,"quality":85}`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct PageImagesJson {
+    format: Option<String>,
+    dpi: Option<f64>,
+    quality: Option<u8>,
+}
+
+/// Save pages (a 1-based range string; empty for all) as pictures named
+/// `<out_prefix><page>.png` or `.jpg`, the page number padded to the
+/// count's digits. Returns JSON `{"files":[...]}`; free with
+/// `pdf_free_string`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_page_images_json(
+    path: *const c_char,
+    password: *const c_char,
+    pages: *const c_char,
+    options_json: *const c_char,
+    out_prefix: *const c_char,
+) -> *mut c_char {
+    let (Ok(path), Ok(password), Ok(pages), Ok(json), Ok(prefix)) = (
+        cstr(path),
+        cstr(password),
+        cstr(pages),
+        cstr(options_json),
+        cstr(out_prefix),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    run_str(|| {
+        let parsed: PageImagesJson = if json.trim().is_empty() {
+            PageImagesJson::default()
+        } else {
+            serde_json::from_str(json).map_err(|e| PdfError::Structure(format!("options: {e}")))?
+        };
+        let (format, extension) = match parsed.format.as_deref() {
+            Some("jpeg" | "jpg") => (
+                pdf_compress::PageImage::Jpeg(parsed.quality.unwrap_or(85).clamp(1, 100)),
+                "jpg",
+            ),
+            _ => (pdf_compress::PageImage::Png, "png"),
+        };
+        let dpi = parsed.dpi.unwrap_or(150.0);
+        let doc = open_for_reading(path, password)?;
+        let count = doc.page_count().unwrap_or(0) as usize;
+        let digits = count.max(1).to_string().len();
+        let mut files = Vec::new();
+        for index in parse_ranges(pages, count)? {
+            let file = format!("{prefix}{:0digits$}.{extension}", index + 1);
+            let bytes = pdf_compress::page_image(&doc, index, dpi, format)?;
+            pdf_core::writer::PdfWriter::write_bytes_atomic(&bytes, &file)?;
+            files.push(file);
+        }
+        Ok(serde_json::json!({ "files": files }).to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2312,6 +2428,36 @@ mod tests {
         assert_eq!(unsafe { pdf_apply_edits(p.as_ptr(), pw.as_ptr(), bad.as_ptr(), p.as_ptr()) }, -1);
         let error = unsafe { CStr::from_ptr(pdf_last_error()) }.to_string_lossy().into_owned();
         assert!(error.starts_with("PAGE_OUT_OF_RANGE"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compresses_and_saves_pages_as_pictures() {
+        let dir = scratch_dir("compress");
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, include_bytes!("../../../fixtures/two_pages.pdf")).unwrap();
+        let (p, pw) = (c(path.to_str().unwrap()), c(""));
+        let out = c(dir.join("small.pdf").to_str().unwrap());
+        let options = c(r#"{"dpi":100,"quality":60}"#);
+        let report: serde_json::Value =
+            serde_json::from_str(&take(unsafe { pdf_compress_json(p.as_ptr(), pw.as_ptr(), options.as_ptr(), out.as_ptr()) }))
+                .unwrap();
+        assert!(report["bytesAfter"].as_u64().unwrap() <= report["bytesBefore"].as_u64().unwrap());
+        assert!(PdfDocument::from_path(dir.join("small.pdf")).is_ok());
+
+        let prefix = c(dir.join("page-").to_str().unwrap());
+        let options = c(r#"{"format":"jpeg","dpi":36}"#);
+        let listed: serde_json::Value = serde_json::from_str(&take(unsafe {
+            pdf_page_images_json(p.as_ptr(), pw.as_ptr(), c("2").as_ptr(), options.as_ptr(), prefix.as_ptr())
+        }))
+        .unwrap();
+        let files = listed["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let file = files[0].as_str().unwrap();
+        assert!(file.ends_with("page-2.jpg"), "{file}");
+        assert!(std::fs::read(file).unwrap().starts_with(&[0xFF, 0xD8]));
+        let bad = c("9");
+        assert!(unsafe { pdf_page_images_json(p.as_ptr(), pw.as_ptr(), bad.as_ptr(), options.as_ptr(), prefix.as_ptr()) }.is_null());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

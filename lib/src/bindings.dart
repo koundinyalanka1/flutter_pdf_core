@@ -20,6 +20,8 @@ typedef _PageCountC = Int32 Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _PageCountDart = int Function(Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _Str2C = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str4C = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _ExtractTextC = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Int32);
 typedef _ExtractTextDart = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, int);
@@ -243,6 +245,14 @@ class PdfBindings {
   late final _RenderRegionRgbaDart? renderPageRegionRgba = _optional(() =>
       _library.lookupFunction<_RenderRegionRgbaC, _RenderRegionRgbaDart>(
           'pdf_render_page_region_rgba'));
+
+  /// Optional: compression and page pictures arrived with phase 8.
+  late final _Str4C? compressJson = _optional(
+      () => _library.lookupFunction<_Str4C, _Str4C>('pdf_compress_json'));
+  late final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>,
+          Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>)? pageImagesJson =
+      _optional(() =>
+          _library.lookupFunction<_Str5C, _Str5C>('pdf_page_images_json'));
 
   /// Optional: forms, annotations and stamps arrived with phase 8.
   late final Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)?

@@ -1,0 +1,13 @@
+[package]
+name = "pdf_compress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pdf_core = { path = "../pdf_core" }
+pdf_render = { path = "../pdf_render" }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+jpeg-decoder = { version = "0.3", default-features = false }

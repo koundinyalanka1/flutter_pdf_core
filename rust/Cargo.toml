@@ -4,6 +4,7 @@ members = [
   "crates/pdf_core",
   "crates/pdf_ops",
   "crates/pdf_edit",
+  "crates/pdf_compress",
   "crates/pdf_render",
   "crates/pdf_text",
   "crates/pdf_ai",

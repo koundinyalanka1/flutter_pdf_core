@@ -18,6 +18,9 @@ A lightweight PDF toolkit for Flutter, **built from scratch in Rust** — no thi
   underline, strike-out, ink, shapes, text boxes, notes), sign with a drawn or
   pictured signature, and draw page numbers, headers and watermarks onto pages,
   saved as an incremental update that keeps signatures valid and passwords on
+* Compress: pictures scaled to a chosen resolution and re-encoded with the
+  library's own JPEG encoder, streams packed, the file written with object
+  streams; pages saved as PNG or JPEG pictures
 * JPEG-to-PDF composition with page-size, fit and margin controls
 * AI-ready JSON/NDJSON export (paragraph-aware chunks with overlap) for feeding local models
 * AES-256 password protection; opens RC4/AES-128/AES-256 encrypted files
@@ -221,6 +224,8 @@ cargo run -p pdf_cli -- encrypt some.pdf user-pw owner-pw locked.pdf
 cargo run --release -p pdf_cli -- ocr scan.pdf                  # recognized text
 cargo run --release -p pdf_cli -- searchable scan.pdf out.pdf   # invisible text layer
 cargo run --release -p pdf_cli -- ocr-eval text.pdf             # accuracy vs. real text
+cargo run --release -p pdf_cli -- compress big.pdf small.pdf 150 70
+cargo run --release -p pdf_cli -- images some.pdf page- jpeg 150  # page-1.jpg, page-2.jpg, …
 cargo run --release -p pdf_cli -- fields form.pdf                # form fields as JSON
 cargo run --release -p pdf_cli -- edit form.pdf edits.json out.pdf
 ```
@@ -236,6 +241,7 @@ cargo run --release -p pdf_cli -- edit form.pdf edits.json out.pdf
 | `rust/crates/pdf_ai` | chunking + JSON/NDJSON export for local AI models |
 | `rust/crates/pdf_ocr` | OCR: page analysis, recognizer inference, invisible text layers |
 | `rust/crates/pdf_edit` | forms, annotations, signatures and page marks; incremental saves |
+| `rust/crates/pdf_compress` | smaller copies (picture re-encoding, compact writing) and pages as pictures |
 | `rust/crates/pdf_ffi` | the FFI layer (Rust, `extern "C"` exports) consumed by `dart:ffi` |
 | `rust/crates/pdf_cli` | developer CLI |
 | `tools/ocr_train` | offline training of the OCR model (Python, not shipped) |

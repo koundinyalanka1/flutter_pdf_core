@@ -1,5 +1,22 @@
 ## Unreleased
 
+* Compress PDFs and save pages as pictures (`pdf_compress`;
+  `pdf_compress_json`, `pdf_page_images_json`; Dart `PdfCore.compress`,
+  `pageImages`).
+  * A baseline JPEG encoder in `pdf_render` (`encode_jpeg`,
+    `encode_rgba_as_jpeg`): 4:2:0 colour, Annex K quantization scaled by
+    quality, and Huffman tables made for each image.
+  * Compressing scales pictures to the chosen resolution for the largest
+    page and re-encodes them when that is smaller (masks, bi-level scans and
+    colour-keyed pictures keep their pixels), Flate-packs plain streams,
+    drops what nothing refers to, and writes object streams with a
+    cross-reference stream. arXiv papers full of photos came out at a third
+    of their size (5.3 → 1.8 MB, 41 → 13 MB) and render as before (43-64 dB
+    PSNR on pages with pictures, text identical). Encrypted files are
+    encrypted again with their password; a file that does not shrink is
+    returned as it was.
+  * `pdf_cli compress` and `images`.
+
 * Fill forms, annotate, sign and stamp pages (`pdf_edit`;
   `pdf_form_fields_json`, `pdf_annotations_json`, `pdf_apply_edits`; Dart
   `PdfCore.formFields`, `annotations`, `applyEdits`).

@@ -1098,6 +1098,62 @@ class PdfCore {
     return _lastWarnings();
   }
 
+  /// Write a smaller copy of [path] to [outPath]: pictures scaled to
+  /// [level]'s resolution and re-encoded as JPEG, streams compressed, the
+  /// file written compactly. Signatures do not survive it, so keep the
+  /// original. An encrypted file keeps its password. When nothing helps,
+  /// the copy is the original.
+  static PdfCompressReport compress(String path, String outPath,
+      {PdfCompressLevel level = PdfCompressLevel.recommended,
+      String password = ''}) {
+    final run = _b.compressJson;
+    if (run == null) throw _editUnavailable();
+    final options = jsonEncode({'dpi': level.dpi, 'quality': level.quality});
+    final json = _withUtf8([path, password, options, outPath],
+        (args) => _takeString(run(args[0], args[1], args[2], args[3])));
+    return PdfCompressReport.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// Save pages ([pages] a 1-based range like "1-3,5"; empty for all) as
+  /// pictures named `<outPrefix><page>.png` or `.jpg`, and return their
+  /// paths.
+  static List<String> pageImages(String path, String outPrefix,
+      {String pages = '',
+      PdfPageImageFormat format = PdfPageImageFormat.png,
+      double dpi = 150,
+      int quality = 85,
+      String password = ''}) {
+    final run = _b.pageImagesJson;
+    if (run == null) throw _editUnavailable();
+    final options =
+        jsonEncode({'format': format.name, 'dpi': dpi, 'quality': quality});
+    final json = _withUtf8([path, password, pages, options, outPrefix],
+        (args) => _takeString(run(args[0], args[1], args[2], args[3], args[4])));
+    return [
+      for (final f in (jsonDecode(json) as Map<String, dynamic>)['files'] as List)
+        f as String,
+    ];
+  }
+
+  static Future<PdfCompressReport> compressAsync(String path, String outPath,
+          {PdfCompressLevel level = PdfCompressLevel.recommended,
+          String password = ''}) =>
+      Isolate.run(
+          () => compress(path, outPath, level: level, password: password));
+
+  static Future<List<String>> pageImagesAsync(String path, String outPrefix,
+          {String pages = '',
+          PdfPageImageFormat format = PdfPageImageFormat.png,
+          double dpi = 150,
+          int quality = 85,
+          String password = ''}) =>
+      Isolate.run(() => pageImages(path, outPrefix,
+          pages: pages,
+          format: format,
+          dpi: dpi,
+          quality: quality,
+          password: password));
+
   static Future<PdfForm> formFieldsAsync(String path, {String password = ''}) =>
       Isolate.run(() => formFields(path, password: password));
 

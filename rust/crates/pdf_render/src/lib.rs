@@ -9,6 +9,7 @@ pub mod ccitt;
 pub mod font;
 pub mod geom;
 pub mod image;
+pub mod jpeg_encode;
 pub mod page;
 pub mod png;
 
@@ -16,4 +17,5 @@ pub use canvas::Rgb;
 pub use page::{
     page_size_points, render_page, PixelRegion, RenderOptions, RenderSize, RenderedPage,
 };
+pub use jpeg_encode::{encode_jpeg, encode_rgba_as_jpeg};
 pub use png::encode_rgba_as_png;

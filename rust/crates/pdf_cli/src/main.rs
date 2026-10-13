@@ -34,7 +34,9 @@ const USAGE: &str = "usage: pdf_cli <command> ...
   ocr-image  <in.pgm>                          recognize a binary (P5) greyscale image
   fields    <in> [password]                    form fields as JSON
   annots    <in> <page-1-based> [password]     a page's annotations as JSON
-  edit      <in> <edits.json> <out> [password] fill, annotate, stamp (incremental save)";
+  edit      <in> <edits.json> <out> [password] fill, annotate, stamp (incremental save)
+  compress  <in> <out> [dpi] [quality] [password]  shrink pictures and streams
+  images    <in> <out-prefix> [png|jpeg] [dpi] [password]  every page as a picture";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +65,40 @@ fn main() -> Result<()> {
                 eprintln!("warning: {warning}");
             }
             println!("wrote {}", arg(&rest, 2)?);
+        }
+        "compress" => {
+            let bytes = std::fs::read(arg(&rest, 0)?)?;
+            let options = pdf_compress::Options {
+                dpi: rest.get(2).map_or(Ok(150.0), |v| v.parse()).context("bad dpi")?,
+                quality: rest.get(3).map_or(Ok(70), |v| v.parse()).context("bad quality")?,
+            };
+            let started = Instant::now();
+            let (out, report) = pdf_compress::compress_bytes(&bytes, rest.get(4).copied().unwrap_or(""), &options)?;
+            std::fs::write(arg(&rest, 1)?, &out)?;
+            println!(
+                "{} -> {} bytes ({:.0}%), {} of {} pictures re-encoded, {} streams packed, {:.2}s",
+                bytes.len(),
+                out.len(),
+                out.len() as f64 * 100.0 / bytes.len().max(1) as f64,
+                report.recompressed,
+                report.images,
+                report.streams,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        "images" => {
+            let doc = open(&rest, 0, 4)?;
+            let prefix = arg(&rest, 1)?;
+            let (format, extension) = match rest.get(2).copied().unwrap_or("png") {
+                "jpeg" | "jpg" => (pdf_compress::PageImage::Jpeg(85), "jpg"),
+                _ => (pdf_compress::PageImage::Png, "png"),
+            };
+            let dpi: f64 = rest.get(3).map_or(Ok(150.0), |v| v.parse()).context("bad dpi")?;
+            for index in 0..doc.page_count().unwrap_or(0) as usize {
+                let path = format!("{prefix}{}.{extension}", index + 1);
+                std::fs::write(&path, pdf_compress::page_image(&doc, index, dpi, format)?)?;
+                println!("wrote {path}");
+            }
         }
         "inspect" => {
             let doc = open(&rest, 0, 1)?;
