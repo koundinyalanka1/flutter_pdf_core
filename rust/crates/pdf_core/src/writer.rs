@@ -1,0 +1,472 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::Path;
+
+use crate::document::PdfDocument;
+use crate::error::{PdfError, Result};
+use crate::lexer::{is_delimiter, is_ws};
+use crate::object::{Dictionary, ObjectId, PdfObject};
+
+pub struct PdfWriter;
+
+impl PdfWriter {
+    pub fn write_document(document: &PdfDocument, output_path: impl AsRef<Path>) -> Result<()> {
+        let output_path = output_path.as_ref();
+        let parent = output_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        Self::write_document_inner(document, false, &mut temporary)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(output_path)
+            .map_err(|err| PdfError::Io(err.error))?;
+        Ok(())
+    }
+
+    /// Replace a destination only after all bytes have been written successfully.
+    /// A sibling temporary file keeps the final rename on the same filesystem.
+    pub fn write_bytes_atomic(bytes: &[u8], output_path: impl AsRef<Path>) -> Result<()> {
+        let output_path = output_path.as_ref();
+        let parent = output_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(output_path)
+            .map_err(|err| PdfError::Io(err.error))?;
+        Ok(())
+    }
+
+    pub fn write_document_to_vec(document: &PdfDocument) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Self::write_document_inner(document, false, &mut out)?;
+        Ok(out)
+    }
+
+    /// Like `write_document_to_vec`, but preserves the trailer's /Encrypt
+    /// reference. Only used by `crypt::encrypt_to_bytes`, which has already
+    /// encrypted every string and stream in the document.
+    pub(crate) fn write_document_to_vec_keep_encrypt(document: &PdfDocument) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Self::write_document_inner(document, true, &mut out)?;
+        Ok(out)
+    }
+
+    fn write_document_inner(
+        document: &PdfDocument,
+        keep_encrypt: bool,
+        destination: &mut impl Write,
+    ) -> Result<()> {
+        let root = document
+            .root_ref()
+            .ok_or_else(|| PdfError::write("cannot write PDF without trailer /Root"))?;
+        let max_object_number = document
+            .objects
+            .keys()
+            .map(|id| id.number)
+            .max()
+            .unwrap_or(0);
+        let mut seen_numbers = BTreeSet::new();
+        for id in document.objects.keys() {
+            if id.number == 0 {
+                return Err(PdfError::write(
+                    "object number zero is reserved for the free xref entry",
+                ));
+            }
+            if !seen_numbers.insert(id.number) {
+                return Err(PdfError::write(format!(
+                    "multiple generations for object {} are not supported by the milestone 2 writer",
+                    id.number
+                )));
+            }
+        }
+
+        let size = max_object_number
+            .checked_add(1)
+            .ok_or_else(|| PdfError::write("object number exceeds the supported PDF range"))?;
+        let mut out = CountingWriter {
+            inner: destination,
+            bytes: 0,
+        };
+        write!(out, "%PDF-{}\n", document.version)?;
+        // Keep a binary marker comment so future viewers treat the file as binary-safe.
+        out.write_all(b"%\xE2\xE3\xCF\xD3\n")?;
+
+        let mut offsets: BTreeMap<u32, (u64, u16)> = BTreeMap::new();
+        for (id, object) in &document.objects {
+            offsets.insert(id.number, (out.bytes, id.generation));
+            write!(out, "{} {} obj\n", id.number, id.generation)?;
+            // Buffer one object, not the entire document. Streams are copied
+            // directly after serializing their small dictionary.
+            if let PdfObject::Stream(stream) = &object.value {
+                let mut dictionary = Vec::new();
+                Self::write_dictionary(
+                    &mut dictionary,
+                    &stream.dictionary,
+                    Some(stream.data.len()),
+                )?;
+                out.write_all(&dictionary)?;
+                out.write_all(b"\nstream\n")?;
+                out.write_all(&stream.data)?;
+                out.write_all(b"\nendstream")?;
+            } else {
+                out.write_all(&Self::serialize_object(&object.value)?)?;
+            }
+            out.write_all(b"\nendobj\n")?;
+        }
+
+        let startxref = out.bytes;
+        out.write_all(b"xref\n0 1\n0000000000 65535 f \n")?;
+        // Classic xref tables permit multiple subsections. Emit only present
+        // object ranges so a large object ID does not amplify a tiny file.
+        let entries: Vec<_> = offsets.into_iter().collect();
+        let mut first = 0;
+        while first < entries.len() {
+            let mut end = first + 1;
+            while end < entries.len() && entries[end].0 == entries[end - 1].0 + 1 {
+                end += 1;
+            }
+            writeln!(out, "{} {}", entries[first].0, end - first)?;
+            for (_, (offset, generation)) in &entries[first..end] {
+                if *offset > 9_999_999_999 {
+                    return Err(PdfError::write("classic xref offset exceeds ten digits"));
+                }
+                writeln!(out, "{offset:010} {generation:05} n ")?;
+            }
+            first = end;
+        }
+
+        let trailer = Self::build_trailer(document, root, size, keep_encrypt);
+        out.write_all(b"trailer\n")?;
+        out.write_all(&Self::serialize_object(&PdfObject::Dictionary(trailer))?)?;
+        write!(out, "\nstartxref\n{startxref}\n%%EOF\n")?;
+        Ok(())
+    }
+
+    pub fn serialize_object(object: &PdfObject) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Self::write_object(&mut out, object)?;
+        Ok(out)
+    }
+
+    fn build_trailer(
+        document: &PdfDocument,
+        root: ObjectId,
+        size: u32,
+        keep_encrypt: bool,
+    ) -> Dictionary {
+        let mut trailer = Dictionary::new();
+        for (key, value) in &document.xref.trailer {
+            if key == "Encrypt" && keep_encrypt {
+                trailer.insert(key.clone(), value.clone());
+                continue;
+            }
+            // Avoid preserving offsets into the previous file, stream-xref
+            // metadata, or encryption state (documents are written decrypted;
+            // use `crypt::encrypt_document` to produce an encrypted file).
+            if matches!(
+                key.as_str(),
+                "Size"
+                    | "Prev"
+                    | "XRefStm"
+                    | "Encrypt"
+                    | "Type"
+                    | "Index"
+                    | "W"
+                    | "Filter"
+                    | "DecodeParms"
+                    | "Length"
+            ) {
+                continue;
+            }
+            trailer.insert(key.clone(), value.clone());
+        }
+        trailer.insert("Size".to_owned(), PdfObject::Integer(i64::from(size)));
+        trailer.insert("Root".to_owned(), PdfObject::Reference(root));
+        trailer
+    }
+
+    fn write_object(out: &mut Vec<u8>, object: &PdfObject) -> Result<()> {
+        match object {
+            PdfObject::Null => out.extend_from_slice(b"null"),
+            PdfObject::Bool(value) => {
+                out.extend_from_slice(if *value { b"true" } else { b"false" })
+            }
+            PdfObject::Integer(value) => write!(out, "{value}")?,
+            PdfObject::Real(value) => write_real(out, *value)?,
+            PdfObject::Name(name) => write_name(out, name),
+            PdfObject::LiteralString(bytes) => write_literal_string(out, bytes),
+            PdfObject::HexString(bytes) => write_hex_string(out, bytes),
+            PdfObject::Array(items) => write_array(out, items)?,
+            PdfObject::Dictionary(dict) => Self::write_dictionary(out, dict, None)?,
+            PdfObject::Stream(stream) => {
+                Self::write_dictionary(out, &stream.dictionary, Some(stream.data.len()))?;
+                out.extend_from_slice(b"\nstream\n");
+                out.extend_from_slice(&stream.data);
+                out.extend_from_slice(b"\nendstream");
+            }
+            PdfObject::Reference(id) => write!(out, "{} {} R", id.number, id.generation)?,
+        }
+        Ok(())
+    }
+
+    fn write_dictionary(
+        out: &mut Vec<u8>,
+        dict: &Dictionary,
+        stream_length: Option<usize>,
+    ) -> Result<()> {
+        out.extend_from_slice(b"<<");
+        let mut first = true;
+        for (key, value) in dict {
+            if stream_length.is_some() && key == "Length" {
+                continue;
+            }
+            if !first {
+                out.push(b' ');
+            }
+            first = false;
+            write_name(out, key);
+            out.push(b' ');
+            Self::write_object(out, value)?;
+        }
+        if let Some(length) = stream_length {
+            if !first {
+                out.push(b' ');
+            }
+            write_name(out, "Length");
+            write!(out, " {length}")?;
+        }
+        out.extend_from_slice(b">>");
+        Ok(())
+    }
+}
+
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    bytes: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.inner.write(bytes)?;
+        self.bytes += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_real(out: &mut Vec<u8>, value: f64) -> Result<()> {
+    if !value.is_finite() {
+        return Err(PdfError::write("cannot serialize non-finite real number"));
+    }
+    let mut text = value.to_string();
+    if text.contains('e') || text.contains('E') {
+        text = format!("{value:.12}");
+        while text.contains('.') && text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.push('0');
+        }
+    }
+    out.extend_from_slice(text.as_bytes());
+    Ok(())
+}
+
+fn write_name(out: &mut Vec<u8>, name: &str) {
+    out.push(b'/');
+    for &byte in name.as_bytes() {
+        if byte <= 0x20 || byte >= 0x7f || is_ws(byte) || is_delimiter(byte) || byte == b'#' {
+            write!(out, "#{byte:02X}").expect("writing to Vec cannot fail");
+        } else {
+            out.push(byte);
+        }
+    }
+}
+
+fn write_literal_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'(');
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'(' => out.extend_from_slice(b"\\("),
+            b')' => out.extend_from_slice(b"\\)"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\x08' => out.extend_from_slice(b"\\b"),
+            b'\x0c' => out.extend_from_slice(b"\\f"),
+            0x20..=0x7e => out.push(byte),
+            _ => write!(out, "\\{byte:03o}").expect("writing to Vec cannot fail"),
+        }
+    }
+    out.push(b')');
+}
+
+fn write_hex_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'<');
+    for byte in bytes {
+        write!(out, "{byte:02X}").expect("writing to Vec cannot fail");
+    }
+    out.push(b'>');
+}
+
+fn write_array(out: &mut Vec<u8>, items: &[PdfObject]) -> Result<()> {
+    out.push(b'[');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(b' ');
+        }
+        PdfWriter::write_object(out, item)?;
+    }
+    out.push(b']');
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn _todo_markers() {
+    // TODO: xref stream output.
+    // TODO: object stream output.
+    // TODO: incremental save.
+    // TODO: stream recompression.
+    // TODO: encryption-aware rewriting.
+    // TODO: signed PDF preservation.
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::document::PdfDocument;
+    use crate::object::ObjectId;
+    use crate::xref::parse_xref;
+
+    use super::*;
+
+    use crate::stream::PdfStream;
+
+    #[test]
+    fn failed_serialization_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        let original = include_bytes!("../../../fixtures/simple.pdf");
+        std::fs::write(&path, original).unwrap();
+        let mut doc = PdfDocument::from_bytes(original).unwrap();
+        doc.add_object(PdfObject::Real(f64::NAN));
+        assert!(doc.save_as(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn saves_over_existing_document_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, b"old contents").unwrap();
+        let doc = PdfDocument::from_bytes(include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        doc.save_as(&path).unwrap();
+        assert_eq!(PdfDocument::from_path(&path).unwrap().page_count(), Some(1));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn serializes_pdf_objects() {
+        let object = PdfObject::Array(vec![
+            PdfObject::Null,
+            PdfObject::Bool(true),
+            PdfObject::Integer(-42),
+            PdfObject::Real(3.25),
+            PdfObject::Name("A Name".to_owned()),
+            PdfObject::LiteralString(b"hi (there)\n".to_vec()),
+            PdfObject::HexString(vec![0xde, 0xad]),
+            PdfObject::Reference(ObjectId::new(7, 0)),
+        ]);
+        let bytes = PdfWriter::serialize_object(&object).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "[null true -42 3.25 /A#20Name (hi \\(there\\)\\n) <DEAD> 7 0 R]"
+        );
+    }
+
+    #[test]
+    fn serializes_stream_with_generated_length() {
+        let mut dict = Dictionary::new();
+        dict.insert("Length".to_owned(), PdfObject::Integer(999));
+        let object = PdfObject::Stream(PdfStream::new(dict, b"hello".to_vec()));
+        let bytes = PdfWriter::serialize_object(&object).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "<</Length 5>>\nstream\nhello\nendstream"
+        );
+    }
+
+    #[test]
+    fn writes_xref_offsets_to_indirect_objects() {
+        let input = include_bytes!("../../../fixtures/simple.pdf");
+        let document = PdfDocument::from_bytes(input).unwrap();
+        let output = PdfWriter::write_document_to_vec(&document).unwrap();
+        let xref = parse_xref(&output).unwrap();
+        for (number, entry) in xref
+            .entries
+            .iter()
+            .filter(|(number, entry)| **number != 0 && entry.in_use())
+        {
+            let expected = format!("{} {} obj", number, entry.generation);
+            let offset = entry.offset().expect("classic entries are in-file");
+            assert!(
+                output[offset..].starts_with(expected.as_bytes()),
+                "xref offset {offset} did not point to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_object_numbers_use_compact_xref_subsections() {
+        let mut doc =
+            PdfDocument::from_bytes(include_bytes!("../../../fixtures/simple.pdf")).unwrap();
+        let sparse = ObjectId::new(1_000_000, 7);
+        doc.set_object(sparse, PdfObject::LiteralString(b"retained value".to_vec()));
+        doc.set_trailer_key("SparseTest", PdfObject::Reference(sparse));
+        let output = doc.to_bytes().unwrap();
+        assert!(
+            output.len() < 2_000,
+            "sparse numbering must not create absent rows"
+        );
+        let xref = parse_xref(&output).unwrap();
+        assert_eq!(xref.entries.len(), doc.objects.len() + 1);
+        assert_eq!(xref.entries[&1_000_000].generation, 7);
+        assert_eq!(xref.trailer["Size"].as_i64(), Some(1_000_001));
+        let reread = PdfDocument::from_bytes(&output).unwrap();
+        assert_eq!(reread.resolve(sparse), doc.resolve(sparse));
+        assert!(reread.recovery_warnings.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.pdf");
+        doc.save_as(&path).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), output);
+    }
+
+    #[test]
+    fn round_trips_tiny_fixtures() {
+        for input in [
+            include_bytes!("../../../fixtures/simple.pdf").as_slice(),
+            include_bytes!("../../../fixtures/two_pages.pdf").as_slice(),
+        ] {
+            let original = PdfDocument::from_bytes(input).unwrap();
+            let output = PdfWriter::write_document_to_vec(&original).unwrap();
+            let rewritten = PdfDocument::from_bytes(&output).unwrap();
+
+            assert_eq!(rewritten.version, original.version);
+            assert_eq!(
+                rewritten.root_ref().is_some(),
+                original.root_ref().is_some()
+            );
+            assert_eq!(rewritten.inspect().encrypted, original.inspect().encrypted);
+            assert_eq!(rewritten.page_count(), original.page_count());
+        }
+    }
+}

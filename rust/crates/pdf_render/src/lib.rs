@@ -1,0 +1,22 @@
+//! Milestone 13 (part 2): page rasterization.
+//!
+//! A from-scratch PDF rasterizer: scanline anti-aliased path filling, clipping
+//! masks, image XObjects and TrueType text, driven by the same content-stream
+//! parser the text extractor uses.
+
+pub mod canvas;
+pub mod ccitt;
+pub mod font;
+pub mod geom;
+pub mod image;
+pub mod jpeg_encode;
+pub mod page;
+pub mod png;
+
+pub use canvas::Rgb;
+pub use page::{
+    page_size_points, render_page, render_page_cancellable, PixelRegion, RenderCancel,
+    RenderOptions, RenderSize, RenderedPage, DEFAULT_TIME_LIMIT,
+};
+pub use jpeg_encode::{encode_jpeg, encode_rgba_as_jpeg};
+pub use png::encode_rgba_as_png;

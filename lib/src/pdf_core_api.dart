@@ -1,0 +1,1580 @@
+// Milestone 11: the public Dart API over the Rust core.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:isolate';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:ffi/ffi.dart';
+
+import 'bindings.dart';
+import 'pdf_edit.dart';
+
+/// Thrown when a native PDF operation fails.
+class PdfException implements Exception {
+  PdfException(this.code, this.message);
+
+  /// Stable machine-readable code: `ENCRYPTED`, `WRONG_PASSWORD`,
+  /// `NOT_A_PDF`, `PAGE_OUT_OF_RANGE`, `ERROR`, `PANIC`; for a render,
+  /// `CANCELLED` ([PdfCore.cancelRender] stopped it) or `TIMEOUT` (its
+  /// asynchronous call's timeout passed, and it was cancelled).
+  final String code;
+  final String message;
+
+  bool get isEncrypted => code == 'ENCRYPTED';
+  bool get isWrongPassword => code == 'WRONG_PASSWORD';
+
+  /// Whether a render was given up on: cancelled, or out of time.
+  bool get isCancelled => code == 'CANCELLED' || code == 'TIMEOUT';
+
+  @override
+  String toString() => 'PdfException($code): $message';
+}
+
+/// A rendered page and anything the renderer had to leave out of it.
+///
+/// A page can render successfully and still not be a faithful copy — an image
+/// in a codec this build does not read, or text in a font the document never
+/// embedded and which is therefore drawn in a substitute face. The warnings
+/// let a caller say so rather than presenting an approximation as exact.
+class PdfRenderedPng {
+  const PdfRenderedPng(this.bytes, this.warnings);
+
+  final Uint8List bytes;
+
+  /// Human-readable notes, empty when the page rendered exactly as authored.
+  final List<String> warnings;
+
+  bool get isApproximate => warnings.isNotEmpty;
+}
+
+/// Document metadata (all fields optional).
+///
+/// When passed to [PdfCore.setMetadata]: `null` leaves a field untouched,
+/// an empty string deletes it.
+class PdfMetadata {
+  const PdfMetadata({
+    this.title,
+    this.author,
+    this.subject,
+    this.keywords,
+    this.creator,
+    this.producer,
+    this.creationDate,
+    this.modDate,
+  });
+
+  factory PdfMetadata.fromJson(Map<String, dynamic> json) => PdfMetadata(
+        title: json['title'] as String?,
+        author: json['author'] as String?,
+        subject: json['subject'] as String?,
+        keywords: json['keywords'] as String?,
+        creator: json['creator'] as String?,
+        producer: json['producer'] as String?,
+        creationDate: json['creation_date'] as String?,
+        modDate: json['mod_date'] as String?,
+      );
+
+  final String? title;
+  final String? author;
+  final String? subject;
+  final String? keywords;
+  final String? creator;
+  final String? producer;
+  final String? creationDate;
+  final String? modDate;
+
+  Map<String, dynamic> toJson() => {
+        'title': title,
+        'author': author,
+        'subject': subject,
+        'keywords': keywords,
+        'creator': creator,
+        'producer': producer,
+        'creation_date': creationDate,
+        'mod_date': modDate,
+      };
+}
+
+/// Summary information about a document.
+class PdfInfo {
+  const PdfInfo({
+    required this.version,
+    required this.encrypted,
+    required this.objectCount,
+    required this.pageCount,
+    required this.metadata,
+  });
+
+  factory PdfInfo.fromJson(Map<String, dynamic> json) => PdfInfo(
+        version: json['version'] as String? ?? '',
+        encrypted: json['encrypted'] as bool? ?? false,
+        objectCount: json['objectCount'] as int? ?? 0,
+        pageCount: json['pageCount'] as int? ?? 0,
+        metadata: PdfMetadata.fromJson(
+            (json['metadata'] as Map?)?.cast<String, dynamic>() ?? const {}),
+      );
+
+  final String version;
+  final bool encrypted;
+  final int objectCount;
+  final int pageCount;
+  final PdfMetadata metadata;
+}
+
+/// A rasterized page: RGBA8 pixels plus their dimensions.
+///
+/// The buffer is straight (non-premultiplied) RGBA with a top-left origin,
+/// which is exactly what `ui.decodeImageFromPixels` expects.
+class PdfRenderedPage {
+  const PdfRenderedPage({
+    required this.width,
+    required this.height,
+    required this.pixels,
+    this.warnings = const [],
+  });
+
+  final int width;
+  final int height;
+
+  /// Straight RGBA8, row by row from the top left.
+  final Uint8List pixels;
+
+  /// What the renderer had to skip or approximate, when it was asked.
+  final List<String> warnings;
+}
+
+/// A page's size in PostScript points (1/72"), honouring `/Rotate`.
+class PdfPageSize {
+  const PdfPageSize(this.width, this.height);
+  final double width;
+  final double height;
+
+  double get aspectRatio => height == 0 ? 1 : width / height;
+}
+
+/// Text and glyph geometry for one displayed page, including its rotation.
+/// Coordinates are page points (1/72 inch), with the origin at the top left,
+/// matching the page raster. Offsets index [text] in Dart UTF-16 code units.
+class PdfPageTextLayout {
+  const PdfPageTextLayout({
+    required this.text,
+    required this.width,
+    required this.height,
+    required this.glyphs,
+  });
+
+  factory PdfPageTextLayout.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final rawGlyphs = json['glyphs'];
+    final width = _textLayoutNumber(json['width'], 'width');
+    final height = _textLayoutNumber(json['height'], 'height');
+    if (text is! String || rawGlyphs is! List || width <= 0 || height <= 0) {
+      throw const FormatException('Invalid PDF page text layout.');
+    }
+    final glyphs = <PdfTextGlyph>[];
+    for (final raw in rawGlyphs) {
+      if (raw is! Map<String, dynamic>) {
+        throw const FormatException('Invalid PDF text glyph.');
+      }
+      final glyph = PdfTextGlyph.fromJson(raw);
+      if (glyph.end > text.length) {
+        throw const FormatException('PDF glyph offsets exceed the page text.');
+      }
+      glyphs.add(glyph);
+    }
+    return PdfPageTextLayout(
+      text: text,
+      width: width,
+      height: height,
+      glyphs: List.unmodifiable(glyphs),
+    );
+  }
+
+  final String text;
+  final double width;
+  final double height;
+  final List<PdfTextGlyph> glyphs;
+
+  bool get hasText => text.trim().isNotEmpty && glyphs.isNotEmpty;
+}
+
+/// Bounds for one glyph or glyph cluster in [PdfPageTextLayout.text].
+/// [start] is inclusive and [end] is exclusive, both UTF-16 offsets. A ligature
+/// or a supplementary Unicode character can span multiple code units.
+class PdfTextGlyph {
+  const PdfTextGlyph({
+    required this.start,
+    required this.end,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+  });
+
+  factory PdfTextGlyph.fromJson(Map<String, dynamic> json) {
+    final start = json['start'];
+    final end = json['end'];
+    final bounds = json['bounds'];
+    if (start is! int || end is! int || start < 0 || end <= start ||
+        bounds is! List || bounds.length != 4) {
+      throw const FormatException('Invalid PDF text glyph offsets or bounds.');
+    }
+    final left = _textLayoutNumber(bounds[0], 'left');
+    final top = _textLayoutNumber(bounds[1], 'top');
+    final right = _textLayoutNumber(bounds[2], 'right');
+    final bottom = _textLayoutNumber(bounds[3], 'bottom');
+    if (right < left || bottom < top) {
+      throw const FormatException('Invalid PDF text glyph bounds.');
+    }
+    return PdfTextGlyph(
+      start: start,
+      end: end,
+      left: left,
+      top: top,
+      right: right,
+      bottom: bottom,
+    );
+  }
+
+  final int start;
+  final int end;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+}
+
+double _textLayoutNumber(Object? value, String field) {
+  if (value is! num || !value.isFinite) {
+    throw FormatException('Invalid PDF text layout $field.');
+  }
+  return value.toDouble();
+}
+
+double _ocrNumber(Object? value, String field) {
+  if (value is! num || !value.isFinite) {
+    throw FormatException('Invalid OCR $field.');
+  }
+  return value.toDouble();
+}
+
+List<double> _ocrBounds(Object? value) {
+  if (value is! List || value.length != 4) {
+    throw const FormatException('Invalid OCR bounds.');
+  }
+  final bounds = [for (final v in value) _ocrNumber(v, 'bounds')];
+  if (bounds[2] < bounds[0] || bounds[3] < bounds[1]) {
+    throw const FormatException('Invalid OCR bounds.');
+  }
+  return bounds;
+}
+
+int _ocrOrientation(Object? value) {
+  if (value is! int || value % 90 != 0 || value < 0 || value > 270) {
+    throw const FormatException('Invalid OCR orientation.');
+  }
+  return value;
+}
+
+/// What OCR did with a page.
+enum PdfOcrStatus {
+  /// Recognized; whatever was legible is in [PdfOcrPage.lines].
+  recognized,
+
+  /// Recognized, but nothing legible was found.
+  noText,
+
+  /// Left alone: the page already has born-digital text.
+  hasText,
+
+  /// Left alone: the page already has an invisible OCR text layer.
+  hasOcrLayer;
+
+  static PdfOcrStatus _parse(Object? value) => PdfOcrStatus.values.firstWhere(
+        (status) => status.name == value,
+        orElse: () => throw const FormatException('Invalid OCR page status.'),
+      );
+}
+
+/// Settings for [PdfCore.ocrPage] and [PdfCore.makeSearchable].
+class PdfOcrOptions {
+  const PdfOcrOptions({
+    this.dpi = 300,
+    this.force = false,
+    this.minConfidence = 0.5,
+    this.deskew = true,
+    this.detectOrientation = true,
+    this.threads = 0,
+  });
+
+  /// Resolution pages are recognized at (36–1200). 300 reads 6-point text;
+  /// very large pages are recognized at less to bound memory.
+  final double dpi;
+
+  /// Also recognize pages that already have text.
+  final bool force;
+
+  /// Lines recognized with less confidence (0–1) are dropped: mostly
+  /// pictures, rules and specks rather than text.
+  final double minConfidence;
+
+  /// Measure and correct the tilt of skewed scans.
+  final bool deskew;
+
+  /// Read pages scanned sideways or upside down.
+  final bool detectOrientation;
+
+  /// Threads recognizing lines; 0 uses every core.
+  final int threads;
+
+  Map<String, dynamic> toJson() => {
+        'dpi': dpi,
+        'force': force,
+        'minConfidence': minConfidence,
+        'deskew': deskew,
+        'detectOrientation': detectOrientation,
+        'threads': threads,
+      };
+}
+
+/// A recognized word. Coordinates are page points from the top left of the
+/// displayed page, like [PdfPageTextLayout].
+class PdfOcrWord {
+  const PdfOcrWord({
+    required this.text,
+    required this.confidence,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+    required this.quad,
+  });
+
+  factory PdfOcrWord.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final rawQuad = json['quad'];
+    if (text is! String || rawQuad is! List || rawQuad.length != 4) {
+      throw const FormatException('Invalid OCR word.');
+    }
+    final quad = <double>[];
+    for (final corner in rawQuad) {
+      if (corner is! List || corner.length != 2) {
+        throw const FormatException('Invalid OCR word corners.');
+      }
+      quad
+        ..add(_ocrNumber(corner[0], 'word corner'))
+        ..add(_ocrNumber(corner[1], 'word corner'));
+    }
+    final bounds = _ocrBounds(json['bounds']);
+    return PdfOcrWord(
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      left: bounds[0],
+      top: bounds[1],
+      right: bounds[2],
+      bottom: bounds[3],
+      quad: List.unmodifiable(quad),
+    );
+  }
+
+  final String text;
+
+  /// How sure the engine is of this word, 0–1.
+  final double confidence;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+
+  /// Corners as x, y pairs: top-left, top-right, bottom-right, bottom-left.
+  /// A rotated rectangle when the scan was skewed.
+  final List<double> quad;
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'confidence': confidence,
+        'bounds': [left, top, right, bottom],
+        'quad': [
+          for (var i = 0; i < 8; i += 2) [quad[i], quad[i + 1]],
+        ],
+      };
+}
+
+/// A recognized line of text, words in reading order.
+class PdfOcrLine {
+  const PdfOcrLine({
+    required this.text,
+    required this.confidence,
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+    required this.words,
+  });
+
+  factory PdfOcrLine.fromJson(Map<String, dynamic> json) {
+    final text = json['text'];
+    final words = json['words'];
+    if (text is! String || words is! List) {
+      throw const FormatException('Invalid OCR line.');
+    }
+    final bounds = _ocrBounds(json['bounds']);
+    return PdfOcrLine(
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      left: bounds[0],
+      top: bounds[1],
+      right: bounds[2],
+      bottom: bounds[3],
+      words: List.unmodifiable([
+        for (final word in words) PdfOcrWord.fromJson((word as Map).cast<String, dynamic>()),
+      ]),
+    );
+  }
+
+  final String text;
+  final double confidence;
+  final double left;
+  final double top;
+  final double right;
+  final double bottom;
+  final List<PdfOcrWord> words;
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'confidence': confidence,
+        'bounds': [left, top, right, bottom],
+        'words': [for (final word in words) word.toJson()],
+      };
+}
+
+/// What [PdfCore.ocrPage] read on one page.
+class PdfOcrPage {
+  const PdfOcrPage({
+    required this.page,
+    required this.status,
+    required this.text,
+    required this.confidence,
+    required this.lines,
+    this.layout,
+    this.width = 0,
+    this.height = 0,
+    this.dpi = 0,
+    this.skewDegrees = 0,
+    this.orientationDegrees = 0,
+  });
+
+  factory PdfOcrPage.fromJson(Map<String, dynamic> json) {
+    final page = json['page'];
+    final text = json['text'];
+    final lines = json['lines'];
+    final layout = json['layout'];
+    if (page is! int || page < 1 || text is! String || lines is! List) {
+      throw const FormatException('Invalid OCR page.');
+    }
+    final status = PdfOcrStatus._parse(json['status']);
+    final recognized = status == PdfOcrStatus.recognized || status == PdfOcrStatus.noText;
+    return PdfOcrPage(
+      page: page,
+      status: status,
+      text: text,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+      lines: List.unmodifiable([
+        for (final line in lines) PdfOcrLine.fromJson((line as Map).cast<String, dynamic>()),
+      ]),
+      layout: layout is Map ? PdfPageTextLayout.fromJson(layout.cast<String, dynamic>()) : null,
+      width: recognized ? _ocrNumber(json['width'], 'width') : 0,
+      height: recognized ? _ocrNumber(json['height'], 'height') : 0,
+      dpi: recognized ? _ocrNumber(json['dpi'], 'dpi') : 0,
+      skewDegrees: recognized ? _ocrNumber(json['skewDegrees'], 'skew') : 0,
+      orientationDegrees: recognized ? _ocrOrientation(json['orientationDegrees']) : 0,
+    );
+  }
+
+  /// 1-based, like [PdfCore.pageTextLayout].
+  final int page;
+  final PdfOcrStatus status;
+
+  /// The recognized text, one line per line.
+  final String text;
+
+  /// Mean word confidence, 0–1.
+  final double confidence;
+  final List<PdfOcrLine> lines;
+
+  /// The page's selectable text exactly as [PdfCore.pageTextLayout] reports
+  /// it once [PdfCore.makeSearchable] or [PdfCore.applyOcr] has written it,
+  /// so a viewer can select and search a scanned page straight away. Null
+  /// when the page was not recognized.
+  final PdfPageTextLayout? layout;
+
+  /// Displayed page size in points, when recognized.
+  final double width;
+  final double height;
+
+  /// Resolution the page was recognized at.
+  final double dpi;
+
+  /// Tilt corrected before recognition.
+  final double skewDegrees;
+
+  /// Clockwise turn (0, 90, 180 or 270) that brought the page's text
+  /// upright: 180 means it was scanned upside down. Boxes are always in the
+  /// page's own coordinates.
+  final int orientationDegrees;
+
+  /// The words, as [PdfCore.applyOcr] takes them.
+  Map<String, dynamic> toJson() => {
+        'page': page,
+        'lines': [for (final line in lines) line.toJson()],
+      };
+}
+
+/// What [PdfCore.makeSearchable] did with one page.
+class PdfOcrPageReport {
+  const PdfOcrPageReport({
+    required this.page,
+    required this.status,
+    required this.words,
+    required this.confidence,
+  });
+
+  factory PdfOcrPageReport.fromJson(Map<String, dynamic> json) {
+    final page = json['page'];
+    final words = json['words'];
+    if (page is! int || words is! int) {
+      throw const FormatException('Invalid OCR page report.');
+    }
+    return PdfOcrPageReport(
+      page: page,
+      status: PdfOcrStatus._parse(json['status']),
+      words: words,
+      confidence: _ocrNumber(json['confidence'], 'confidence'),
+    );
+  }
+
+  final int page;
+  final PdfOcrStatus status;
+  final int words;
+  final double confidence;
+}
+
+/// The outcome of [PdfCore.makeSearchable].
+class PdfSearchableReport {
+  const PdfSearchableReport({required this.recognized, required this.pages});
+
+  factory PdfSearchableReport.fromJson(Map<String, dynamic> json) {
+    final recognized = json['recognized'];
+    final pages = json['pages'];
+    if (recognized is! int || pages is! List) {
+      throw const FormatException('Invalid searchable-PDF report.');
+    }
+    return PdfSearchableReport(
+      recognized: recognized,
+      pages: List.unmodifiable([
+        for (final page in pages) PdfOcrPageReport.fromJson((page as Map).cast<String, dynamic>()),
+      ]),
+    );
+  }
+
+  /// Pages that received recognized text.
+  final int recognized;
+  final List<PdfOcrPageReport> pages;
+}
+
+/// How an image is placed on its page by [PdfCore.imagesToPdf].
+enum PdfImageFit {
+  /// Fixed page size; the image is scaled to fit and centred (letterboxed).
+  contain,
+
+  /// The page takes the image's own aspect ratio — no bars.
+  imageAspect,
+}
+
+/// Pure-Rust PDF toolkit: parse, split, merge, rotate, crop, metadata,
+/// text extraction, rendering, AI export and AES-256 password protection.
+///
+/// All methods are synchronous FFI calls; the `xxxAsync` variants run the
+/// same call on a background isolate so heavy documents don't jank the UI.
+///
+/// Page selections use 1-based range strings such as `'1-3,5'`.
+/// An empty selection string means "all pages".
+class PdfCore {
+  PdfCore._();
+
+  static PdfBindings get _b => PdfBindings.instance;
+
+  /// Native library version.
+  static String get nativeVersion => _b.version().toDartString();
+
+  // -- queries ---------------------------------------------------------------
+
+  static int pageCount(String path, {String password = ''}) =>
+      _int2(_b.pageCount, path, password);
+
+  static PdfInfo inspect(String path, {String password = ''}) {
+    final json = _str2(_b.inspectJson, path, password);
+    return PdfInfo.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  static PdfMetadata getMetadata(String path, {String password = ''}) {
+    final json = _str2(_b.getMetadataJson, path, password);
+    return PdfMetadata.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// Extracted text. With [page] (1-based) extracts a single page;
+  /// otherwise all pages, separated by form-feed (`\f`).
+  static String extractText(String path, {int? page, String password = ''}) {
+    return _withUtf8([path, password], (args) {
+      final out = _b.extractText(args[0], args[1], page ?? 0);
+      return _takeString(out);
+    });
+  }
+
+  /// Extract selectable text and its displayed geometry on a background
+  /// isolate. [page] is 1-based, unlike the raster API's 0-based page index.
+  /// Empty/scanned pages return an empty text layout; recognize their text with
+  /// [ocrPage], which reports the same geometry.
+  /// Throws `TEXT_SELECTION_UNAVAILABLE` with older native binaries.
+  static Future<PdfPageTextLayout> pageTextLayout(
+    String path, {
+    required int page,
+    String password = '',
+  }) async {
+    if (page < 1) {
+      throw RangeError.range(page, 1, null, 'page');
+    }
+    return Isolate.run(() {
+      final extract = _b.pageTextLayoutJson;
+      if (extract == null) {
+        throw PdfException(
+          'TEXT_SELECTION_UNAVAILABLE',
+          'Text selection is unavailable in this version of the PDF engine.',
+        );
+      }
+      return _withUtf8([path, password], (args) {
+        final json = _takeString(extract(args[0], args[1], page));
+        return PdfPageTextLayout.fromJson(
+          jsonDecode(json) as Map<String, dynamic>,
+        );
+      });
+    });
+  }
+
+  /// AI-ready export: pages + metadata + overlapping text chunks.
+  /// Returns a JSON document, or NDJSON lines when [ndjson] is true.
+  static String exportForAi(
+    String path, {
+    String password = '',
+    int maxChars = 2000,
+    int overlap = 200,
+    bool ndjson = false,
+  }) {
+    return _withUtf8([path, password], (args) {
+      final out = _b.exportAi(args[0], args[1], maxChars, overlap, ndjson ? 1 : 0);
+      return _takeString(out);
+    });
+  }
+
+  // -- transformations -------------------------------------------------------
+
+  /// Copy [pages] (e.g. `'1-3,7'`) into a new file.
+  static void extractPages(String path, String pages, String outPath,
+          {String password = ''}) =>
+      _check(_int4(_b.extractPages, path, password, pages, outPath));
+
+  /// Delete [pages] and save the remainder.
+  static void deletePages(String path, String pages, String outPath,
+          {String password = ''}) =>
+      _check(_int4(_b.deletePages, path, password, pages, outPath));
+
+  /// Reorder pages; [order] must mention every page exactly once (`'3,1,2'`).
+  static void reorderPages(String path, String order, String outPath,
+          {String password = ''}) =>
+      _check(_int4(_b.reorderPages, path, password, order, outPath));
+
+  /// Merge [paths] into one document.
+  static void merge(List<String> paths, String outPath) {
+    if (paths.isEmpty) {
+      throw PdfException('ERROR', 'no input files');
+    }
+    _check(_withUtf8([paths.join('\n'), outPath], (args) {
+      return _b.merge(args[0], args[1]);
+    }));
+  }
+
+  /// Rotate [pages] (empty = all) by [degrees] (multiple of 90).
+  static void rotatePages(String path, int degrees, String outPath,
+      {String pages = '', String password = ''}) {
+    _check(_withUtf8([path, password, pages, outPath], (args) {
+      return _b.rotatePages(args[0], args[1], args[2], degrees, args[3]);
+    }));
+  }
+
+  /// Set the crop box of one [page] (1-based) in points.
+  static void setCropBox(
+    String path,
+    int page,
+    double x0,
+    double y0,
+    double x1,
+    double y1,
+    String outPath, {
+    String password = '',
+  }) {
+    _check(_withUtf8([path, password, outPath], (args) {
+      return _b.setCropBox(args[0], args[1], page, x0, y0, x1, y1, args[2]);
+    }));
+  }
+
+  /// Write metadata; see [PdfMetadata] for null/empty semantics.
+  static void setMetadata(String path, PdfMetadata metadata, String outPath,
+      {String password = ''}) {
+    final json = jsonEncode(metadata.toJson());
+    _check(_int4(_b.setMetadata, path, password, json, outPath));
+  }
+
+  /// Password-protect with AES-256 (PDF 2.0). An empty [ownerPassword]
+  /// reuses [userPassword].
+  static void encrypt(String path, String userPassword, String outPath,
+      {String ownerPassword = '', String password = ''}) {
+    _check(_withUtf8([path, password, userPassword, ownerPassword, outPath],
+        (args) {
+      return _b.encrypt(args[0], args[1], args[2], args[3], args[4]);
+    }));
+  }
+
+  /// Remove encryption (requires the correct [password]).
+  static void decrypt(String path, String password, String outPath) =>
+      _check(_int3(_b.decrypt, path, password, outPath));
+
+  // -- rendering ---------------------------------------------------------
+
+  /// Rasterize [page] (0-based) and return it as PNG bytes.
+  ///
+  /// When [width] and [height] are both positive the page is scaled to fit
+  /// inside that pixel box, preserving aspect ratio; otherwise it renders at
+  /// its natural size (72 dpi).
+  ///
+  /// A page that takes the engine more than about twenty seconds to draw
+  /// comes back as far as it got, with a "page too complex" warning. With a
+  /// nonzero [renderId] (see [cancelRender]) another isolate can stop the
+  /// render sooner; it then throws `CANCELLED`.
+  static Uint8List renderPagePng(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    int renderId = 0,
+  }) {
+    final cancellable = renderId == 0 ? null : _b.renderPagePngCancellable;
+    return _withUtf8([path, password], (args) {
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = cancellable != null
+            ? cancellable(
+                args[0], args[1], page, width, height, renderId, lengthOut)
+            : _b.renderPagePng(args[0], args[1], page, width, height, lengthOut);
+        if (buffer == nullptr) throw _lastError();
+        return _takeBuffer(buffer, lengthOut.value);
+      } finally {
+        calloc.free(lengthOut);
+      }
+    });
+  }
+
+  /// As [renderPagePng], but also reports what the renderer had to skip.
+  ///
+  /// The warnings come from a thread-local the native side fills in during the
+  /// render, so they are read here, immediately after the call that set them.
+  static PdfRenderedPng renderPagePngWithWarnings(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    int renderId = 0,
+  }) {
+    final bytes = renderPagePng(path, page,
+        width: width, height: height, password: password, renderId: renderId);
+    return PdfRenderedPng(bytes, _lastWarnings());
+  }
+
+  /// Whether this build of the engine can stop a render part way
+  /// ([cancelRender]). Without it, renders still end, by the engine's own
+  /// time limit, and an asynchronous call's timeout still gives up waiting.
+  static bool get canCancelRenders {
+    try {
+      return _b.renderCancel != null;
+    } catch (_) {
+      // No native library at all: nothing renders to be cancelled.
+      return false;
+    }
+  }
+
+  /// Stop the render started with [renderId], from any isolate. It stops
+  /// within moments and throws `CANCELLED`. True when one was running;
+  /// otherwise the id is remembered for a while, so a render about to start
+  /// under it fails at once. A render id is any nonzero number the caller
+  /// chooses, unique among its renders running at the same time.
+  static bool cancelRender(int renderId) {
+    final cancel = _b.renderCancel;
+    if (cancel == null || renderId == 0) return false;
+    return cancel(renderId) == 1;
+  }
+
+  /// Whether this build of the engine can render part of a page
+  /// ([renderPageRegionPngWithWarnings]).
+  static bool get canRenderRegions => _b.renderPageRegionPng != null;
+
+  /// Rasterize part of [page] (0-based) to PNG.
+  ///
+  /// The page is laid out to fit inside [pageWidth] x [pageHeight] pixels,
+  /// exactly as [renderPagePng] would draw it at that size, and only the
+  /// [width] x [height] pixels at ([x], [y]) of that layout are drawn. The
+  /// region is clipped to the page; one that misses the page throws.
+  ///
+  /// A viewer zoomed far into a page needs sharp pixels only for what is on
+  /// screen. Rendering the whole page at that scale would take hundreds of
+  /// megabytes; rendering the visible part takes about a screenful.
+  ///
+  /// Throws [PdfException] with code `REGION_RENDER_UNAVAILABLE` when the
+  /// native library predates region rendering ([canRenderRegions]).
+  static PdfRenderedPng renderPageRegionPngWithWarnings(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+    int renderId = 0,
+  }) {
+    final render = _b.renderPageRegionPng;
+    if (render == null) {
+      throw PdfException(
+        'REGION_RENDER_UNAVAILABLE',
+        'Rendering part of a page is unavailable in this version of the PDF engine.',
+      );
+    }
+    final cancellable =
+        renderId == 0 ? null : _b.renderPageRegionPngCancellable;
+    final bytes = _withUtf8([path, password], (args) {
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = cancellable != null
+            ? cancellable(args[0], args[1], page, pageWidth, pageHeight, x, y,
+                width, height, renderId, lengthOut)
+            : render(args[0], args[1], page, pageWidth, pageHeight, x, y,
+                width, height, lengthOut);
+        if (buffer == nullptr) throw _lastError();
+        return _takeBuffer(buffer, lengthOut.value);
+      } finally {
+        calloc.free(lengthOut);
+      }
+    });
+    return PdfRenderedPng(bytes, _lastWarnings());
+  }
+
+  /// Whether this build of the engine can return part of a page as raw
+  /// pixels ([renderPageRegionRgbaWithWarnings]).
+  static bool get canRenderRegionPixels => _b.renderPageRegionRgba != null;
+
+  /// As [renderPageRegionPngWithWarnings], but as raw RGBA8: the region goes
+  /// straight to a `ui.Image`, with no PNG to encode here and decode again.
+  /// On a phone that round trip took longer than drawing a scanned page's
+  /// region.
+  ///
+  /// Throws [PdfException] with code `REGION_RENDER_UNAVAILABLE` when the
+  /// native library predates it ([canRenderRegionPixels]).
+  static PdfRenderedPage renderPageRegionRgbaWithWarnings(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+    int renderId = 0,
+  }) {
+    final render = _b.renderPageRegionRgba;
+    if (render == null) {
+      throw PdfException(
+        'REGION_RENDER_UNAVAILABLE',
+        'Rendering part of a page as pixels is unavailable in this version of the PDF engine.',
+      );
+    }
+    final cancellable =
+        renderId == 0 ? null : _b.renderPageRegionRgbaCancellable;
+    final rendered = _withUtf8([path, password], (args) {
+      final widthOut = calloc<Int32>();
+      final heightOut = calloc<Int32>();
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = cancellable != null
+            ? cancellable(args[0], args[1], page, pageWidth, pageHeight, x, y,
+                width, height, renderId, widthOut, heightOut, lengthOut)
+            : render(args[0], args[1], page, pageWidth, pageHeight, x, y,
+                width, height, widthOut, heightOut, lengthOut);
+        if (buffer == nullptr) throw _lastError();
+        return (
+          width: widthOut.value,
+          height: heightOut.value,
+          pixels: _takeBuffer(buffer, lengthOut.value),
+        );
+      } finally {
+        calloc.free(widthOut);
+        calloc.free(heightOut);
+        calloc.free(lengthOut);
+      }
+    });
+    return PdfRenderedPage(
+      width: rendered.width,
+      height: rendered.height,
+      pixels: rendered.pixels,
+      warnings: _lastWarnings(),
+    );
+  }
+
+  /// Rasterize [page] (0-based) to raw RGBA8 — the cheapest path to a
+  /// `ui.Image`, with no encode/decode round trip.
+  static PdfRenderedPage renderPageRgba(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    int renderId = 0,
+  }) {
+    final cancellable = renderId == 0 ? null : _b.renderPageRgbaCancellable;
+    return _withUtf8([path, password], (args) {
+      final widthOut = calloc<Int32>();
+      final heightOut = calloc<Int32>();
+      final lengthOut = calloc<Int32>();
+      try {
+        final buffer = cancellable != null
+            ? cancellable(args[0], args[1], page, width, height, renderId,
+                widthOut, heightOut, lengthOut)
+            : _b.renderPageRgba(
+                args[0],
+                args[1],
+                page,
+                width,
+                height,
+                widthOut,
+                heightOut,
+                lengthOut,
+              );
+        if (buffer == nullptr) throw _lastError();
+        return PdfRenderedPage(
+          width: widthOut.value,
+          height: heightOut.value,
+          pixels: _takeBuffer(buffer, lengthOut.value),
+        );
+      } finally {
+        calloc.free(widthOut);
+        calloc.free(heightOut);
+        calloc.free(lengthOut);
+      }
+    });
+  }
+
+  /// Page size in points, honouring `/Rotate`.
+  static PdfPageSize pageSize(String path, int page, {String password = ''}) {
+    return _withUtf8([path, password], (args) {
+      final widthOut = calloc<Double>();
+      final heightOut = calloc<Double>();
+      try {
+        final status =
+            _b.pageSize(args[0], args[1], page, widthOut, heightOut);
+        _check(status);
+        return PdfPageSize(widthOut.value, heightOut.value);
+      } finally {
+        calloc.free(widthOut);
+        calloc.free(heightOut);
+      }
+    });
+  }
+
+  // -- composition -------------------------------------------------------
+
+  /// Build a PDF from JPEG files, one page per image.
+  ///
+  /// The JPEG bytes are embedded as-is (`DCTDecode`), so there is no decode /
+  /// re-encode step and no quality loss. [pageSizePoints] defaults to A4 and
+  /// only matters for [PdfImageFit.contain]; under [PdfImageFit.imageAspect]
+  /// it sets the target long edge.
+  static void imagesToPdf(
+    List<String> jpegPaths,
+    String outPath, {
+    PdfImageFit fit = PdfImageFit.imageAspect,
+    PdfPageSize? pageSizePoints,
+    double margin = 0,
+  }) {
+    if (jpegPaths.isEmpty) {
+      throw PdfException('ERROR', 'no input images');
+    }
+    _check(_withUtf8([jpegPaths.join('\n'), outPath], (args) {
+      return _b.imagesToPdf(
+        args[0],
+        args[1],
+        pageSizePoints?.width ?? 0,
+        pageSizePoints?.height ?? 0,
+        fit == PdfImageFit.contain ? 0 : 1,
+        margin,
+      );
+    }));
+  }
+
+  // -- OCR -------------------------------------------------------------------
+
+  /// Recognize the text on [page] (1-based) with the built-in OCR engine, on
+  /// a background isolate. Pages that already have text are reported as
+  /// [PdfOcrStatus.hasText] or [PdfOcrStatus.hasOcrLayer] and not recognized
+  /// unless [PdfOcrOptions.force].
+  ///
+  /// [PdfOcrPage.layout] holds the page's selectable text exactly as
+  /// [pageTextLayout] reports it after [makeSearchable] or [applyOcr] writes
+  /// it, so a viewer can select and search a scanned page right away. The
+  /// built-in engine reads printed Latin-script text. Throws
+  /// `OCR_UNAVAILABLE` with older native binaries.
+  static Future<PdfOcrPage> ocrPage(
+    String path, {
+    required int page,
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) async {
+    if (page < 1) {
+      throw RangeError.range(page, 1, null, 'page');
+    }
+    final optionsJson = jsonEncode(options.toJson());
+    return Isolate.run(() {
+      final ocr = _b.ocrPageJson;
+      if (ocr == null) throw _ocrUnavailable();
+      return _withUtf8([path, password, optionsJson], (args) {
+        final json = _takeString(ocr(args[0], args[1], page, args[2]));
+        return PdfOcrPage.fromJson(jsonDecode(json) as Map<String, dynamic>);
+      });
+    });
+  }
+
+  /// Save a copy of [path] to [outPath] with invisible text over its scanned
+  /// [pages] (`'1-3,5'`; empty = all), so their text can be selected,
+  /// searched, extracted and exported. Pages that already have text are left
+  /// as they are unless [PdfOcrOptions.force]. Like the other writing
+  /// operations, the copy is saved without encryption.
+  ///
+  /// This recognizes every page in one call; to show progress, recognize
+  /// pages one at a time with [ocrPage] and write them with [applyOcr].
+  static PdfSearchableReport makeSearchable(
+    String path,
+    String outPath, {
+    String pages = '',
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) {
+    final searchable = _b.makeSearchableJson;
+    if (searchable == null) throw _ocrUnavailable();
+    final optionsJson = jsonEncode(options.toJson());
+    return _withUtf8([path, password, pages, optionsJson, outPath], (args) {
+      final json = _takeString(searchable(args[0], args[1], args[2], args[3], args[4]));
+      return PdfSearchableReport.fromJson(jsonDecode(json) as Map<String, dynamic>);
+    });
+  }
+
+  /// Save a copy of [path] to [outPath] with invisible text layers built from
+  /// [results]: pages recognized with [ocrPage], or by another OCR engine
+  /// with coordinates in displayed page points. Returns the number of pages
+  /// that received text.
+  static int applyOcr(
+    String path,
+    List<PdfOcrPage> results,
+    String outPath, {
+    String password = '',
+  }) {
+    final apply = _b.applyOcrJson;
+    if (apply == null) throw _ocrUnavailable();
+    final json = jsonEncode([for (final page in results) page.toJson()]);
+    final written = _withUtf8([path, password, json, outPath], (args) {
+      return apply(args[0], args[1], args[2], args[3]);
+    });
+    if (written < 0) throw _lastError();
+    return written;
+  }
+
+  static PdfException _ocrUnavailable() => PdfException(
+        'OCR_UNAVAILABLE',
+        'OCR is unavailable in this version of the PDF engine.',
+      );
+
+  // -- forms, annotations, stamps (phase 8) ---------------------------------
+
+  /// The document's form fields; an empty form when it has none.
+  static PdfForm formFields(String path, {String password = ''}) {
+    final read = _b.formFieldsJson;
+    if (read == null) throw _editUnavailable();
+    final json = _str2(read, path, password);
+    return PdfForm.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// The annotations on a page (1-based).
+  static List<PdfAnnotationInfo> annotations(String path, int page,
+      {String password = ''}) {
+    final read = _b.annotationsJson;
+    if (read == null) throw _editUnavailable();
+    final json = _withUtf8([path, password],
+        (args) => _takeString(read(args[0], args[1], page)));
+    return [
+      for (final a in jsonDecode(json) as List)
+        PdfAnnotationInfo.fromJson(a as Map<String, dynamic>),
+    ];
+  }
+
+  /// Fill fields, add or remove annotations and draw marks, writing the
+  /// result to [outPath] (which may be [path]). The original bytes are
+  /// kept and the changes appended, so signatures stay valid and an
+  /// encrypted file keeps its password. Returns what the caller should
+  /// tell the user: characters the standard fonts lack, fields that were
+  /// left as they were.
+  static List<String> applyEdits(String path, PdfEdits edits, String outPath,
+      {String password = ''}) {
+    final apply = _b.applyEdits;
+    if (apply == null) throw _editUnavailable();
+    final json = jsonEncode(edits.toJson());
+    final status = _withUtf8([path, password, json, outPath],
+        (args) => apply(args[0], args[1], args[2], args[3]));
+    if (status < 0) throw _lastError();
+    return _lastWarnings();
+  }
+
+  /// Write a smaller copy of [path] to [outPath]: pictures scaled to
+  /// [level]'s resolution and re-encoded as JPEG, streams compressed, the
+  /// file written compactly. Signatures do not survive it, so keep the
+  /// original. An encrypted file keeps its password. When nothing helps,
+  /// the copy is the original.
+  static PdfCompressReport compress(String path, String outPath,
+      {PdfCompressLevel level = PdfCompressLevel.recommended,
+      String password = ''}) {
+    final run = _b.compressJson;
+    if (run == null) throw _editUnavailable();
+    final options = jsonEncode({'dpi': level.dpi, 'quality': level.quality});
+    final json = _withUtf8([path, password, options, outPath],
+        (args) => _takeString(run(args[0], args[1], args[2], args[3])));
+    return PdfCompressReport.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// Save pages ([pages] a 1-based range like "1-3,5"; empty for all) as
+  /// pictures named `<outPrefix><page>.png` or `.jpg`, and return their
+  /// paths.
+  static List<String> pageImages(String path, String outPrefix,
+      {String pages = '',
+      PdfPageImageFormat format = PdfPageImageFormat.png,
+      double dpi = 150,
+      int quality = 85,
+      String password = ''}) {
+    final run = _b.pageImagesJson;
+    if (run == null) throw _editUnavailable();
+    final options =
+        jsonEncode({'format': format.name, 'dpi': dpi, 'quality': quality});
+    final json = _withUtf8([path, password, pages, options, outPrefix],
+        (args) => _takeString(run(args[0], args[1], args[2], args[3], args[4])));
+    return [
+      for (final f in (jsonDecode(json) as Map<String, dynamic>)['files'] as List)
+        f as String,
+    ];
+  }
+
+  static Future<PdfCompressReport> compressAsync(String path, String outPath,
+          {PdfCompressLevel level = PdfCompressLevel.recommended,
+          String password = ''}) =>
+      Isolate.run(
+          () => compress(path, outPath, level: level, password: password));
+
+  static Future<List<String>> pageImagesAsync(String path, String outPrefix,
+          {String pages = '',
+          PdfPageImageFormat format = PdfPageImageFormat.png,
+          double dpi = 150,
+          int quality = 85,
+          String password = ''}) =>
+      Isolate.run(() => pageImages(path, outPrefix,
+          pages: pages,
+          format: format,
+          dpi: dpi,
+          quality: quality,
+          password: password));
+
+  static Future<PdfForm> formFieldsAsync(String path, {String password = ''}) =>
+      Isolate.run(() => formFields(path, password: password));
+
+  static Future<List<PdfAnnotationInfo>> annotationsAsync(String path, int page,
+          {String password = ''}) =>
+      Isolate.run(() => annotations(path, page, password: password));
+
+  static Future<List<String>> applyEditsAsync(
+          String path, PdfEdits edits, String outPath, {String password = ''}) =>
+      Isolate.run(() => applyEdits(path, edits, outPath, password: password));
+
+  static PdfException _editUnavailable() => PdfException(
+        'UNSUPPORTED',
+        'Filling and annotating need a newer PDF engine.',
+      );
+
+  // -- pinned documents ------------------------------------------------------
+
+  /// Parse [path] once and keep it in memory, so that later read-only calls
+  /// on the same path and password (renders, page sizes, text, text layout)
+  /// reuse it instead of reading and parsing the whole file again. Returns
+  /// the page count; throws [PdfException] (for example `ENCRYPTED`) like
+  /// [pageCount].
+  ///
+  /// Pair every successful call with [closeDocument]. Calls made while the
+  /// file on disk has changed read it afresh. With an older native library
+  /// this only counts the pages.
+  static Future<int> openDocument(String path, {String password = ''}) =>
+      Isolate.run(() {
+        final open = _b.documentOpen;
+        if (open == null) return pageCount(path, password: password);
+        return _int2(open, path, password);
+      });
+
+  /// Release one [openDocument]. The parse is freed when its last holder
+  /// closes it, off the calling isolate.
+  static Future<void> closeDocument(String path, {String password = ''}) =>
+      Isolate.run(() {
+        final close = _b.documentClose;
+        if (close == null) return;
+        _check(_withUtf8([path, password], (args) => close(args[0], args[1])));
+      });
+
+  // -- async variants ----------------------------------------------------------
+
+  static Future<int> pageCountAsync(String path, {String password = ''}) =>
+      Isolate.run(() => pageCount(path, password: password));
+
+  static Future<PdfInfo> inspectAsync(String path, {String password = ''}) =>
+      Isolate.run(() => inspect(path, password: password));
+
+  static Future<String> extractTextAsync(String path,
+          {int? page, String password = ''}) =>
+      Isolate.run(() => extractText(path, page: page, password: password));
+
+  static Future<String> exportForAiAsync(
+    String path, {
+    String password = '',
+    int maxChars = 2000,
+    int overlap = 200,
+    bool ndjson = false,
+  }) =>
+      Isolate.run(() => exportForAi(path,
+          password: password,
+          maxChars: maxChars,
+          overlap: overlap,
+          ndjson: ndjson));
+
+  static Future<void> extractPagesAsync(String path, String pages, String outPath,
+          {String password = ''}) =>
+      Isolate.run(() => extractPages(path, pages, outPath, password: password));
+
+  static Future<void> deletePagesAsync(String path, String pages, String outPath,
+          {String password = ''}) =>
+      Isolate.run(() => deletePages(path, pages, outPath, password: password));
+
+  static Future<void> reorderPagesAsync(String path, String order, String outPath,
+          {String password = ''}) =>
+      Isolate.run(() => reorderPages(path, order, outPath, password: password));
+
+  static Future<void> mergeAsync(List<String> paths, String outPath) =>
+      Isolate.run(() => merge(paths, outPath));
+
+  static Future<void> rotatePagesAsync(String path, int degrees, String outPath,
+          {String pages = '', String password = ''}) =>
+      Isolate.run(() => rotatePages(path, degrees, outPath,
+          pages: pages, password: password));
+
+  static Future<void> encryptAsync(String path, String userPassword, String outPath,
+          {String ownerPassword = '', String password = ''}) =>
+      Isolate.run(() => encrypt(path, userPassword, outPath,
+          ownerPassword: ownerPassword, password: password));
+
+  static Future<void> decryptAsync(String path, String password, String outPath) =>
+      Isolate.run(() => decrypt(path, password, outPath));
+
+  /// How long an asynchronous render may take before it is cancelled and
+  /// fails with `TIMEOUT`. The engine stops drawing a page itself after
+  /// about twenty seconds and returns what it drew, with a "page too
+  /// complex" warning; the timeout is for what it cannot stop by then, such
+  /// as reading a badly damaged file, and for engines too old to stop.
+  static const Duration defaultRenderTimeout = Duration(seconds: 30);
+
+  /// [renderPagePng] on a background isolate, cancelled when [timeout]
+  /// passes (see [defaultRenderTimeout]).
+  static Future<Uint8List> renderPagePngAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    Duration timeout = defaultRenderTimeout,
+  }) =>
+      _renderWithin(
+          timeout,
+          (renderId) => renderPagePng(path, page,
+              width: width,
+              height: height,
+              password: password,
+              renderId: renderId));
+
+  /// [renderPagePngWithWarnings] on a background isolate, cancelled when
+  /// [timeout] passes (see [defaultRenderTimeout]).
+  ///
+  /// Both the render and the warning read happen inside the isolate, which is
+  /// the only place the thread-local they live in is valid.
+  static Future<PdfRenderedPng> renderPagePngWithWarningsAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    Duration timeout = defaultRenderTimeout,
+  }) =>
+      _renderWithin(
+          timeout,
+          (renderId) => renderPagePngWithWarnings(path, page,
+              width: width,
+              height: height,
+              password: password,
+              renderId: renderId));
+
+  /// [renderPageRegionPngWithWarnings] on a background isolate, cancelled
+  /// when [timeout] passes (see [defaultRenderTimeout]).
+  static Future<PdfRenderedPng> renderPageRegionPngWithWarningsAsync(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+    Duration timeout = defaultRenderTimeout,
+  }) =>
+      _renderWithin(
+          timeout,
+          (renderId) => renderPageRegionPngWithWarnings(path, page,
+              pageWidth: pageWidth,
+              pageHeight: pageHeight,
+              x: x,
+              y: y,
+              width: width,
+              height: height,
+              password: password,
+              renderId: renderId));
+
+  /// [renderPageRegionRgbaWithWarnings] on a background isolate, cancelled
+  /// when [timeout] passes (see [defaultRenderTimeout]).
+  static Future<PdfRenderedPage> renderPageRegionRgbaWithWarningsAsync(
+    String path,
+    int page, {
+    required int pageWidth,
+    required int pageHeight,
+    required int x,
+    required int y,
+    required int width,
+    required int height,
+    String password = '',
+    Duration timeout = defaultRenderTimeout,
+  }) =>
+      _renderWithin(
+          timeout,
+          (renderId) => renderPageRegionRgbaWithWarnings(path, page,
+              pageWidth: pageWidth,
+              pageHeight: pageHeight,
+              x: x,
+              y: y,
+              width: width,
+              height: height,
+              password: password,
+              renderId: renderId));
+
+  /// [renderPageRgba] on a background isolate, cancelled when [timeout]
+  /// passes (see [defaultRenderTimeout]).
+  static Future<PdfRenderedPage> renderPageRgbaAsync(
+    String path,
+    int page, {
+    int width = 0,
+    int height = 0,
+    String password = '',
+    Duration timeout = defaultRenderTimeout,
+  }) =>
+      _renderWithin(
+          timeout,
+          (renderId) => renderPageRgba(path, page,
+              width: width,
+              height: height,
+              password: password,
+              renderId: renderId));
+
+  /// Run [render] on a background isolate under a render id of its own, and
+  /// cancel it if [timeout] passes first: the future then fails with
+  /// `TIMEOUT` at once, and the engine stops drawing within moments, which
+  /// frees the isolate. An engine that cannot cancel renders gets id 0; its
+  /// render goes on until it ends by itself, and nobody waits for it.
+  ///
+  /// The clock is the real one, outside any zone: how long a render takes
+  /// is the engine's time, whatever a caller's zone does with timers.
+  static Future<T> _renderWithin<T>(
+      Duration timeout, T Function(int renderId) render) {
+    final renderId = canCancelRenders ? _nextRenderId() : 0;
+    final result = Completer<T>();
+    final timer = Zone.root.createTimer(timeout, () {
+      if (result.isCompleted) return;
+      if (renderId != 0) cancelRender(renderId);
+      result.completeError(PdfException('TIMEOUT',
+          'The page took more than ${timeout.inMilliseconds} ms to draw.'));
+    });
+    _runOnIsolate(render, renderId).then((value) {
+      timer.cancel();
+      if (!result.isCompleted) result.complete(value);
+    }, onError: (Object error, StackTrace stack) {
+      timer.cancel();
+      if (!result.isCompleted) result.completeError(error, stack);
+    });
+    return result.future;
+  }
+
+  /// `render(renderId)` on a background isolate. A function of its own, so
+  /// that the closure sent to the isolate holds only these two, not the
+  /// timer and completer of [_renderWithin], which cannot be sent.
+  static Future<T> _runOnIsolate<T>(T Function(int renderId) render, int renderId) =>
+      Isolate.run(() => render(renderId));
+
+  /// Render ids made here: a random high part, so that ids made on
+  /// different isolates (each has its own counter) do not meet, and a count.
+  static final int _renderIdBase = (Random().nextInt(1 << 30) + 1) << 24;
+  static int _renderCount = 0;
+  static int _nextRenderId() =>
+      _renderIdBase + (++_renderCount & 0xFFFFFF);
+
+  static Future<PdfPageSize> pageSizeAsync(String path, int page,
+          {String password = ''}) =>
+      Isolate.run(() => pageSize(path, page, password: password));
+
+  static Future<PdfSearchableReport> makeSearchableAsync(
+    String path,
+    String outPath, {
+    String pages = '',
+    String password = '',
+    PdfOcrOptions options = const PdfOcrOptions(),
+  }) =>
+      Isolate.run(() => makeSearchable(path, outPath,
+          pages: pages, password: password, options: options));
+
+  static Future<int> applyOcrAsync(
+    String path,
+    List<PdfOcrPage> results,
+    String outPath, {
+    String password = '',
+  }) =>
+      Isolate.run(() => applyOcr(path, results, outPath, password: password));
+
+  static Future<void> imagesToPdfAsync(
+    List<String> jpegPaths,
+    String outPath, {
+    PdfImageFit fit = PdfImageFit.imageAspect,
+    PdfPageSize? pageSizePoints,
+    double margin = 0,
+  }) =>
+      Isolate.run(() => imagesToPdf(jpegPaths, outPath,
+          fit: fit, pageSizePoints: pageSizePoints, margin: margin));
+
+  // -- plumbing ----------------------------------------------------------------
+
+  static R _withUtf8<R>(List<String> strings, R Function(List<Pointer<Utf8>>) f) {
+    final pointers = strings.map((s) => s.toNativeUtf8()).toList();
+    try {
+      return f(pointers);
+    } finally {
+      for (final p in pointers) {
+        malloc.free(p);
+      }
+    }
+  }
+
+  /// Copy a native buffer into a Dart list and release the native memory.
+  static Uint8List _takeBuffer(Pointer<Uint8> ptr, int length) {
+    try {
+      if (length <= 0) return Uint8List(0);
+      // asTypedList is a view over native memory; copy before freeing.
+      return Uint8List.fromList(ptr.asTypedList(length));
+    } finally {
+      _b.freeBuffer(ptr, length);
+    }
+  }
+
+  static String _takeString(Pointer<Utf8> ptr) {
+    if (ptr == nullptr) {
+      throw _lastError();
+    }
+    try {
+      return ptr.toDartString();
+    } finally {
+      _b.freeString(ptr);
+    }
+  }
+
+  static int _int2(int Function(Pointer<Utf8>, Pointer<Utf8>) f, String a, String b) {
+    final result = _withUtf8([a, b], (args) => f(args[0], args[1]));
+    if (result < 0) {
+      throw _lastError();
+    }
+    return result;
+  }
+
+  static int _int3(int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>) f,
+          String a, String b, String c) =>
+      _withUtf8([a, b, c], (args) => f(args[0], args[1], args[2]));
+
+  static int _int4(
+          int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>) f,
+          String a,
+          String b,
+          String c,
+          String d) =>
+      _withUtf8([a, b, c, d], (args) => f(args[0], args[1], args[2], args[3]));
+
+  static String _str2(
+      Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>) f, String a, String b) {
+    return _withUtf8([a, b], (args) => _takeString(f(args[0], args[1])));
+  }
+
+  static void _check(int status) {
+    if (status != 0) {
+      throw _lastError();
+    }
+  }
+
+  static List<String> _lastWarnings() {
+    final raw = _b.lastWarnings().toDartString();
+    if (raw.isEmpty) return const [];
+    return raw.split('\n').where((line) => line.isNotEmpty).toList();
+  }
+
+  static PdfException _lastError() {
+    final raw = _b.lastError().toDartString();
+    final colon = raw.indexOf(':');
+    if (colon > 0) {
+      return PdfException(
+          raw.substring(0, colon), raw.substring(colon + 1).trim());
+    }
+    return PdfException('ERROR', raw.isEmpty ? 'unknown error' : raw);
+  }
+}

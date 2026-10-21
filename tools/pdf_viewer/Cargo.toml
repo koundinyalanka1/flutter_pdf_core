@@ -1,0 +1,11 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pdf_core = { path = "../../rust/crates/pdf_core" }
+pdf_ops = { path = "../../rust/crates/pdf_ops" }
+pdf_text = { path = "../../rust/crates/pdf_text" }
+anyhow = "1"
+serde_json = "1"

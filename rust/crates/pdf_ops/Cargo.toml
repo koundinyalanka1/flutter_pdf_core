@@ -1,0 +1,9 @@
+[package]
+name = "pdf_ops"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pdf_core = { path = "../pdf_core" }
+thiserror.workspace = true
+serde.workspace = true

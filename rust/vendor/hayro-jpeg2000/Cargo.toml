@@ -1,0 +1,15 @@
+[package]
+name = "hayro-jpeg2000"
+version = "0.4.1"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/LaurenzV/hayro"
+
+[features]
+default = ["std"]
+std = []
+# Optional upstream integration/SIMD paths are intentionally not built.
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("image", "simd", "logging"))'] }
